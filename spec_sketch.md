@@ -1,498 +1,888 @@
-Got it – I’m on it. I’ve updated the design instructions accordingly.
+# RAQL v0 Technical Specification
 
+This spec synthesizes the design direction in the convo into one coherent system: RAQL as a context-assembly engine built on top of rust-analyzer (RA). It covers architecture, query/view language, CLI, output formatting contracts, and the minimal primitive schema.
 
-Alright. With the real-world rust-analyzer asks + the “amnesia agent” constraint, the v0 design should feel like a **semantic compressor** and a **spiderweb radar**, not a query playground.
-
-Here’s a concrete 80/20 v0 that gives a ridiculous amount of leverage immediately, stays noninteractive, and stays intuitive because it’s basically:
-
-* `find` (what is this noun?)
-* `explain` (what is true *here*, with minimal sufficient context?)
-* `show` (shape of a def)
-* `uses/refs` (where/how used, categorized)
-* `callers/callees` (flow)
-* `impact` (peripheral vision)
-* `scaffold` (bridge from “know” to “write”)
-
-Under the hood it’s Datalog over HIR, but the product is the **views and verbs**.
+The guiding principle throughout: **semantic truth is necessary but not sufficient**. RAQL must turn semantic truth into **readable, decision-ready artifacts** by default.
 
 ---
 
-# V0 principles
+## Product definition
 
-## Views are the product
+RAQL is a CLI that answers “code understanding” questions by producing **curated context artifacts** assembled from semantic relationships (types, traits, impls, calls, refs, error flow) rather than returning coordinates alone.
 
-Agents almost never type primitives. They run **high-level views** (commands), and only drop into `q` to build a new view.
+It is designed for:
 
-## Output is semantic compression
+* Agents operating via tool calls (navigation is not free).
+* Humans who want “show me the territory” output without IDE hopping.
 
-Default output is **dense plaintext**: high entropy, low whitespace, no table borders. It should be readable to humans but tuned for agent token economy.
+It is not:
 
-## Two output views, max
-
-* Default: dense plaintext
-* Optional: JSONL (for Python bridge / post-processing)
-
-No “concise/machine” dialects. Just the two.
-
-## “No results” is a result
-
-If something returns nothing, the CLI must say whether that’s **Verified 0** (strong fact) or **Unknown/Partial** (analysis degraded).
-
-## Explicit trust + broken-state tolerance
-
-Every result line carries a status:
-
-* `V` = Verified (resolved via HIR/types)
-* `H` = Heuristic (fallback because resolution unavailable or partial)
-
-The tool remains useful mid-refactor.
+* A grep replacement.
+* A documentation generator that dumps everything by default.
+* A full Rust trait solver (it surfaces RA’s best available resolution and labels uncertainty).
 
 ---
 
-# One mental model for chaining
+## Goals and non-goals
 
-Every line that represents a “hit” starts with:
+### Goals
 
-`path:line:col`
+1. **Comprehension-first defaults**
+   Default output is readable, curated, grounded code, not lists of `file:line`.
 
-and ends with a copy-pastable handle:
+2. **Queryable assembly**
+   The query system can express not only *what* to include, but *how to render* it (intentful extraction, budgets, grouping).
 
-`@K:<qualified-id>`
+3. **Stable, composable identity**
+   Every printed fragment includes a handle usable as input to subsequent commands.
 
-So agents can go:
+4. **Opinionated “theory of showing”**
+   Every “lens” has a clear, canonical output contract that matches its intent.
 
-1. `raql find X`
-2. copy handle
-3. `raql type @T:...` / `raql uses @T:...` / `raql explain path:line:col`
+5. **Fast enough to be conversational**
+   Lazy evaluation, bounded outputs, caching, and careful “text access” so we do not accidentally enumerate source text.
 
-Headings start with `#` so they’re trivially greppable out:
+### Non-goals
 
-* keep headings for human comprehension
-* `grep -v '^#'` gives pure results for piping
+* Perfect stability across arbitrary refactors for identity. Instead: “stable-ish handles + best-effort resolution with confidence.”
+* Printing entire subsystems with no limits by default.
+* A general-purpose text processing language inside the query engine.
 
 ---
 
-# Global flags (keep it tight)
+## Architecture
 
-These apply to most commands:
+### High-level pipeline
+
+1. **rust-analyzer substrate**
+
+   * RA holds file contents in memory (VFS).
+   * RA provides syntax trees, HIR, name resolution, type inference, and many semantic relationships.
+
+2. **Fact Providers**
+
+   * Small, well-defined relations derived from RA (some precomputed, many lazy).
+   * These form RAQL’s semantic “atoms.”
+
+3. **Query/Assembly Engine**
+
+   * Evaluates “views” (recipes) over facts.
+   * Views emit **Fragments** and **Metrics**, not raw row dumps by default.
+
+4. **Renderer**
+
+   * Converts fragments into terminal artifacts or JSONL.
+   * Applies expansion policies (STMT/BLOCK/EXPR), line budgets, elision messaging, and grouping.
+
+### Why this split is deliberate
+
+* RA already has code and semantics. RAQL’s value is **assembly and presentation discipline**.
+* We keep “text retrieval” out of relational joins by default, so the engine stays semantic and bounded.
+* We make text retrieval *first-class for output*, but *guarded for evaluation*.
+
+---
+
+## Core concepts
+
+### Selector
+
+A user-provided reference to a semantic target.
+
+Accepted forms across commands:
+
+1. **Handle** (preferred for precision)
+
+   * `@H:…`
+2. **Qualified name**
+
+   * `crate::mod::Type::method`
+3. **Bare name** (fuzzy)
+
+   * `process`
+4. **Location fallback**
+
+   * `path:line` (no `:col`)
+   * Optional disambiguator: `path:line/needle`
+
+### Handle
+
+A stable-ish identifier for a definition.
+
+**Contract**
+
+* Encodes: crate identity, module path, kind, name, and a lightweight “anchor signature hash.”
+* Must support best-effort re-resolution:
+
+  * `handle_resolve(handle) -> (Def, confidence, note)`
+* Handles are printable and copy/pasteable.
+
+**Tradeoff**
+
+* Perfect stability is costly and fragile. Best-effort resolution + confidence is the pragmatic sweet spot for agent workflows.
+
+### Fragment
+
+The unit of output. A fragment is a readable piece of code or text that is:
+
+* Semantically targeted (Def or Span).
+* Rendered with an intentful extraction policy.
+* Grounded with repo-relative location.
+* Optional highlight anchors.
+
+Conceptually:
+
+* `Fragment { section, group?, rank, kind, render, target(Def|Span), anchor?, title, handle?, meta }`
+
+### Render modes
+
+A small vocabulary describing *how to slice code*:
+
+* `DOC_SIG`
+  Doc summary + signature (no body). The default “API surface” slice.
+
+* `ITEM`
+  Full syntactic item (struct/enum/trait/impl/fn). Bodies included (subject to budgets).
+
+* `HEADER`
+  One-line declaration header (impl header, type header).
+
+* `LINE`
+  The containing line of a span.
+
+* `STMT`
+  The containing statement (semantic unit for refs, locals).
+
+* `BLOCK`
+  The smallest enclosing block / match arm / branch needed to see control flow around a span.
+
+* `EXPR`
+  The smallest meaningful expression (critical for compare audits).
+
+**Opinionated constraint:** Keep this set small. If you need 20 modes, you are leaking formatting complexity into the language.
+
+### Metrics
+
+Structured numbers emitted by views:
+
+* counts (callers, impls, refs by kind)
+* breakdowns (operators used in comparisons)
+* coverage (shown vs omitted)
+
+Metrics are first-class outputs, not “raw tuples.”
+
+---
+
+## CLI design
+
+You asked to avoid “minimal at all costs” while still requiring that each command earns its place. The design below is a **small set of operators** plus **explicit, task-shaped lenses** that are worth having as standalone entry points.
+
+### Command families
+
+1. **Selection**
+
+   * `raql search`
+
+2. **Comprehension (curated artifacts)**
+
+   * Default dossier: `raql <selector>` (alias: `raql explain <selector>`)
+   * Explicit “just these” lenses:
+
+     * `raql callers <selector>`
+     * `raql callees <selector>`
+     * `raql refs <selector> [--kind …]`
+     * `raql uses <selector> [--kind …]`
+     * `raql impls <selector> [<selector> …]` (intersection use case)
+     * `raql interface <selector>` (type surface area, intentional and distinct)
+
+       * This earns its place because “I need to *use* this type” is a different intent than a general dossier.
+
+3. **Narrative / cross-hop**
+
+   * `raql trace <selector> [--to <selector>] [--depth N]`
+
+4. **Verification**
+
+   * `raql audit <check> <selector>`
+
+5. **Subsystem packing**
+
+   * `raql bundle <selector> [--radius N]`
+
+6. **Power user**
+
+   * `raql q` (custom view/query execution)
+
+7. **Code generation**
+
+   * `raql scaffold impl <Trait> for <Type>`
+
+### Why this isn’t “too many commands”
+
+Each of the lens commands above has a materially different output contract:
+
+* `callers` is grouped callsite control flow context.
+* `refs` is intent-classified EXPR/STMT slices.
+* `uses` is type-site roles across APIs and locals.
+* `interface` is API surface (docs + sigs) without usage noise.
+* `dossier` is “what is this and what context do I need.”
+
+If a command does not define a distinct assembly axis, it should not exist.
+
+---
+
+## Flags
+
+### Output mode
+
+* `--only {artifact|nav|counts}`
+
+  * `artifact` default: curated code fragments + metrics.
+  * `nav`: headers only (map mode).
+  * `counts`: metrics only.
 
 * `--jsonl`
-  Output JSONL records instead of text.
+  Stream fragments and metrics as JSONL events.
 
-* `--code[=N]`
-  Include code excerpt. Default N=1 if provided. (For multi-hit commands, this can be expensive, so it’s opt-in.)
+### Scope controls
 
 * `--include-tests`
-  Default behavior is “tests excluded” (because it’s the 99th percentile exploration pain). Add this flag to include them.
-
 * `--include-macro`
-  Default excludes macro-generated hits. Add this to include macro-expanded results.
-
 * `--include-blanket`
-  Default hides blanket impls (the “.into() takes me to a blanket impl” problem). Add to include.
 
-That’s it for global. Everything else is command-specific and minimal.
+### Concrete show knobs (explicit, not “more/full”)
+
+* `--bodies=on|off`
+* `--show callers=K|all`
+* `--show callees=K|all`
+* `--show impls=K|all`
+* `--show examples=K|all`
+
+### Budgets (rare but necessary)
+
+* `--max-frags=N`
+* `--max-lines=N`
+
+### Explainability
+
+* `--why`
+  Annotate fragments with inclusion reasons and edge kinds (direct, through trait, etc).
 
 ---
 
-# The v0 command set
+## Output formatting contract
 
-## 1) `raql find <noun>`
+This is where RAQL earns its keep. The output is structured, curated, and predictable.
 
-Cold start. “What even is this string in this repo?”
+### Formatting goals
 
-### Output shape
+* First screen answers “what is this?”.
+* Fragments are grounded but not noisy.
+* Grouping makes patterns visible.
+* Elision is honest and actionable (“what was omitted + how to expand”).
 
-* lists *definitions* and common semantic categories
-* returns handles
+### Artifact preamble
+
+Single line, log-friendly:
+
+`raql <cmd>  <selector>  ->  <resolved-kind> <resolved-path>  [@H:…]`
+
+**Tradeoff:** This is one line of overhead that pays for itself in debugging and copy/paste workflows.
+
+### Summary section
+
+Always key-value, compact, diff-friendly:
+
+```
+# Summary
+kind: fn
+handle: @H:…
+path: crate::…
+scope: prod, source, no-blanket
+analysis: features=…, target=…
+callers: 12 direct, 7 through-trait
+```
+
+### Sections and grouping
+
+* Section headings start with `#`.
+* Group headings start with `##`.
 
 Example:
 
+* `# Usage patterns`
+* `## In fn handle_request(...) [@H:…]`
+
+### Fragment header styles
+
+Two styles depending on `--only`:
+
+#### Artifact mode (semantic-first)
+
 ```
-# FIND CanonicalState
-src/core/state.rs:42:1  V  TYPE struct core::state::CanonicalState  fields=5 impls=12  @T:core::state::CanonicalState
-src/core/traits.rs:15:1 V  TRAIT core::traits::CanonicalState  items=3 impls=9  @Tr:core::traits::CanonicalState
+FN  fn process(&self, req: Request) -> Result<Response, MyError>
+at src/processor.rs:41-78  [@H:…]
 ```
 
-This solves the “amnesia noun ambiguity” problem immediately.
+Rationale:
+
+* Reads like documentation.
+* Location is present but does not dominate.
+* Prevents “organized grep” vibes.
+
+#### Nav mode (location-first)
+
+```
+src/processor.rs:41-78  FN  fn process(&self, req: Request) -> Result<Response, MyError>  [@H:…]
+```
+
+Rationale:
+
+* Optimizes jump workflows.
+* Matches “map mode.”
+
+### Code blocks
+
+Use a guttered format for terminal readability and highlighting:
+
+* Each line prefixed with `| `
+* Anchor lines prefixed with `> | `
+
+Rationale:
+
+* Highlighting without column underlines.
+* Works for LINE/STMT/BLOCK/EXPR.
+* JSONL provides raw code without gutters for perfect copy/paste.
+
+### Elision messages
+
+Always:
+
+* what was omitted
+* how many
+* the concrete knob to expand
+
+Examples:
+
+* `… omitted 11 more trait impls (showing 8/19). Add: --show impls=all`
+* `… truncated BLOCK context to 80 lines. Add: --max-lines=200`
+
+### Alternatives (ambiguity handling)
+
+If resolution is ambiguous, RAQL prints a picker section:
+
+```
+# Alternatives (matched "process")
+
+1. FN  fn crate::processor::process(req: Request) -> Result<Response, MyError>  [@H:…]
+   doc: Processes incoming requests.
+
+2. FN  fn crate::ingest::process(blob: Bytes) -> Result<()>  [@H:…]
+   doc: Parses ingest payload.
+
+Tip: rerun as `raql @H:…`
+```
+
+Rationale:
+
+* Wrong symbol selection is expensive.
+* Avoid interactive prompts; keep it scriptable.
 
 ---
 
-## 2) `raql explain <file:line:col | handle>`
+## Canonical output contracts per command
 
-This is the anchor. It should feel like “dump everything useful about this location”, not a bag of facts.
+These are “theories of showing” that make commands earn their place.
 
-### What `explain` must do in v0
+### `raql search <query>`
 
-It detects the syntactic situation and prints the most useful semantic context:
-
-* On a **call**: resolved callee, signature, where defined, whether it’s a trait method, and the receiver/arg types.
-* On a **method call**: show the impl path if concrete; if not, show the trait item and bounds.
-* On a **field access**: resolve field to its definition, field type, and show “what you can do with this value” (key methods or traits).
-* On `.into()` / operators: show the relevant trait method mapping and skip blanket impls unless `--include-blanket`.
-
-Example (call site):
-
-```
-src/core/apply.rs:42:13  V  CALL core::apply::apply_event(state: &mut CanonicalState, event: &EventBody) -> Result<()>  def=src/core/apply.rs:10:1  @F:core::apply::apply_event
-  args: state=&mut core::state::CanonicalState, event=&core::event::EventBody
-  returns: Result<(), core::error::Error>
-  enclosing: core::daemon::ingest_remote_batch(...)  @F:core::daemon::ingest_remote_batch
-```
-
-Example (field access):
-
-```
-src/core/state.rs:88:9  V  FIELD core::state::CanonicalState.beads: BeadMap<BeadId, Bead>  def=src/core/state.rs:45:5  @Field:core::state::CanonicalState::beads
-  value-type: core::beads::BeadMap<...>  traits: Clone Debug Serialize Deserialize  @T:core::beads::BeadMap
-  common methods: insert get remove iter len
-```
-
-If `--code=2`:
-
-* include 2 lines of code around the location.
-
-This single command eliminates most “open file, scroll, parse imports” token waste.
-
----
-
-## 3) `raql type <type>`
-
-Type exploration: fields, variants, impls, key methods, embedding, conversions.
-
-### Default output for `type` should include
-
-* definition location + kind (struct/enum/type alias)
-* fields/variants (names + types)
-* implemented traits (top N, with “+K more”)
-* embed/containment: “types that contain this as a field”
-* conversions: From/Into edges (skipping blanket by default)
-
-Example:
-
-```
-# TYPE core::state::CanonicalState  (tests excluded, macro excluded)
-src/core/state.rs:42:1  V  struct core::state::CanonicalState  @T:core::state::CanonicalState
-  fields:
-    beads: core::beads::BeadMap<BeadId, Bead>
-    tombstones: core::tomb::TombstoneSet
-    ...
-  traits (12): Default Debug Clone Serialize Deserialize ... (+6)
-  embedded-by (3):
-    src/daemon/repo.rs:21:1  V  struct daemon::RepoState.state: CanonicalState  @T:daemon::RepoState
-  conversions:
-    From<...> (2): core::state::CanonicalState <- core::state::Snapshot ... (+1)
-    Into<...> (1): core::state::CanonicalState -> core::state::Snapshot
-```
-
-This covers rust-analyzer issues:
-
-* “traits this type implements”
-* “what structs contain this type as a field”
-* “what can this type convert to/from”
-
----
-
-## 4) `raql fn <fn>`
-
-Function exploration: signature, location, parameters, return, and a tiny summary of connectivity.
-
-Example:
-
-```
-src/core/apply.rs:10:1  V  fn core::apply::apply_event(state: &mut CanonicalState, event: &EventBody) -> Result<()>  @F:core::apply::apply_event
-  calls: 7 (direct)   called-by: 3 (direct)
-```
-
-If the agent needs more: `callers`/`callees`.
-
----
-
-## 5) `raql trait <trait>`
-
-Trait exploration: methods/items + implementors summary.
-
-Example:
-
-```
-src/core/traits.rs:15:1  V  trait core::traits::CanonicalState  items=3 impls=9  @Tr:core::traits::CanonicalState
-  items:
-    fn merge(&mut self, other: Self)
-    fn snapshot(&self) -> Snapshot
-    ...
-  implementors (9): core::state::CanonicalState, core::state::StoreState, ... (+7)
-```
-
-This maps cleanly to:
-
-* “find types implementing Trait1 AND Trait2” (see `impls` below)
-* “show all associated items available on this type” (via type+trait)
-
----
-
-## 6) `raql impls <trait> [<trait2> ...]`
-
-Intersection by default. This directly answers the “Trait1 AND Trait2” class.
-
-Example:
-
-```
-# IMPLS (AND) core::fmt::Debug core::serde::Serialize
-src/core/state.rs:42:1  V  TYPE core::state::CanonicalState  @T:core::state::CanonicalState
-src/core/store.rs:11:1  V  TYPE core::store::StoreState  @T:core::store::StoreState
-... (+14)
-```
-
-Default skips blanket impls. `--include-blanket` shows them.
-
----
-
-## 7) `raql callers <fn-or-method>` and `raql callees <fn>`
-
-Call flow, with explicit cost knobs.
-
-### Defaults
-
-* `callers X` is **direct** calls only (cheap, reliable).
-* To expand:
-
-  * `--transitive[=N]` (medium). Default depth if flag present maybe 5.
-  * `--through-traits` (expensive). Includes trait method calls where the concrete impl may be unknown. Lines are tagged `V` or `H` appropriately.
-
-Example:
-
-```
-# CALLERS core::apply::apply_event (direct)
-src/daemon/core.rs:287:5  V  CALL daemon::core::ingest_remote_batch -> apply_event  @F:daemon::core::ingest_remote_batch
-src/daemon/repo.rs:156:9  V  CALL daemon::repo::replay -> apply_event  @F:daemon::repo::replay
-```
-
-Trait method usage example:
-
-```
-# CALLERS core::fmt::Display::fmt  (--through-traits)
-src/ui/log.rs:44:12  V  FORMAT uses Display for core::state::CanonicalState  @T:core::state::CanonicalState
-src/ui/log.rs:51:9   H  FORMAT uses Display for <T> where T: Display  @Tr:core::fmt::Display
-```
-
-This explicitly addresses the rust-analyzer “call hierarchy through generics” pain without pretending it’s free or exact.
-
----
-
-## 8) `raql uses <thing>`
-
-This is “grep but semantic, categorized by role”.
-
-### Default behavior
-
-* categorizes automatically, no extra flags
-* prints only non-empty categories
-* headings include totals and hidden counts (tests/macro)
-
-For a **type**, categories include:
-
-* `FIELD_TYPE`
-* `PARAM_TYPE`
-* `RETURN_TYPE`
-* `LOCAL_TYPE`
-* `WHERE_BOUND`
-* `CONSTRUCT` (construction in expressions)
-* `PATTERN` (destructuring/match sites)
-
-Example:
-
-```
-# USES core::state::CanonicalState  (tests excluded, macro excluded)
-# FIELD_TYPE (3)
-src/daemon/repo.rs:21:1  V  daemon::RepoState.state: CanonicalState  @T:daemon::RepoState
-...
-# PARAM_TYPE (5)
-src/core/apply.rs:10:21  V  fn apply_event(state: &mut CanonicalState, ...)  @F:core::apply::apply_event
-...
-# PATTERN (2)
-src/core/state.rs:140:9  V  match CanonicalState { ... }  @T:core::state::CanonicalState
-```
-
-This directly answers the “construction vs pattern sites” request class.
-
-For a **trait**, `uses` includes:
-
-* `BOUND` (where Trait appears in bounds)
-* `METHOD_CALL` (calls to its methods, including through generic bounds)
-* optionally `IMPL` (types implementing it), though you may keep that in `trait/impls` to reduce noise.
-
-For a **function**, `uses` is effectively call sites (like callers), but categorized:
-
-* `DIRECT_CALL`
-* `MACRO_CALL` (if `--include-macro`)
-* `DYN_DISPATCH` (if applicable)
-
----
-
-## 9) `raql refs <thing>`
-
-This is “Find references, but by intent”.
-
-Ref kinds in v0 are intentionally small, and tuned for exploration and writing:
-
-* `READ`
-* `WRITE`
-* `COMPARE` (includes `== != < <= > >=`, match scrutinee checks, assert_eq-ish macros when resolvable)
-* `PASS` (passed as argument / receiver)
-* `FIELD` (field access `.foo`)
-* `MOVE` (consumed; helps writing code correctly)
-
-Example:
-
-```
-# REFS core::store::Request.store_id  (tests excluded, macro excluded)
-# COMPARE (3)
-src/core/validate.rs:77:9  V  store_id == expected_id  @Field:core::store::Request::store_id
-src/core/guard.rs:41:5     V  assert_eq!(store_id, expected_id)  @Field:core::store::Request::store_id
-# PASS (5)
-...
-# WRITE (0)
-Verified: 0 write references (scope=prod, macro=excluded)
-```
-
-That last line is the “negative space” superpower: it turns “no hits” into an actionable guarantee.
-
----
-
-## 10) `raql impact <thing>`
-
-The “peripheral vision” command. Depth-1 spiderweb summary for refactors.
-
-For a **type**:
-
-* embedded-by (field containment)
-* fns taking it
-* fns returning it
-* impl traits
-* conversions
-
-For a **fn**:
-
-* callers
-* callees
-* types in signature
-
-For a **trait**:
-
-* implementors
-* bounds usage
-* method call usage (optional)
-
-Example:
-
-```
-# IMPACT core::state::CanonicalState  (depth=1, tests excluded, macro excluded)
-embedded-by: 3  (RepoState.state, Snapshot.state, ...)
-param-of:    12 (apply_event, build_snapshot, ...)
-returns:     4  (load_state, snapshot, ...)
-traits:      12 (Default, Serialize, ...)
-conversions: 3  (From/Into)
-```
-
-Optionally, include top locations per bucket:
-
-```
-embedded-by:
-  src/daemon/repo.rs:21:1  V  daemon::RepoState.state  @T:daemon::RepoState
-...
-```
-
-This is the “spooky action at a distance” antidote.
-
----
-
-## 11) `raql scaffold ...`
-
-This is the “reasoning -> writing” bridge. High leverage for agents.
-
-### v0 scaffolds that pay off immediately
-
-* `raql scaffold impl <trait> for <type>`
-* `raql scaffold match <enum-type>` (optional v0, but very useful)
-
-Example:
-
-```bash
-raql scaffold impl core::fmt::Display for @T:core::state::CanonicalState
-```
+Purpose: selection without committing to a big artifact.
 
 Output:
 
-```rust
-impl core::fmt::Display for core::state::CanonicalState {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!()
-    }
+* A ranked list of candidates with `DOC_SIG` or `HEADER`, doc summary, handle.
+* No callsites, no blocks.
+
+Why it earns its place:
+
+* It is the “selector tool” in the Select → Assemble loop.
+* It is script-friendly and avoids accidental firehose.
+
+### `raql <selector>` (Dossier, alias `explain`)
+
+Purpose: “what is this and what context do I need to work safely?”
+
+Sections (always in this order):
+
+1. Summary
+2. Definition (DOC_SIG by default, ITEM if type/trait)
+3. Context you likely need (types, errors, trait parent)
+4. Typical usage patterns (bounded, grouped)
+5. Related edges (small, bounded)
+6. Alternatives (only if needed)
+
+Why it’s distinct:
+
+* It is balanced and curated. It is not “just callers” and not “just refs.”
+
+### `raql interface <selector>`
+
+Purpose: “I need to use this type or trait. Show surface area.”
+
+Default contents:
+
+* Definition ITEM for type/trait
+* Inherent methods DOC_SIG
+* Trait implementations as HEADER only
+* Associated types and key bounds (headers)
+
+Why it earns its place:
+
+* It eliminates usage noise, keeps API surface compact.
+* This is a very common agent move.
+
+### `raql callers <selector>`
+
+Purpose: “how is this called, and what control flow surrounds usage?”
+
+Output:
+
+* Target DOC_SIG
+* Groups by caller function:
+
+  * caller DOC_SIG
+  * callsites rendered as BLOCK with highlight
+* Optional “through trait” section, labeled
+
+### `raql callees <selector>`
+
+Purpose: “what does this function touch?”
+
+Output:
+
+* Target DOC_SIG
+* Direct callees DOC_SIG (bounded)
+* Trait-target callees DOC_SIG (labeled)
+* Optional: a small “hot edge” summary (most frequent)
+
+### `raql refs <selector> [--kind K]`
+
+Purpose: “how is this value used, by intent?”
+
+Output:
+
+* Summary with counts per kind, operator breakdown for COMPARE
+* Groups by enclosing function (DOC_SIG)
+* Each hit rendered by intent:
+
+  * COMPARE: EXPR preferred, plus GUARD context when relevant
+  * WRITE/MOVE/PASS: STMT
+  * FIELD: LINE or STMT depending on clarity
+
+### `raql uses <selector> [--kind K]`
+
+Purpose: “where does this type appear in APIs and structure?”
+
+Output grouped by role:
+
+* FIELD_TYPE: field signature line
+* PARAM_TYPE: signature line
+* RETURN_TYPE: signature line
+* LOCAL_TYPE: STMT
+* WHERE_CLAUSE: LINE
+* CONSTRUCT/PATTERN: STMT or BLOCK
+
+### `raql impls <Trait1> [Trait2 …]`
+
+Purpose: intersection queries (capability search).
+
+Output:
+
+* Summary counts
+* Candidate types as HEADER (or DOC_SIG if type definition is small)
+* Optional: show the matching impl headers under each type
+
+This earns its place because it is a distinct capability search pattern, not just an “impl list.”
+
+### `raql trace <selector> [--to …]`
+
+Purpose: multi-hop narrative with witness paths.
+
+Output:
+
+* Summary with number of paths shown, edge kinds involved
+* Path cards:
+
+  * Each hop has a kind label (CALL, PROPAGATE_QMARK, CONVERT_FROM, HANDLE, etc)
+  * Each hop includes a small code slice and grounding
+
+Why it’s distinct:
+
+* Trace outputs connected narratives, not exemplars.
+
+### `raql audit <check> <selector>`
+
+Purpose: verification, invariant enforcement.
+
+Checks v0 (each must be sharply defined):
+
+* `compare`: direct comparisons and ordering
+* `write`: mutation sites
+* `construct`: construction sites (type or variant)
+* `handle`: match/handler sites (especially errors)
+
+Output:
+
+* Report-style summary
+* Findings grouped by function/module, slices chosen to verify in one glance
+
+Why it’s distinct:
+
+* Its goal is correctness verification, not comprehension.
+
+### `raql bundle <selector> [--radius N]`
+
+Purpose: produce a “virtual source file” that reads like a subsystem.
+
+Output must include:
+
+* Contents (TOC) with numbered items and handles
+* Ordered body:
+
+  1. primary definitions
+  2. related traits and impl headers
+  3. key methods (DOC_SIG by default)
+  4. key error types and flows (bounded)
+
+Why it’s distinct:
+
+* It optimizes for linear reading of a closure, not just “what’s relevant.”
+
+---
+
+## JSONL output contract
+
+JSONL is a stream of events. Two main event types:
+
+### Fragment event
+
+```json
+{
+  "event": "fragment",
+  "section": "Usage patterns",
+  "group": "@H:caller…",
+  "rank": 78,
+  "kind": "CALLSITE",
+  "render": "BLOCK",
+  "handle": "@H:target…",
+  "file": "src/http.rs",
+  "line_start": 110,
+  "line_end": 118,
+  "title": "callsite",
+  "code": "raw code without gutters",
+  "anchor": {"line_start": 113, "line_end": 113},
+  "meta": {"edge": "through_trait"}
 }
 ```
 
-This reduces hallucinated signatures dramatically.
+### Metric event
+
+```json
+{
+  "event": "metric",
+  "section": "Summary",
+  "name": "callers_direct",
+  "value": 12
+}
+```
+
+Rationale:
+
+* Downstream tooling can reconstruct the artifact, filter sections, or feed handles into other commands.
 
 ---
 
-## 12) `raql q` and `raql sample`
+## Query language and view system
 
-For the 20% cases, view authorship, and “I need exactly this weird slice”.
+You flagged that the QL started feeling less approachable. The fix is to **keep a relational core** but add a **view DSL** that is ergonomic and opinionated for assembly.
 
-* `raql sample uses` shows a handful of tuples for grounding.
-* `raql q` runs a heredoc Datalog query.
+### Two layers
 
-But the daily workflow is the verbs above.
+1. **RAQL Core (relational)**
+
+   * Facts + derived relations
+   * Joins, recursion (bounded), aggregates
+   * Great for correctness and reuse
+
+2. **RAQL View DSL**
+
+   * Structured around sections, groups, and “show” operations
+   * Emits fragments and metrics
+   * Compiles to RAQL Core queries and a fragment emission plan
+
+This keeps expressiveness while making authoring intuitive.
+
+### View DSL primitives (minimal but powerful)
+
+* `section "Name" { … }`
+* `group by <key> { … }`
+* `let <name> = <relation>(...)`
+* `top K by <score>`
+* `when <predicate>`
+* `show <render>(<Def|Span>) kind=<K> title=<T> anchor=<Span?>`
+* `metric <name> = <aggregate>`
+
+The crucial ergonomic move: **blessed standard relations** so authors do not hand-join low-level call predicates.
+
+Examples of standard library relations (conceptual):
+
+* `callsites_of(target, mode=direct|through_trait) -> (caller_fn, call_span, resolution_kind)`
+* `callees_of(fn) -> (callee_fn, resolution_kind)`
+* `impls_of(type) -> (impl_def, trait_def?, impl_kind)`
+* `methods_of(type) -> (method_def, impl_def)`
+* `refs_of(def, kind?) -> (ref_span, enclosing_fn, kind, meta)`
+* `type_sites_of(type, role?) -> (span, owner_def, role)`
+
+### Output sinks in the language
+
+Views can emit:
+
+* fragments
+* metrics
+* small tables (optional)
+
+This resolves the “metrics without fragments” concern cleanly: metrics are not a fallback to raw tuples.
+
+### Overrides “slot into QL”
+
+CLI flags compile into injected facts:
+
+* `opt_include_tests()`, `opt_include_macro()`, `opt_include_blanket()`
+* `opt_bodies_on()`
+* `opt_show_callers(K|all)`, etc
+* budget facts `opt_max_lines(N)`, `opt_max_frags(N)`
+* `opt_only(mode)`
+
+Views consult these to decide what to emit.
 
 ---
 
-# How this hits the real-world rust-analyzer pattern list
+## Render pipeline and extraction
 
-* Trait queries (“what traits does this type implement?”): `type`, `explain`
-* Types implementing Trait1 AND Trait2: `impls Trait1 Trait2`
-* Calls to trait methods: `callers Trait::method --through-traits` or `uses Trait`
-* Callers through generics: `callers --through-traits` (explicitly expensive, tagged)
-* Field containment: `type` + `uses` + `impact`
-* From/Into: `type` + `impact`
-* Construction vs pattern: `uses Type` categories
-* Exclude tests: default, `--include-tests` if needed
-* Macro-generated: default off, `--include-macro` if needed
-* Skip blanket impls: default on, `--include-blanket` if needed
-* Operator resolution for PartialOrd/PartialEq: `refs --kind COMPARE`
+### Core idea
 
----
+Views specify *intent* (render mode). Renderer uses RA syntax trees to expand spans.
 
-# The “80/20 loop” this enables
+### Required extraction relations
 
-A typical amnesiac agent session becomes:
+**Span splitting**
 
-1. `raql find CanonicalState`
-2. `raql type @T:...`
-3. `raql uses @T:...`
-4. spot a location → `raql explain path:line:col`
-5. identify the relevant fn → `raql callers @F:...`
-6. before editing: `raql impact @T:...`
-7. need to implement something: `raql scaffold impl Trait for Type`
+* `def_name_span(Def, Span)`
+* `def_item_span(Def, Span)`
+* `def_sig_span(Def, Span)`
+* `def_header_span(Def, Span)`
 
-That’s a tight, repeatable loop that replaces a lot of “rg + read + hope”.
+**Span expansion**
 
----
+* `expand_span(Span, Mode, OutSpan)` where Mode in {LINE, STMT, BLOCK, EXPR}
 
-# One last judgment call: default scoping
+**Text retrieval (guarded)**
 
-For v0, I’d default to:
+* `span_text(Span, Text)`
+  Guard: Span must be bound. This prevents “enumerate every line of every file” queries.
 
-* tests excluded
-* macro excluded
-* blanket impls excluded
+**Grounding**
 
-…and make that visible in headers so the agent doesn’t forget the lens:
+* `span_loc(Span, RelPath, LineStart, LineEnd)`
 
-`# USES ... (tests excluded, macro excluded)`
+**Docs**
 
-This biases toward **signal**, which is what exploration needs. When you need the noise, you opt in.
+* `def_doc_summary(Def, OneLine)`
+  Used in DOC_SIG and search results.
 
 ---
 
-If you want, next I can draft the **exact v0 “view catalog”** (the high-level views that back each command) and the minimal HIR-backed primitive relations required to implement them, but still in a “views-first” order so the design stays anchored to what you actually type.
+## Minimal primitive schema
 
+This is the semantic waist. It stays small and precise.
+
+### Identity and metadata
+
+* `def_kind(Def, Kind)` (type, fn, trait, impl, field, variant, module…)
+* `def_name(Def, Name)`
+* `def_path(Def, PathStr)` (qualified)
+* `def_crate(Def, Crate)`
+* `def_visibility(Def, Vis)`
+* `handle(Def, HandleStr)`
+* `handle_resolve(HandleStr, Def, Confidence, Note)`
+
+### Search
+
+* `search(QueryStr, Def, Score)`
+
+### Types and type refs
+
+* `typeref_pretty(TypeRef, PrettyStr)`
+* `typeref_mentions(TypeRef, Def)` (with written vs normalized split later if needed)
+* `type_site(Role, OwnerDef, TypeRef, Span)`
+  Role in {field_type, param_type, return_type, local_type, where_clause}
+
+### Traits and impls
+
+* `impl_kind(Impl, inherent|trait)`
+* `impl_self_type(Impl, TypeDef)`
+* `impl_trait(Impl, TraitDef)` (when trait impl)
+* `impl_is_blanket(Impl)`
+* `impl_item(Impl, AssocItemDef)`
+* `trait_item(TraitDef, AssocItemDef)`
+* `assoc_item_kind(AssocItemDef, Kind)`
+* `fn_trait_parent(FnDef, TraitDef)` (if trait method)
+* `fn_impl_parent(FnDef, ImplDef)` (if in impl)
+
+### Functions
+
+* `fn_sig(FnDef, SigPrettyStr)` (for titles, not necessarily rendering)
+* `fn_param(FnDef, Index, ParamDef)`
+* `param_type(ParamDef, TypeRef)`
+* `fn_return_type(FnDef, TypeRef)`
+
+### Calls
+
+* `call(CallId)`
+* `call_in_fn(CallId, CallerFn)`
+* `call_span(CallId, Span)`
+* `call_target(CallId, CalleeFn)` (may be multiple)
+* `call_trait_target(CallId, TraitMethodFn)` (through bounds)
+* `call_resolution(CallId, Kind)` (direct, inherent, trait_static, trait_dyn, closure, unknown)
+
+### References (value intent)
+
+* `ref_event(RefId, Def, RefKind, Span, EnclosingFn)`
+* `ref_kv(RefId, Key, Val)` (operator, callee, by=move/borrow, etc)
+
+### Error flow (to pass the real “context assembly” test)
+
+* `error_event(ErrorDefOrVariant, Kind, Span, EnclosingFn, Detail)`
+
+  * Kind: CONSTRUCT_VARIANT, RETURN_ERR, PROPAGATE_QMARK, MAP_ERR, MATCH_HANDLE, CONVERT_FROM
+
+This is the “semantic event” primitive that turns error understanding from grep into narrative.
+
+---
+
+## Ranking, budgets, and determinism
+
+### Why ranking must be specified
+
+Without stable ordering, artifacts become noisy and hard to diff. Agents also need predictability to reason.
+
+### Default ranking heuristics (opinionated)
+
+* Prefer workspace defs over external.
+* Prefer non-test over test unless included.
+* Prefer non-macro over macro unless included.
+* Prefer non-blanket impls unless included.
+* For callers/usage:
+
+  * rank callers by number of callsites, then by module proximity.
+* For impl lists:
+
+  * rank by “referenced in repo” if available, else stable alphabetical by path.
+
+### Default budgets (example starting point)
+
+* Dossier typical usage: show 3 caller groups, 2 callsites per group.
+* Callers lens: show 8 caller groups, 2 callsites per group.
+* Refs lens: show 5 groups per ref kind, 3 hits per group.
+* Type interface: show 25 methods, 8 trait impl headers.
+* Bundle: 30 items in TOC, radius 1 by default.
+
+Budgets must produce elision messages with expansion knobs.
+
+---
+
+## The “just these” mechanism
+
+You explicitly want “just callers”, “just refs”, “just uses”, etc. There are two complementary paths:
+
+1. **Explicit lens commands** (recommended for usability)
+
+   * `raql callers X`
+   * `raql refs X --kind compare`
+   * `raql uses X --kind param_type`
+
+2. **Section selection on any artifact** (composition)
+
+   * `raql X --just callers,refs`
+   * `raql bundle X --just contents,definitions`
+
+Implementation: `--just` compiles to facts that filter emitted sections or lens recipes.
+
+Rationale:
+
+* Lens commands are discoverable and ergonomic.
+* `--just` supports composition without multiplying commands.
+
+---
+
+## Acceptance tests
+
+These are the “does it feel like context assembly?” tests.
+
+You already listed great ones. This spec treats them as v0 acceptance criteria:
+
+1. **Trait method with multiple impls**
+   `raql Processor::process` should assemble: trait method DOC_SIG, impl headers, and method bodies when `--bodies=on`, grouped per implementor.
+
+2. **Callers through generics**
+   `raql callers MyTrait::some_method --through-traits` should show DOC_SIG of caller plus BLOCK around `t.some_method()`, labeled through trait.
+
+3. **Type with 15+ trait impls (budgeting)**
+   `raql interface Processor` should show top impl headers and a precise elision message.
+
+4. **Guardrail compare**
+   `raql audit compare StoreId` should produce EXPR-first findings plus guard context when needed.
+
+5. **Ambiguous symbol**
+   `raql process` yields Alternatives picker with handles.
+
+6. **Error flow narrative**
+   `raql trace MyError` should show construction, propagation, conversion, and handling paths as readable hop cards.
+
+Additional v0 tests worth adding:
+
+* Macro-heavy callsites: primary source location vs expansion.
+* cfg-gated symbols: analysis config stamped in Summary.
+* dyn dispatch: labeled `trait_dyn`, show trait method target.
+
+---
+
+## What to implement first
+
+If you want the shortest path to something that feels “real”:
+
+1. Fragment IR + renderer (artifact/nav/counts + JSONL)
+2. Span splitting + expand_span + guarded span_text
+3. `search` + handle resolution + Alternatives picker
+4. Lenses with the highest ROI:
+
+   * dossier
+   * callers
+   * refs (compare)
+   * interface
+   * trace (call graph witness)
+5. Error_event primitive and `trace MyError`
+
+That sequence de-risks the product: you prove the assembly experience early, not after a year of schema work.
+
+---
+
+## Summary of the adjustments you just asked for
+
+* Yes, **`raql search`** is part of the core UX and earns its place as the “Select” tool that does not force a dossier.
+* Yes, “**just these**” is best served by **explicit lens commands** (callers/refs/uses) and optionally a compositional `--just` for section filtering.
+* No, we do not optimize for “4 verbs”. We optimize for:
+
+  * each command having a distinct intent and output philosophy
+  * a shared assembly substrate so functionality does not create chaos
+
+If you want, I can now do the next concrete step: write the canonical output contracts (section ord[<35;75;33M[<35;76;33Mer, default budgets, exact elision strings) for `search`, `dossier`, `callers`, `refs(compare)`, and `trace(MyError)` as “golden tests” you can snapshot in CI.
