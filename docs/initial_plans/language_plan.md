@@ -1,6 +1,42 @@
 Below is a practical, engineering-first implementation plan for RAQL v0.1 as specified. I’m going to treat your spec as the “contract” and turn it into a build order, module boundaries, algorithms, and an acceptance-test matrix.
 
-I’ll assume Rust for the engine + a rust-analyzer-backed host adapter, because your spec is already leaning that way.
+I'll assume Rust for the engine + a rust-analyzer-backed host adapter, because your spec is already leaning that way.
+
+---
+
+## Nonnegotiable: Rust-grade diagnostics (first-class)
+
+Treat diagnostics as a product feature, not an afterthought.
+
+**Recommended stack:**
+
+* `miette` for rich, multi-span diagnostics and reports
+* `thiserror` for structured error enums
+* snapshot tests for diagnostic output with colors disabled
+
+**Diagnostic requirements:**
+
+* every error has a primary span and a short message
+* wherever possible, include:
+  * secondary labeled spans
+  * `help:` suggestions (how to fix)
+  * stable error codes (e.g., `RAQL0001`)
+  * include-stack context for `.include` chains
+
+**Make diagnostics testable:**
+
+* render with `miette` report handler configured without ANSI color
+* snapshot the rendered output text
+
+**Error code ranges (suggested):**
+
+* `RAQL0001-0099`: parse errors
+* `RAQL0100-0199`: name resolution errors
+* `RAQL0200-0299`: type errors
+* `RAQL0300-0399`: mode errors
+* `RAQL0400-0499`: stratification errors
+* `RAQL0500-0599`: safety/range-restriction errors
+* `RAQL0900-0999`: runtime errors
 
 ---
 
@@ -71,6 +107,25 @@ Add a small shared crate used by syntax/compiler/engine/hosts to make invariants
 * Interned strings/symbols for predicate names, section/group/kind strings, string literals
 * Typed term/value representations (monomorphized after type checking)
 * A compact `VarSet` bitset type used by mode planning and runtime assertions
+
+**Explicit program phases (make illegal states unrepresentable):**
+
+Split compilation into distinct, typed phases:
+
+* `AstProgram`:
+  * raw identifiers, raw terms, source spans
+* `ResolvedProgram`:
+  * predicate/type/enum names resolved to ids
+* `TypedProgram`:
+  * every term annotated with a concrete monomorphic type
+  * variables have fixed types per rule
+* `PlannedProgram`:
+  * disjunction desugared
+  * goal ordering selected (mode planning)
+  * selected modes recorded per call site
+  * strata + SCC partitions computed
+
+Only `PlannedProgram` can be executed by the engine. This makes entire classes of bugs impossible.
 
 ### 1) Frontend crate: `raql_syntax`
 
@@ -216,6 +271,29 @@ No time estimates, just build order and “definition of done.”
 
 ---
 
+### Milestone 0.5: Diagnostics scaffolding (do this early)
+
+**Build**
+
+* A `RaqlDiag` type that implements `miette::Diagnostic`
+* A shared source manager:
+  * maps file ids to `miette::NamedSource`
+  * tracks `.include` stacks for any parsed file
+* Parser and compiler errors use `RaqlDiag`:
+  * parse errors: expected token sets, where it went wrong
+  * resolution errors: unknown predicate/type, unknown enum variant
+  * type errors: show expected vs found types, highlight the term
+  * mode errors: show the first unschedulable goal + currently bound vars + suggested reorder
+  * stratification errors: show the dependency cycle and edge kinds (positive/negative/selection/aggregate)
+
+**Done when**
+
+* A parse error points at the correct span with a useful message and help text
+* Include-stack context is printed (like Rust's "in file included from ...")
+* Snapshot tests exist for diagnostics output (colors disabled)
+
+---
+
 ### Milestone 1: Full parser (v0.1 grammar coverage)
 
 **Add**
@@ -265,7 +343,25 @@ The parser should construct distinct AST nodes for variables vs enum atoms witho
 **Done when**
 
 * Wrong-arity / wrong-type programs are rejected with precise diagnostics.
-* Enum variant resolution works and doesn’t break `S`/`D` variables.
+* Enum variant resolution works and doesn't break `S`/`D` variables.
+
+**Polymorphic constructors: `none` and `[]`**
+
+Implement type inference via constraint solving:
+
+* When encountering `none`:
+  * assign it a fresh type variable `option<Tv>`
+* When encountering `[]`:
+  * assign it a fresh type variable `list<Tv>`
+* Collect unification constraints from:
+  * predicate schemas
+  * constructors (`some(T)`)
+  * comparisons and arithmetic binding typing rules
+* Solve constraints to a concrete monomorphic type per rule.
+* If any type variable remains unconstrained at end:
+  * reject with a diagnostic:
+    * primary label: the `none` / `[]` literal
+    * help: "add type context by placing this in a typed predicate position" (and show the nearest predicate schema)
 
 ---
 
@@ -334,6 +430,16 @@ Implement mode planning as a bounded search:
   * which vars were needed
   * which goal(s) were runnable
   * where the planner got stuck
+
+**Quality requirement: mode error diagnostics**
+
+For mode failures, the diagnostic should include:
+
+* the selected partial ordering that worked so far
+* the first goal that could not be scheduled
+* which vars it required and which vars were currently bound
+* at least one actionable suggestion:
+  * "bind Span S earlier (e.g. call node_span(...) before span_text(...))"
 
 ---
 
@@ -447,6 +553,19 @@ Implement semi-naive from the start for recursive SCCs. A naive evaluator will m
 painful and will obscure correctness issues behind timeouts.
 
 Use naive evaluation only for non-recursive, acyclic SCCs if you want a simpler first implementation.
+
+**Determinism under partial runs: relation iteration order**
+
+To keep partial outputs reproducible:
+
+* Relations should have a deterministic enumeration order.
+* Prefer storage that preserves insertion order:
+  * `indexmap::IndexSet<Tuple, BuildHasherDefault<FxHasher>>`
+* Ensure insertion attempt order is deterministic:
+  * deterministic rule order
+  * deterministic join enumeration
+* Join operators must enumerate inputs in a deterministic order
+  (avoid iterating `HashSet`/`HashMap` directly unless wrapped in a stable view).
 
 **Done when**
 
@@ -659,6 +778,49 @@ which is incorrect. The spec already requires "no higher strata are evaluated" o
 ### Milestone 12: rust-analyzer adapter (the "load-bearing externs")
 
 Implement the required extern predicates/functions from §16.
+
+**Snapshot model (required)**
+
+* The adapter must construct exactly one rust-analyzer `Analysis` snapshot per RAQL run.
+* All extern predicate answers must come from that snapshot (immutability).
+* `world_stamp/1` must describe the snapshot configuration (target/features/cfg) sufficiently for reproducibility.
+
+**Span representation**
+
+Define Span as a stable handle to:
+
+* file id (including macro-expanded "virtual files" if supported)
+* byte/text range
+
+Implement `span_key/6` by computing:
+
+* stable relative path (or a stable virtual path for expanded files)
+* line/col range via a line index
+
+If macro-expanded spans are not supported in v0.1, document that `Span` refers only to original source files
+and macro internals map back to call-site spans.
+
+**Node representation**
+
+Do not store raw `SyntaxNode` in opaque values. Store:
+
+* file id + `SyntaxNodePtr` (or equivalent stable pointer)
+
+This keeps nodes stable across cheap clones and avoids lifetime issues.
+
+**Semantics layer**
+
+Prefer implementing externs via:
+
+* `hir::Semantics` for syntax<->hir mapping and type queries
+* position-specific analysis tools (`SourceAnalyzer` or equivalent)
+
+**TypeRef representation**
+
+* Intern TypeRefs in the adapter:
+  * `TypeRefId` is a stable handle keyed by the underlying RA type (`Ty`) or a normalized representation.
+* `ty_normalize(TR, Norm)` must never fail:
+  * return `TR` unchanged if normalization is unavailable.
 
 **Host value representation**
 

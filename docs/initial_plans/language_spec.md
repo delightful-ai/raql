@@ -45,6 +45,18 @@ RAQL is a **Datalog** language with a **Prolog-like surface**:
 
 RAQL runs against an **analysis snapshot** provided by a host (rust-analyzer adapter). All extern predicates read from that snapshot. In v0.1, there is exactly **one analysis world** (one feature/target configuration); the host is required to expose a stamp of that configuration (see §13.4).
 
+## 0.1 Compile-time errors and diagnostics (required)
+
+If a program fails to parse or fails any static check (name resolution, typing, safety/range restriction,
+mode validity, stratification), the program is rejected and evaluation does not start.
+
+Implementations must produce diagnostics that include:
+
+* a primary source location (file/line/col span)
+* a clear error message
+* optional secondary labels and actionable help text (recommended)
+* include-stack context for `.include` chains when relevant
+
 ---
 
 # 1. Lexical syntax
@@ -314,9 +326,14 @@ Syntax:
 Meaning:
 
 * For any **bound** `D` for which the call is well-typed, `def_doc_summary(D, Doc)` produces **exactly one** tuple.
-* Absence is represented via `none`, not “no tuple”.
+* Absence is represented via `none`, not "no tuple".
 
-This is RAQL’s canonical answer to optionality (§8).
+**Host contract requirement:**
+
+* If an extern `.func` produces zero or multiple results for a bound input, this is a runtime error (see §13.5).
+  This is considered a host contract violation.
+
+This is RAQL's canonical answer to optionality (§8).
 
 > Rule: “attribute-like” properties must be `.func` returning `option<T>` when absence is common (docs, parent, display name, etc.). Multi-valued edges remain `.decl` relations.
 
@@ -992,6 +1009,7 @@ Some operations may encounter runtime errors, including:
 
 * division by zero in arithmetic binding (§7.4, `:=`)
 * int overflow in arithmetic or sum (§3.1, §10.4)
+* extern `.func` cardinality violations (0 or >1 results for bound input) (§5.2)
 * implementation-defined failures in extern predicates (e.g. adapter I/O failure)
 
 **On any runtime error:**
@@ -1059,21 +1077,29 @@ Notes:
 
 ## 14.2 Fragment key/value metadata (optional but included)
 
-To avoid requiring map types:
+To avoid requiring map types, and to disambiguate between def and span fragments:
 
 ```prolog
+.type FragTarget = { DEF, SPAN }.
+
 .decl out_frag_kv(
   Section: string,
   Group: string,
   Rank: int,
   Seq: int,
   Kind: string,
+  Target: FragTarget,
   Key: string,
   Val: string
 ) output.
 ```
 
-This attaches metadata to the fragment identified by `(Section,Group,Rank,Seq,Kind)`.
+This attaches metadata to the fragment identified by `(Section,Group,Rank,Seq,Kind,Target)`.
+
+* `Target = FragTarget::DEF` refers to `out_def_frag`
+* `Target = FragTarget::SPAN` refers to `out_span_frag`
+
+This discriminator ensures that metadata can unambiguously target a fragment even if both `out_def_frag` and `out_span_frag` emit the same `(Section,Group,Rank,Seq,Kind)` tuple.
 
 ## 14.3 Metrics
 
@@ -1211,6 +1237,14 @@ We want enough to answer: “what control structure is this span in?”
 .func node_at(S: Span, N: option<Node>) extern.
 .mode node_at(+Span, -option<Node]).
 ```
+
+**Determinism rule for `node_at` (required):**
+
+Let `Candidates` be the set of nodes `N` such that `node_span(N, NS)` and span `S` is fully contained in `NS`.
+If `Candidates` is empty, return `none`.
+Otherwise return `some(N*)` where `N*` is the node with the smallest `node_span` (most specific).
+
+If multiple candidates have equal `node_span` (implementation-defined), break ties by `stable_order(N)`.
 
 ### Node attributes (required, functional)
 
