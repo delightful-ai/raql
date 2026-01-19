@@ -13,7 +13,7 @@ I’ll assume Rust for the engine + a rust-analyzer-backed host adapter, because
   * `.include`, `.type`, `.decl`, `.func`, `.mode`, `.pragma`
   * facts + rules
   * `not`, disjunction `( … ; … )`
-  * constraints (`= != < <= > >=`, arithmetic)
+  * constraints (`= != < <= > >=`, arithmetic binding via `:=`)
   * aggregates (`count`, `count_distinct`, `sum`, `min`, `max`)
   * `choose_topk(...)` binder
   * option terms: `none`, `some(T)`
@@ -52,13 +52,25 @@ I’ll assume Rust for the engine + a rust-analyzer-backed host adapter, because
 ### Host contract (rust-analyzer adapter)
 
 * Opaque value handles: `Def`, `Span`, `TypeRef`, `Node`, etc.
-* Required externs: `handle/2`, `span_loc/2`, type structure (§16.1), node context (§16.2), and whatever base schema your views use.
+* Required externs: `handle/2`, `span_key/6`, type structure (§16.1), node context (§16.2), and whatever base schema your views use.
+
+NOTE: this plan is now aligned to the spec's stable ordering contract:
+use `span_key/6` (not `span_loc/2`) and implement all required stable key functions.
 
 ---
 
 ## Architecture: four layers, one clean seam
 
 Think of it like a kiln: the compiler shapes the clay, the engine fires it, the host provides the raw ore, the renderer plates the result.
+
+### 0) Shared crate: `raql_ir` (new)
+
+Add a small shared crate used by syntax/compiler/engine/hosts to make invariants hard to violate:
+
+* ID newtypes: `PredId`, `RuleId`, `VarId`, `TypeId`, `EnumId`, `VariantId`, `StratumId`, `SccId`, plus opaque host ids
+* Interned strings/symbols for predicate names, section/group/kind strings, string literals
+* Typed term/value representations (monomorphized after type checking)
+* A compact `VarSet` bitset type used by mode planning and runtime assertions
 
 ### 1) Frontend crate: `raql_syntax`
 
@@ -116,6 +128,13 @@ Think of it like a kiln: the compiler shapes the clay, the engine fires it, the 
 * Relation storage (set semantics)
 * Semi-naive fixpoint per stratum/SCC
 * Execution of rule plans (joins, filters, negation checks)
+* Deterministic scheduling (required for reproducible partial runs):
+  * Sort rules by (include stack path, file, line, col) once at compile time.
+  * Evaluate strata in increasing stratum id.
+  * Within a stratum, evaluate SCCs in deterministic order.
+  * Within an SCC iteration, apply rules in that stable rule order.
+  * Avoid `HashMap` iteration order for any semantic effect:
+    * use stable iteration sources (sorted vectors, BTreeMap, or explicit "stable tuple order" indices)
 * Built-ins:
 
   * string helpers
@@ -125,6 +144,20 @@ Think of it like a kiln: the compiler shapes the clay, the engine fires it, the 
   * witness_path/path_hop binder + path storage
 * Recursion guard and partial-run behavior
 * Output collection
+
+**Runtime error plumbing (move earlier, make central)**
+
+Introduce a central run state:
+
+* `RunStatus = Ok | Partial`
+* `notes: Vec<(Section, Message)>`
+
+Any runtime error (checked arithmetic overflow, division by zero, host extern failure, `.func` cardinality violation)
+must:
+
+1. emit `out_status("partial")` (once)
+2. emit `out_note("Errors", "...")`
+3. halt evaluation immediately and return partial results
 
 **Key deliverable**
 
@@ -198,15 +231,10 @@ No time estimates, just build order and “definition of done.”
 * Parser roundtrips examples from your spec without loss of structure.
 * Error recovery gives usable messages (file/line/col, expected tokens).
 
-**Important design note: identifier ambiguity**
-Your spec allows **variables** like `S` and **enum atoms** like `IF`. Both are uppercase.
-Implementation plan: **lex identifiers uniformly** and disambiguate during type checking:
-
-* If an identifier matches an enum variant AND the expected type is that enum type → treat as enum constant.
-* Otherwise → treat as variable.
-* `_` alone → wildcard.
-
-This keeps your surface syntax intact and avoids inventing new sigils.
+**Enum atoms are unambiguous in v0.1**
+Per the spec, enum atoms are only written as `EnumType::Variant`.
+Bare uppercase identifiers are always variables (or `_` wildcard).
+The parser should construct distinct AST nodes for variables vs enum atoms without context-dependent resolution.
 
 ---
 
@@ -247,28 +275,65 @@ This keeps your surface syntax intact and avoids inventing new sigils.
 
 * Parse `.mode pred(+Type, -Type, ?Type, …).`
 * Store allowed modes per predicate.
+* Implement `?Type` expansion exactly per spec:
+
+  * A mode declaration containing one or more `?Type` positions expands to the cartesian product of replacing each `?` with `+` and `-`.
+  * After expansion, duplicate modes are permitted but redundant.
 
 **Implement mode checking as in your spec**
 
 * For each rule:
 
-  * Consider only **positive goals** (non-negated atoms, aggregates, choose_topk, func calls) to build an ordering.
-  * Find an ordering where each goal’s `+` args are bound when executed.
-* If no ordering exists → compile error.
+  * Consider **positive goals and binders** to build an ordering:
+    * positive predicate atoms
+    * `.func` calls
+    * aggregates
+    * `choose_topk`
+    * unification constraints (`T1 = T2`) which may bind vars
+    * arithmetic binding constraints (`X := Expr`) which bind `X`
+  * Find an ordering where each goal's `+` args are bound when executed, per spec's "exists some ordering".
 
 **Practical algorithm**
 
-* Treat each goal as a node with a set of required-bound vars.
-* Greedy/topological-style:
+Do NOT use a purely greedy picker. A greedy algorithm can reject a mode-valid rule.
 
-  * Start with vars bound by constants in rule + facts already bound in earlier chosen goals
-  * Repeatedly pick a goal whose required inputs are satisfied; add its outputs to bound-set.
-  * If stuck → invalid.
+Implement mode planning as a bounded search:
+
+* Represent body goals in an arena and track remaining goals via a bitmask.
+* Track currently bound variables via a bitset (`FixedBitSet` or equivalent).
+* At each step:
+  * compute runnable goals under at least one allowed mode (for predicates with multiple modes)
+  * branch if multiple runnable goals exist
+  * use heuristics to keep the search small (for example pick the goal that binds the most new vars first)
+* Memoize states `(remaining_goals_mask, bound_vars_mask)` to avoid exponential blowups.
+* Cap depth at number of goals.
+
+**Multi-mode call sites:**
+
+* If a predicate has multiple expanded modes, the planner must select a mode per call site.
+* A call is valid if there exists at least one mode such that all `+` inputs are bound at the time of evaluation.
+* Record the selected mode in the planned IR for execution.
+
+**Constraints as goals:**
+
+* Unification `T1 = T2`:
+  * may bind previously unbound vars (respecting occurs check at runtime)
+  * in planning, treat it as runnable when it can make progress (at least one side is sufficiently grounded to bind the other)
+* Arithmetic binding `X := Expr`:
+  * requires all vars used in `Expr` bound as `int`
+  * binds `X`
+* `!=`, `<`, `<=`, `>`, `>=`:
+  * require both sides ground before evaluation (planner must schedule them only after their vars are bound)
+  * bind nothing
 
 **Done when**
 
 * Mode-invalid rules are rejected.
 * Compiler produces a concrete **execution order** for each rule body (even though semantics are order-free).
+* Mode errors are explainable:
+  * which vars were needed
+  * which goal(s) were runnable
+  * where the planner got stuck
 
 ---
 
@@ -285,6 +350,14 @@ For head predicate `P` and a referenced predicate `Q`:
   * any predicate used inside `witness_path(...)` / `path_hop(...)` goals (or more precisely, treat these built-ins as stratum barriers)
   * any predicate used inside aggregate subgoals
 
+**Disjunction safety:**
+
+* Desugar `(A ; B ; ...)` into multiple rules per spec.
+* Before or during desugaring, enforce the spec's disjunction variable rule:
+  * any variable referenced outside the disjunction must be range-restricted in every branch
+* To prevent accidental capture/collision during desugaring:
+  * rename branch-local variables to unique names per branch in the desugared rules (alpha-renaming)
+
 **Compute SCCs** (Tarjan/Kosaraju)
 
 **Validate**
@@ -293,22 +366,44 @@ For head predicate `P` and a referenced predicate `Q`:
 
   * positive: stratum(P) >= stratum(Q)
   * negative/selection/aggregate: stratum(P) > stratum(Q)
+
+* Use a real and deterministic stratum computation:
+  * Build the condensation DAG (SCC graph).
+  * Assign weighted constraints:
+    * positive edge weight = 0 (stratum(head) >= stratum(dep))
+    * negative/selection/aggregate edge weight = 1 (stratum(head) >= stratum(dep) + 1)
+  * Compute minimal satisfying strata via longest-path DP in topological order.
+  * If the constraint system is inconsistent, reject and print the cycle and which edge(s) required strictness.
+
 * Additionally:
 
   * `choose_topk` forbidden if rule head is in an SCC that includes any predicate referenced inside its `Goals`
   * `witness_path`/`path_hop` forbidden in recursive SCCs
-  * aggregate recursion forbidden (cycle through aggregate edges)
+  * aggregates are stratified (per spec) and forbidden in recursive SCCs
+
+**Make witness_path's implied dependency explicit**
+
+Even if `witness_path` is implemented as an engine built-in, compilation must enforce the spec rule that it
+operates over a completed `graph_edge/5`.
+
+In dependency analysis:
+
+* If a rule body contains `witness_path(...)` or `path_hop(...)`, add a selection edge from the head predicate to:
+  * `graph_edge/5` (required)
+  * and any predicate referenced in the same rule that could define `graph_edge` (transitively, via normal deps)
+
+This guarantees `stratum(head) > stratum(graph_edge)` and prevents evaluating paths while edges are still growing.
 
 **Done when**
 
 * The compiler either:
 
   * produces strata (list of predicates per stratum), or
-  * rejects with a clear “cannot stratify due to negative/selection cycle” error.
+  * rejects with a clear "cannot stratify due to negative/selection cycle" error.
 
 ---
 
-### Milestone 5: Core evaluation engine (facts + monotone rules)
+### Milestone 5: Core evaluation engine (facts + monotone rules + unification + constraints)
 
 **Implement**
 
@@ -322,12 +417,36 @@ For head predicate `P` and a referenced predicate `Q`:
   * unify terms, extend bindings
   * emit head tuples
 
+**Move unification + constraints into the core engine milestone**
+
+You cannot implement correct joins without unification and constraint evaluation. Treat these as part of the
+minimum viable engine, not a later add-on.
+
+Implement in this milestone:
+
+* Unification with occurs check (spec-required)
+* Opaque host types are atomic and unify only by equality
+* Constraint evaluation:
+  * `=` is unification
+  * `:=` is checked integer expression evaluation
+  * `!=` and order comparisons require ground operands
+* Checked arithmetic everywhere:
+  * `checked_add/sub/mul`
+  * `checked_div` with explicit division-by-zero detection
+  * on failure: runtime error -> partial halt
+
 **Fixpoint**
 
 * Evaluate per stratum:
 
   * within stratum, evaluate SCCs to fixpoint
-* Start with a naive implementation, then upgrade to semi-naive (delta relations) once correct.
+
+**Semi-naive baseline**
+
+Implement semi-naive from the start for recursive SCCs. A naive evaluator will make even toy recursive workloads
+painful and will obscure correctness issues behind timeouts.
+
+Use naive evaluation only for non-recursive, acyclic SCCs if you want a simpler first implementation.
 
 **Done when**
 
@@ -340,26 +459,6 @@ For head predicate `P` and a referenced predicate `Q`:
   reach(A,C) :- reach(A,B), edge(B,C).
   ```
 
----
-
-### Milestone 6: Constraints, unification, options, lists
-
-**Implement**
-
-* Unification:
-
-  * variable binding
-  * wildcard `_` never binds
-  * structural match for `some(T)` and list terms
-* Constraints:
-
-  * `term = term` as unification (or equality check if both bound)
-  * `var = expr` binds or validates
-  * comparisons require both sides bound
-* Arithmetic expressions for `int`
-
-**Done when**
-
 * Your optionality examples work without two-rule boilerplate:
 
   ```raql
@@ -369,7 +468,7 @@ For head predicate `P` and a referenced predicate `Q`:
 
 ---
 
-### Milestone 7: Negation (stratified)
+### Milestone 6: Negation (stratified)
 
 **Implement**
 
@@ -388,7 +487,7 @@ For head predicate `P` and a referenced predicate `Q`:
 
 ---
 
-### Milestone 8: Aggregates
+### Milestone 7: Aggregates
 
 **Implement binder evaluation**
 For:
@@ -416,7 +515,7 @@ N = count(V : Goals).
 
 ---
 
-### Milestone 9: `choose_topk` binder (deterministic)
+### Milestone 8: `choose_topk` binder (deterministic)
 
 **Implement**
 
@@ -435,12 +534,12 @@ N = count(V : Goals).
 
 * primitives: straightforward
 * for `Def`: call host `handle(Def, string)` and compare strings
-* for `Span`: call host `span_loc(Span, string)` and compare strings
+* for `Span`: call host `span_key(Span, RelPath, L0, C0, L1, C1)` and compare the tuple
 * for `Path`: internal deterministic id
 
 **Caching**
 
-* Cache `handle` and `span_loc` results aggressively; top-k and witness paths will otherwise thrash.
+* Cache `handle` and `span_key` results aggressively; top-k and witness paths will otherwise thrash.
 
 **Done when**
 
@@ -448,7 +547,7 @@ N = count(V : Goals).
 
 ---
 
-### Milestone 10: `graph_edge` + `witness_path` + `path_hop`
+### Milestone 9: `graph_edge` + `witness_path` + `path_hop`
 
 Even though the spec marks these as `extern`, you can implement them inside the engine as **built-ins** that read the already-computed `graph_edge/5` relation. That keeps the feature available for any host and avoids pushing complex graph search into the adapter.
 
@@ -477,6 +576,16 @@ Even though the spec marks these as `extern`, you can implement them inside the 
   * store `Vec<Hop>` in an arena/map keyed by `PathId`
 * `path_hop(P, Seq, ...)` reads hops from the map.
 
+**Indexing requirement (make it explicit)**
+
+Do not run BFS by scanning the raw `graph_edge` tuple set.
+
+Before path enumeration:
+
+* materialize an adjacency index:
+  * `Map<(Graph, From), Vec<Edge>>`
+  * store edges in a stable, pre-sorted vector
+
 **Done when**
 
 * Your trace example works exactly:
@@ -486,7 +595,7 @@ Even though the spec marks these as `extern`, you can implement them inside the 
 
 ---
 
-### Milestone 11: Recursion guard + partial honesty outputs
+### Milestone 10: Recursion guard + partial honesty outputs (tighten semantics)
 
 **Implement**
 
@@ -497,12 +606,19 @@ Even though the spec marks these as `extern`, you can implement them inside the 
   * count iterations
   * if exceed:
 
-    * stop evaluating that SCC
     * mark run partial
     * emit:
 
       * `out_status("partial")`
       * `out_note("Notes", "fixpoint iteration limit exceeded in SCC: <name>")`
+    * halt evaluation immediately
+
+**Critical semantic requirement**
+
+When the recursion guard triggers, do NOT evaluate any remaining SCCs or any higher strata.
+Higher strata would otherwise compute results using incomplete lower-stratum relations (closed-world assumption),
+which is incorrect. The spec already requires "no higher strata are evaluated" on partial runs.
+
 * If no SCC exceeds limit:
 
   * emit `out_status("ok")`
@@ -513,7 +629,7 @@ Even though the spec marks these as `extern`, you can implement them inside the 
 
 ---
 
-### Milestone 12: Standard library `std.raql` (v0.1)
+### Milestone 11: Standard library `std.raql` (v0.1)
 
 **Provide (at minimum)**
 
@@ -540,7 +656,7 @@ Even though the spec marks these as `extern`, you can implement them inside the 
 
 ---
 
-### Milestone 13: rust-analyzer adapter (the “load-bearing externs”)
+### Milestone 12: rust-analyzer adapter (the "load-bearing externs")
 
 Implement the required extern predicates/functions from §16.
 
@@ -552,7 +668,13 @@ Implement the required extern predicates/functions from §16.
 * Maintain stable ordering keys:
 
   * `handle(Def) -> String`
-  * `span_loc(Span) -> String` formatted consistently
+  * `span_key(Span) -> (RelPath, L0, C0, L1, C1)` formatted consistently
+  * `typeref_id(TypeRef) -> String`
+  * `node_id(Node) -> String`
+  * `call_id(Call) -> String`
+  * `ref_id(Ref) -> String`
+  * `impl_id(Impl) -> String`
+  * `world_stamp() -> String`
 
 **Type structure**
 
@@ -582,7 +704,7 @@ Implement the required extern predicates/functions from §16.
 
 ---
 
-### Milestone 14: Renderer + “query mode”
+### Milestone 13: Renderer + "query mode"
 
 **Renderer responsibilities**
 
@@ -644,7 +766,7 @@ Implement the required extern predicates/functions from §16.
 
 ### 7) witness_path determinism test
 
-* Multiple shortest paths: lexicographic ho[<35;136;41Mp key ranking stable.
+* Multiple shortest paths: lexicographic hop key ranking stable.
 * `Seq` from `path_hop` is 0..n-1 exactly.
 
 ### 8) Recursion guard test
@@ -655,52 +777,105 @@ Implement the required extern predicates/functions from §16.
   * note emitted
   * partial derived facts preserved
 
+### 9) Missing spec corner tests (add these)
+
+* Occurs check:
+
+  ```raql
+  .decl p(X: option<int>) output.
+  p(X) :- X = some(X).
+  ```
+
+  Must fail the unification goal (no tuple produced).
+
+* `none` ambiguity rejection:
+
+  ```raql
+  .decl r(X: option<int>) output.
+  r(none).  % ok, context fixes T=int
+  ```
+
+  but
+
+  ```raql
+  .decl bad(X: option<int>) output.
+  .decl bad2(X: option<string>) output.
+  w(none).  % reject: no context for T
+  ```
+
+* Empty list ambiguity rejection (same idea for `[]`).
+
+* Groundness for `!=` and order comparisons:
+  * if `X != Y` can run before X/Y are bound, mode planner must reject or reorder.
+
+* Checked arithmetic overflow and division by zero:
+  * triggers runtime error -> partial halt -> out_note("Errors", ...)
+
+* min/max empty input fail the goal:
+  * `min(...)` over empty inner set produces no binding for the aggregate goal
+
+* witness_path stratum rule:
+  * reject if `witness_path` is in same stratum as `graph_edge`
+
+* Determinism under partial runs:
+  * same program + same inputs + same snapshot -> identical partial outputs
+
 ---
 
-## Two “sharp corners” to decide early (so they don’t bite later)
+## One "sharp corner" to decide early (so it doesn't bite later)
 
-### A) How to name/resolve enum atoms vs variables
+### What is "extern" in practice
 
-Recommended (matches your syntax and examples):
+Treat `extern` as "provided by the runtime host," where:
 
-* Parse identifiers as “UnresolvedIdent”
-* During type checking:
-
-  * if position expects enum `E` and token matches a variant of `E` → treat as enum atom
-  * else treat as variable (unless it’s `_`)
-    This preserves both `S` variables and `IF` constants.
-
-### B) What is “extern” in practice
-
-Treat `extern` as “provided by the runtime host,” where:
-
-* some externs [<35;137;41Mare **engine built-ins** (strings, coalesce, witness_path)
+* some externs are **engine built-ins** (strings, coalesce, witness_path)
 * some externs are **adapter-provided** (rust-analyzer facts)
   This keeps the language spec intact and makes the system modular.
+
+**Note:** The previous version of this plan discussed enum atom ambiguity - this is now resolved in the spec.
+Enum atoms are always written as `EnumType::Variant`, so there is no ambiguity with variables.
 
 ---
 
 ## Optional but high-leverage extras (still v0.1-friendly)
 
-These aren’t required by the spec, but they make v0.1 feel sturdy:
+These aren't required by the spec, but they make v0.1 feel sturdy:
 
-1. **Index planning from modes**
-   If a predicate mode is `(+Def,-Span)`, build an index keyed by `Def` for that relation.
+1. **Index planning from modes (make this core, not optional)**
+   Mode checking already tells you which columns are bound at each call site.
+   Use that to:
+   * build per-relation indexes keyed by the most common bound prefixes
+   * choose join strategies deterministically
 
-2. **Key caching for stable_order**
+2. **Separate extern `.decl` vs extern `.func` at the Host boundary**
+   Enforce `.func` semantics ("exactly one tuple") structurally:
+   * `.decl extern` returns 0..N tuples (iterator/stream)
+   * `.func extern` returns exactly 1 tuple or signals runtime error
+
+3. **MockHost first (unit tests before rust-analyzer)**
+   Add a `MockHost` implementation that:
+   * provides the required stable key functions (`handle`, `span_key`, `*_id`, `world_stamp`)
+   * provides a few small extern relations for tests
+   This lets you validate language semantics without debugging rust-analyzer integration at the same time.
+
+4. **Key caching for stable_order**
    Memoize:
+   * `handle(Def)`
+   * `span_key(Span, ...)`
+   * `typeref_id`, `node_id`, `call_id`, `ref_id`, `impl_id`
+   This is the difference between "snappy" and "why is topk slow?"
 
-* `handle(Def)`
-* `span_loc(Span)`
-  This is the difference between “snappy” and “why is topk slow?”
-
-3. **Explain mode errors**
+5. **Explain mode errors**
    When mode-check fails, print:
+   * which predicate call needed which vars bound
+   * one suggested ordering or the point where it got stuck
 
-* which predicate call needed which vars bound
-* one suggested ordering or the point where it got stuck
+6. **Output key collision warnings (debuggability)**
+   If multiple fragments share `(Section, Group, Rank, Seq, Kind)`, emit:
+   * `out_note("Notes", "duplicate fragment key: ...")`
+   and keep rendering deterministically (for example by stable_order on Def/Span).
 
----[<35;137;42M
+---
 
 ## A concrete “first slice” plan (what to implement in week-one code, conceptually)
 
@@ -722,5 +897,5 @@ That order ensures you don’t get stuck building a huge adapter before the lang
 If you want, I can also produce (in the same “no interpretation gaps” style as your spec):
 
 * a **module-by-module Rust API sketch** (traits, structs, key methods), and
-* the **[<35;138;42M[<35;139;42Mcanonical `std.raql`** plus **three golden example views** as executable acceptance tests, exactly as you suggested.
+* the **canonical `std.raql`** plus **three golden example views** as executable acceptance tests, exactly as you suggested.
 

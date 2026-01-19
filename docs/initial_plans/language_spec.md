@@ -25,6 +25,15 @@ I’m being deliberately explicit so there are no “interpretation gaps.”
 
 # RAQL v0.1 Language Specification
 
+## Change log (v0.1 spec errata)
+
+This spec is intended to be the contract for the RAQL v0.1 implementation. The following clarifications/fixes
+resolve ambiguities discovered during plan review:
+
+* Arithmetic binding is now written with `:=` (not `=`) to eliminate grammar ambiguity between unification and
+  arithmetic evaluation.
+* Integer division semantics are now explicitly defined (truncation toward zero).
+
 ## 0. Model and terminology
 
 RAQL is a **Datalog** language with a **Prolog-like surface**:
@@ -211,7 +220,7 @@ Programs with type errors are rejected.
 
 * Relational `=` unifies types structurally.
 * Relational `!=` and order comparisons require both sides to have the same type.
-* Arithmetic binding `X = Expr` requires `X:int` and `Expr:int`.
+* Arithmetic binding `X := Expr` requires `X:int` and `Expr:int`.
 
 **Aggregate typing:**
 
@@ -232,6 +241,17 @@ An orderable type is any type for which `stable_order` is defined (§12.2), incl
 **`choose_topk` typing constraint:**
 
 * `Group` and `Item` must be orderable types.
+
+## 3.5 Parametric built-ins (v0.1)
+
+The spec describes some built-in extern predicates/functions using schematic type variables such as `T`
+(for example `coalesce(option<T>, T, T)`).
+
+Rules:
+
+* User programs cannot declare their own type variables in v0.1.
+* For each call site, the compiler must infer a single concrete monomorphic type for each schematic variable.
+* If the type cannot be inferred from context, the program is rejected at compile-time.
 
 ---
 
@@ -355,7 +375,7 @@ A rule is **mode-valid** iff the compiler can find **some ordering** of the posi
 * variables bound by `.func` calls whose required inputs are already bound, or
 * variables newly bound by earlier constraints:
   * unification constraints `T1 = T2` may bind variables (§2.2, §7.4)
-  * arithmetic binding `X = Expr` may bind `X` (§7.4)
+  * arithmetic binding `X := Expr` may bind `X` (§7.4)
 
 If no such ordering exists, the rule is rejected at compile-time.
 
@@ -402,7 +422,7 @@ Head :- Goal1, Goal2, ..., GoalN.
 1. A predicate atom: `p(X, Y)`
 2. A negated atom: `not p(X, Y)`
 3. A disjunction group: `(A ; B ; C)` where each branch is a comma-separated goal list (semantics in §7.3)
-4. A constraint: `X = Y + 1`, `X != Y`, `X < 3`
+4. A constraint: `X := Y + 1`, `X != Y`, `X < 3`
 5. An aggregate binder: `N = count(V : Goals...)`
 6. A selection binder: `choose_topk(...)` (defined in §11.1)
 
@@ -457,15 +477,16 @@ where `relop ∈ { "=", "!=", "<", "<=", ">", ">=" }`.
     * enums: by variant ordinal in declaration order (§12.2)
   * If the types are not comparable, the program is rejected at compile-time (type error).
 
-**B) Arithmetic binding:** `X = Expr`
+**B) Arithmetic binding:** `X := Expr`
 
-* This is the `var = expr` constraint form in the grammar (§19).
+* This is the `var := expr` constraint form in the grammar (§19).
 * `Expr` must be an int expression using `+`, `-`, `*`, `/`, unary `-`, and parentheses.
 * All variables referenced by `Expr` must be bound to int at evaluation time.
 * Evaluate `Expr` to an int value `V`, then:
   * If `X` is unbound, bind `X := V`.
   * If `X` is bound, require `X == V`, otherwise fail the goal.
 * This form never solves for variables inside `Expr` (no algebraic rearrangement).
+* Division `/` is truncating integer division toward zero.
 * Division by zero and integer overflow are runtime errors (see §13.5).
 
 ---
@@ -503,15 +524,10 @@ def_doc_summary(D, none).
 
 ## 8.4 Coalesce helper (built-in)
 
-Built-in predicate:
+Built-in functional predicate (parametric in `T`, see §3.5):
 
 ```prolog
-coalesce(Opt: option<T>, Default: T, Out: T).
-```
-
-Modes:
-
-```prolog
+.func coalesce(Opt: option<T>, Default: T, Out: T) extern.
 .mode coalesce(+option<T>, +T, -T).
 .mode coalesce(+option<T>, +T, +T).  % validate
 ```
@@ -607,6 +623,11 @@ Given an aggregate binder with inner `Goals`:
 * Evaluate the inner `Goals` under the current binding of outer variables.
 * This yields a set of satisfying bindings for the inner `Goals`' variables (set semantics).
 
+**Clarification (required):**
+
+* Because the inner result is a set, `count(V : Goals)` counts distinct values of `V`.
+* `count(Goals)` counts distinct satisfying bindings ("rows") of `Goals`.
+
 **The optional `V : Goals` form:**
 
 * When an aggregate is written as `agg(V : Goals)`, `V` must be a variable that appears in `Goals`.
@@ -618,7 +639,20 @@ Given an aggregate binder with inner `Goals`:
 
 ## 10.3 Restrictions
 
-Aggregates are **non-recursive**: a predicate may not depend on itself through an aggregate (directly or indirectly). If it does, reject the program.
+Aggregates are **non-monotonic** and must be **stratified**.
+
+For stratification purposes, an aggregate introduces an *aggregate dependency*:
+
+* If predicate `p` contains an aggregate binder whose inner `Goals` reference predicate `q`,
+  then `p` has an aggregate dependency on `q`.
+
+Rules (required):
+
+* Aggregate dependencies must go to a strictly lower stratum (same rule as negation and `choose_topk`/`witness_path`).
+* Aggregates are forbidden inside any recursive SCC (directly or indirectly).
+
+Rationale: aggregates must observe a complete input set. Requiring lower-stratum inputs eliminates ambiguity and
+ensures deterministic, set-based semantics.
 
 ## 10.4 Empty input semantics (required)
 
@@ -636,7 +670,10 @@ Then:
 
 * `sum(V : Goals)` requires `V:int`.
 * `min(V : Goals)` and `max(V : Goals)` require `V` to be orderable (§3.4, §12.2).
-* `count_distinct` is a synonym for `count` in v0.1 (both count distinct values of `V`); both are retained for readability and future evolution.
+* `count_distinct` is a synonym for `count` in v0.1:
+  * `count_distinct(V : Goals)` == `count(V : Goals)`
+  * both count distinct values of `V` due to set semantics
+  * both are retained for readability and future evolution
 
 ---
 
@@ -663,7 +700,10 @@ Select top-K items per group by integer score, deterministically, without awkwar
 choose_topk(Tag, K, Group, Score, Item : Goals).
 ```
 
-* `Tag: string` — must be a string literal constant that namespaces the selection site (prevents accidental mixing).
+* `Tag: string` — must be a string literal constant used to namespace the selection site.
+  * Tag is not required to be globally unique.
+  * Each syntactic occurrence of `choose_topk(...)` is semantically independent.
+  * Engines should key any internal caches by `(Tag, occurrence-id)` (not Tag alone) to prevent collisions.
 * `K: int` — must be bound at call time (literal, input fact, or previously bound variable).
 * `Group` — grouping key (any orderable term).
 * `Score: int` — score variable bound inside `Goals`.
@@ -729,6 +769,11 @@ Paths are computed over a standard relation defined by the program:
 .decl graph_edge(Graph: string, From: Def, To: Def,
                  EdgeKind: string, Evidence: Span).
 ```
+
+**Required well-formedness rule:**
+
+* `graph_edge/5` is a reserved predicate name and arity for v0.1.
+* Programs may declare `graph_edge` only with exactly this schema; otherwise compilation fails.
 
 * `Graph` is a string namespace (e.g. `"call"`, `"error"`, `"convert"`).
 * `EdgeKind` is a free-form label (e.g. `"direct"`, `"trait"`, `"qmark"`).
@@ -814,6 +859,10 @@ where:
 * `ValueKey` is defined below per type.
 
 Cross-type ordering is by `TypeTag` first, then `ValueKey`.
+
+**Clarification (required):**
+
+* `TypeTag` comparison uses lexicographic UTF-8 byte order over the canonical textual `TypeTag` string.
 
 **ValueKey per type/form:**
 
@@ -941,7 +990,7 @@ This is exposed via a required extern functional predicate:
 
 Some operations may encounter runtime errors, including:
 
-* division by zero in arithmetic binding (§7.4)
+* division by zero in arithmetic binding (§7.4, `:=`)
 * int overflow in arithmetic or sum (§3.1, §10.4)
 * implementation-defined failures in extern predicates (e.g. adapter I/O failure)
 
@@ -1064,9 +1113,19 @@ Modes:
 
 (You can add more later; v0.1 requires at least these.)
 
+## 15.2 Option predicates
+
+These are pure, deterministic helpers. `coalesce/3` is required for v0.1.
+
+```prolog
+.func coalesce(Opt: option<T>, Default: T, Out: T) extern.
+.mode coalesce(+option<T>, +T, -T).
+.mode coalesce(+option<T>, +T, +T).
+```
+
 ---
 
-# 16. v0.1 REQUIRED rust-analyzer-backed predicates (the “new” core)
+# 16. v0.1 REQUIRED rust-analyzer-backed predicates (the "new" core)
 
 This section is the “load-bearing” set you prioritized. These are not “nice-to-haves”; they are required for v0.1.
 
@@ -1357,7 +1416,7 @@ enum_atom      := ident "::" ident ;
 list           := "[" [ term { "," term } ] "]" ;
 
 constraint     := term relop term
-               | var "=" expr
+               | var ":=" expr
                ;
 
 relop          := "=" | "!=" | "<" | "<=" | ">" | ">=" ;
