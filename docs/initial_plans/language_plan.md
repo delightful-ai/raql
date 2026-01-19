@@ -1,6 +1,26 @@
-Below is a practical, engineering-first implementation plan for RAQL v0.1 as specified. I’m going to treat your spec as the “contract” and turn it into a build order, module boundaries, algorithms, and an acceptance-test matrix.
+Below is a practical, engineering-first implementation plan for RAQL v0.1 as specified. I'm going to treat your spec as the "contract" and turn it into a build order, module boundaries, algorithms, and an acceptance-test matrix.
 
 I'll assume Rust for the engine + a rust-analyzer-backed host adapter, because your spec is already leaning that way.
+
+---
+
+## Type inference upgrade: usability-first, still static
+
+Goal: agents and humans can write short one-off queries without `.decl` boilerplate and without fighting inference.
+
+Key deliverables:
+
+* Derived predicate schemas inferred when `.decl` omitted
+* Constraint-based type inference with type variables
+* Typed literal escape hatch:
+  * `none::<T>`
+  * `[]::<T>`
+  * `[... ]::<T>`
+
+Diagnostics are part of the feature:
+
+* ambiguity errors MUST suggest a fix (turbofish or `.decl`)
+* errors MUST explain which constraints were missing
 
 ---
 
@@ -292,6 +312,19 @@ No time estimates, just build order and “definition of done.”
 * Include-stack context is printed (like Rust's "in file included from ...")
 * Snapshot tests exist for diagnostics output (colors disabled)
 
+**Add diagnostic templates for inference**
+
+Define at least these error codes/messages early:
+
+* `RAQL0201` Ambiguous `none`:
+  * "cannot infer type parameter T for option<T>"
+  * help: "use `none::<option<string>>` or place `none` in a typed predicate position"
+* `RAQL0202` Ambiguous empty list `[]`:
+  * help: "use `[]::<string>` (for list<string>) or add context"
+* `RAQL0203` Inferred schema mismatch:
+  * "predicate p/3 used with inconsistent types across occurrences"
+  * show two example call sites with spans
+
 ---
 
 ### Milestone 1: Full parser (v0.1 grammar coverage)
@@ -362,6 +395,81 @@ Implement type inference via constraint solving:
   * reject with a diagnostic:
     * primary label: the `none` / `[]` literal
     * help: "add type context by placing this in a typed predicate position" (and show the nearest predicate schema)
+
+### Type inference: concrete implementation plan (do in Milestone 2)
+
+Implement constraint-based inference in two layers:
+
+#### A) Schema inference for undeclared derived predicates
+
+1. Parse and collect all predicate occurrences (`pred_name`, `arity`, arg term AST, source span).
+2. For any predicate that lacks `.decl` and is not `extern/input/output`:
+   * create an unknown schema `p(T1, T2, ... Tn)` where each `Ti` is a fresh type variable.
+3. Add constraints for every occurrence:
+   * unify the type of each argument term with the corresponding schema type variable
+4. Solve constraints to produce a concrete schema.
+5. If any schema type variable remains unresolved:
+   * error `RAQL0203` with help:
+     * "add `.decl p(... )`"
+     * or annotate literals (`none::<T>`, `[]::<T>`)
+
+#### B) Rule-local inference (variables and literals)
+
+Within each rule:
+
+* assign each variable a fresh type variable on first sight
+* assign each `none` a fresh `option<Tv>`
+* assign each `[]` a fresh `list<Tv>`
+* generate constraints from:
+  * predicate schemas (declared or inferred)
+  * constructors (`some`, lists)
+  * constraints (`=`, `!=`, comparisons, `:=`)
+  * aggregates and built-ins
+
+Solve constraints and then:
+
+* all variable types must be concrete
+* all remaining unresolved type vars -> compile error with turbofish suggestion
+
+#### Solver suggestion (practical)
+
+Use union-find unification for type variables plus structural types:
+
+* primitive types
+* enums
+* opaque host types
+* option<T>
+* list<T>
+
+Implement "occurs check" in the type solver to prevent infinite types (recommended by spec).
+
+### Typed literal turbofish parsing + typing
+
+Parser:
+
+* accept `none::<type>` and attach optional `TypeAst`
+* accept list literal optional `::<type>`
+
+Type checking:
+
+* `none::<T>` yields `option<T>`
+* `[]::<T>` yields `list<T>`
+* `[a,b]::<T>` yields `list<T>` and constrains `type(a)=type(b)=T`
+
+### "Explain inferred types" mode (agent-friendly)
+
+Add an optional CLI flag:
+
+* `--explain-types`
+
+It prints:
+
+* all inferred predicate schemas (for predicates without `.decl`)
+* for each rule:
+  * inferred type of each named variable
+  * (optional) inferred type of each ambiguous literal once resolved
+
+This massively helps agents self-correct without trial-and-error.
 
 ---
 
@@ -440,6 +548,15 @@ For mode failures, the diagnostic should include:
 * which vars it required and which vars were currently bound
 * at least one actionable suggestion:
   * "bind Span S earlier (e.g. call node_span(...) before span_text(...))"
+
+### Important interaction: mode planning needs inferred schemas
+
+Mode checking relies on knowing argument types to select allowed modes (especially for externs).
+
+Therefore:
+
+* schema inference must happen before mode planning
+* inferred schemas must be included in the predicate registry as if they were explicit `.decl`
 
 ---
 

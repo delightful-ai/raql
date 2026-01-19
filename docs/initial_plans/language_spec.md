@@ -25,6 +25,16 @@ I’m being deliberately explicit so there are no “interpretation gaps.”
 
 # RAQL v0.1 Language Specification
 
+## Type inference usability upgrade (v0.1)
+
+This spec includes an inference-focused usability upgrade intended to support one-off queries
+written by humans and agents:
+
+* Derived predicates may omit `.decl` and have their schemas inferred.
+* `none` and `[]` participate in constraint-based inference and do not immediately error.
+* When inference is still ambiguous, users can annotate `none` and list literals using Rust-style turbofish:
+  `none::<T>`, `[]::<T>`, `[... ]::<T>`.
+
 ## Change log (v0.1 spec errata)
 
 This spec is intended to be the contract for the RAQL v0.1 implementation. The following clarifications/fixes
@@ -111,8 +121,8 @@ A **term** is one of:
 * Wildcard: `_`
 * Literal: `123`, `"hi"`, `true`
 * Enum variant atom: `RenderMode::DOC_SIG`, `RefKind::COMPARE`
-* Option value: `none`, `some(Term)`
-* List literal: `[Term, Term, ...]`
+* Option value: `none`, `none::<Type>`, `some(Term)`
+* List literal: `[Term, Term, ...]`, with optional `::<Type>` annotation
 
 ## 2.1 Option values (built-in)
 
@@ -201,6 +211,9 @@ This avoids ambiguity with variables, which are also uppercase-initial (§1.4).
 RAQL programs are type-checked at compile-time against predicate schemas declared via `.decl` and `.func`.
 Programs with type errors are rejected.
 
+Additionally, for usability, schemas for derived predicates may be inferred when `.decl` is omitted (§5.3).
+Inferred schemas are still statically typed and monomorphic.
+
 **Variable typing (rule-local, monomorphic):**
 
 * Within a single rule, each named variable has exactly one type.
@@ -222,10 +235,10 @@ Programs with type errors are rejected.
 **Constructor typing:**
 
 * `some(T)` has type `option<T>`.
-* `none` has type `option<T>` for an unknown `T` that must be determined from context.
-  * If `T` cannot be determined (e.g. `p(none)` with no schema context), it is a compile-time error.
+* `none` has type `option<Tv>` where `Tv` is a fresh type variable resolved by inference (§3.5).
+  * If `Tv` remains unresolved when a concrete schema is required, it is a compile-time error.
 * List literals are homogeneous:
-  * `[ ]` has type `list<T>` for unknown `T` that must be determined from context, otherwise compile-time error.
+  * `[ ]` has type `list<Tv>` where `Tv` is a fresh type variable resolved by inference (§3.5).
   * `[T1, T2, ...]` has type `list<T>` where all elements unify to the same type `T`.
 
 **Constraint typing:**
@@ -254,7 +267,67 @@ An orderable type is any type for which `stable_order` is defined (§12.2), incl
 
 * `Group` and `Item` must be orderable types.
 
-## 3.5 Parametric built-ins (v0.1)
+## 3.5 Type inference model (v0.1, required)
+
+RAQL uses constraint-based type inference to support ergonomic queries.
+
+Key properties:
+
+* Inference is monomorphic:
+  * each variable within a rule has exactly one type
+  * each predicate argument position has exactly one type
+* Type variables (meta-variables) may be introduced internally during inference
+  (e.g. for `none` and `[]`), but they must be resolved to concrete types before execution.
+
+### 3.5.1 Sources of constraints
+
+The type checker generates equality/compatibility constraints from:
+
+* predicate schemas:
+  * declared via `.decl` / `.func`
+  * inferred for derived predicates when `.decl` is omitted (§5.3)
+* constructors:
+  * `some(T)` implies `some(T): option<type(T)>`
+  * `none` implies `none: option<Tv>` for fresh `Tv`
+  * `[]` implies `[]: list<Tv>` for fresh `Tv`
+  * `[a,b,c]` implies `list<T>` and `type(a)=type(b)=type(c)=T`
+* constraints:
+  * `T1 = T2` implies `type(T1) = type(T2)`
+  * `T1 != T2` implies `type(T1) = type(T2)` and both sides ground at evaluation time
+  * order comparisons imply both sides share a comparable type
+  * arithmetic binding `X := Expr` implies `type(X)=int` and `type(Expr)=int`
+* aggregates:
+  * `count`/`count_distinct` produce `int`
+  * `sum` requires and produces `int`
+  * `min`/`max` require orderable types and produce that type
+
+### 3.5.2 Resolution requirement
+
+After constraint solving:
+
+* all predicate argument types (declared or inferred) must be concrete (no remaining type variables)
+* all rule-local variable types must be concrete
+* any remaining unconstrained type variable is a compile-time error
+
+### 3.5.3 Infinite type protection (recommended)
+
+Implementations SHOULD reject inferred infinite types (e.g. constraints like `Tv = option<Tv>`)
+with a compile-time diagnostic.
+
+Rationale: even if a rule would be unsatisfiable at runtime due to occurs check, infinite types degrade tooling and
+produce confusing downstream errors.
+
+## 3.6 Typed literal annotations (v0.1)
+
+When inference is ambiguous, users may annotate `none` and list literals using Rust-style turbofish:
+
+* `none::<T>` has type `option<T>`
+* `[]::<T>` has type `list<T>`
+* `[a,b,c]::<T>` asserts the list has type `list<T>` (elements must unify with `T`)
+
+These annotations are purely type-level and do not affect runtime semantics.
+
+## 3.7 Parametric built-ins (v0.1)
 
 The spec describes some built-in extern predicates/functions using schematic type variables such as `T`
 (for example `coalesce(option<T>, T, T)`).
@@ -335,7 +408,42 @@ Meaning:
 
 This is RAQL's canonical answer to optionality (§8).
 
-> Rule: “attribute-like” properties must be `.func` returning `option<T>` when absence is common (docs, parent, display name, etc.). Multi-valued edges remain `.decl` relations.
+> Rule: "attribute-like" properties must be `.func` returning `option<T>` when absence is common (docs, parent, display name, etc.). Multi-valued edges remain `.decl` relations.
+
+## 5.3 Implicit schemas for derived predicates (v0.1 usability, required)
+
+To support one-off queries, `.decl` is OPTIONAL for predicates that are:
+
+* not marked `extern`
+* not marked `input`
+* not marked `output`
+
+Such predicates are treated as **derived** and their schemas are inferred.
+
+### 5.3.1 What is inferred
+
+For each derived predicate `p/n` lacking a `.decl`, the compiler infers:
+
+* arity `n`
+* the type of each argument position
+
+### 5.3.2 Constraint sources for schema inference
+
+Schema inference must incorporate constraints from:
+
+* all rule heads with predicate `p(...)`
+* all call sites of `p(...)` in rule bodies
+
+Rules:
+
+* All occurrences must agree on arity, otherwise compile-time error.
+* Types are inferred using the same constraint system as §3.5.
+* The final inferred schema must be monomorphic and fully concrete (no type variables).
+
+### 5.3.3 Interaction with explicit `.decl`
+
+If a predicate has an explicit `.decl`, that schema is authoritative.
+All call sites and rule heads must type-check against it; otherwise compile-time error.
 
 ---
 
@@ -1440,14 +1548,14 @@ term           := var
                | string
                | "true" | "false"
                | enum_atom
-               | "none"
+               | "none" [ "::" "<" type ">" ]
                | "some" "(" term ")"
                | list
                ;
 
 enum_atom      := ident "::" ident ;
 
-list           := "[" [ term { "," term } ] "]" ;
+list           := "[" [ term { "," term } ] "]" [ "::" "<" type ">" ] ;
 
 constraint     := term relop term
                | var ":=" expr
