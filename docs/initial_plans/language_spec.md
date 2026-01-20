@@ -929,8 +929,13 @@ Because it's a binder, mode is structural:
 
 * `Tag` must be a string literal constant.
 * `K` must be bound at call time.
-* `Group` may be bound or bound by outer goals.
+* `Group` must be **ground** at binder evaluation time (bound by outer goals or a constant term).
 * `Score` and `Item` are outputs of the binder (bound by `Goals` + selection).
+
+**Clarification (required):**
+
+`choose_topk` is defined "per `Group`." If `Group` is not ground at binder evaluation time, the semantics are undefined,
+so such programs are rejected by mode checking.
 
 ---
 

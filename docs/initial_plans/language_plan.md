@@ -85,7 +85,10 @@ Treat diagnostics as a product feature, not an afterthought.
   * negation
   * `choose_topk`
   * `witness_path` / `path_hop`
-  * aggregates: forbid recursion through aggregate subgoals (per spec; not a stratum barrier)
+  * aggregates:
+    * **strict stratum barrier**: any predicate that contains an aggregate binder must be in a strictly
+      higher stratum than every predicate referenced inside the aggregate's inner `Goals` (matches spec §10.3)
+    * **also forbidden in recursive SCCs** (direct or indirect), regardless of stratum assignment
 * Safety/range restriction (head vars must be bound by a positive goal)
 
 Add spec-required reserved-schema checks:
@@ -612,12 +615,14 @@ For head predicate `P` and a referenced predicate `Q`:
 * **Selection edge** `P ~/> Q` for:
 
   * any predicate used inside `choose_topk(... : Goals)`
-  * any predicate used inside `witness_path(...)` / `path_hop(...)` goals
-  * additionally, any rule using `witness_path` or `path_hop` has an implied dependency on `graph_edge/5` (the graph relation that witness_path ranges over)
+  * additionally, any rule using `witness_path` or `path_hop` has an implied dependency on `graph_edge/5`
+    (the graph relation that `witness_path` ranges over)
 
 * **Aggregate edge** `P -agg-> Q` for any predicate used inside aggregate subgoals
-  * Aggregate edges are not stratum constraints by themselves.
-  * Instead, enforce the spec rule: no recursion through aggregates (reject any cycle that includes an aggregate edge).
+  * Aggregate edges are **stratum constraints** with weight = 1 (same as negation/selection):
+    * enforce `stratum(P) > stratum(Q)` for every aggregate edge
+  * Additionally enforce spec's "no aggregates inside recursive SCC" as a hard ban:
+    * if any SCC contains an aggregate binder anywhere in any rule body, reject program (even if the stratum constraints happen to be satisfiable)
 
 **Disjunction safety:**
 
@@ -635,6 +640,7 @@ For head predicate `P` and a referenced predicate `Q`:
 
   * positive: stratum(P) >= stratum(Q)
   * negative/selection: stratum(P) > stratum(Q)
+  * aggregate: stratum(P) > stratum(Q)
 
 * Use a real and deterministic stratum computation:
   * Build the condensation DAG (SCC graph).
@@ -648,7 +654,7 @@ For head predicate `P` and a referenced predicate `Q`:
 
   * `choose_topk` forbidden if rule head is in an SCC that includes any predicate referenced inside its `Goals`
   * `witness_path`/`path_hop` forbidden in recursive SCCs
-  * aggregate recursion forbidden (any cycle that includes an aggregate edge)
+  * aggregates forbidden in recursive SCCs (direct or indirect), and must be strictly above their referenced predicates
   * `witness_path`/`path_hop` must be strictly above `graph_edge/5` and anything `graph_edge/5` depends on (enforced via the implied dependency above)
 
 **Make witness_path's implied dependency explicit**
@@ -660,9 +666,14 @@ In dependency analysis:
 
 * If a rule body contains `witness_path(...)` or `path_hop(...)`, add a selection edge from the head predicate to:
   * `graph_edge/5` (required)
-  * and any predicate referenced in the same rule that could define `graph_edge` (transitively, via normal deps)
+  * (Optional, diagnostic-only) record the transitive "why" chain `head -> … -> graph_edge` for error reporting,
+    but do **not** add extra constraint edges beyond `head ~/> graph_edge`.
 
 This guarantees `stratum(head) > stratum(graph_edge)` and prevents evaluating paths while edges are still growing.
+
+Rationale: `stratum(head) > stratum(graph_edge)` already implies `stratum(head) > stratum(dep)` for anything
+`graph_edge` depends on, because positive deps never decrease strata. Extra constraint edges tend to over-constrain
+otherwise valid programs and create confusing "why is this forced into a higher stratum?" diagnostics.
 
 **Also enforce**: `witness_path` and `path_hop` require `graph_edge/5` to exist with the reserved schema.
 If a program calls `witness_path` but never declares/defines `graph_edge/5`, reject at compile-time with a clear diagnostic.
@@ -834,8 +845,11 @@ N = count(V : Goals).
 * During rule execution, when reaching the aggregate goal:
 
   * evaluate `Goals` under current outer binding
-  * accumulate aggregate value
-  * bind `N`
+  * compute the *set* of satisfying bindings (set semantics, no duplicates)
+  * apply the spec's **projection-and-dedup rule**:
+    * for `agg(V : Goals)`, collect `Vals = { V | row ∈ Rows }` as a **set** (dedup by term equality), then aggregate over `Vals`
+    * for `count(Goals)`, treat `Rows` itself as a set and return `|Rows|`
+  * then bind `N`
 
 **Implementation details**
 
@@ -846,7 +860,9 @@ N = count(V : Goals).
 
 **Done when**
 
-* Counting examples work and are stable.
+* `count(V : Goals)` counts distinct `V` values (not rows).
+* `sum(V : Goals)` sums distinct `V` values (not per-row repeats).
+* `min/max` fail the aggregate goal on empty input (no binding), matching spec §10.4.
 
 ---
 
@@ -864,6 +880,16 @@ N = count(V : Goals).
     2. `stable_order(Item)` ascending
     3. `stable_order(Score)` as a final (redundant) total-order tie-break, matching the spec
   * emit top K as bindings
+
+**Spec-compatibility checks to enforce during typing/validation**
+
+* `Score` must be `int`.
+* `Group` and `Item` must be **orderable** types (per spec's stable-order domain).
+* `Group` must be **ground at binder evaluation time** (treat it as a required input for mode planning),
+  because selection is "per group" and the semantics are defined "for each binding including `Group`."
+  (If you later want "enumerate all groups" semantics, make it a separate binder in v1.)
+* `K` must be ground at binder evaluation time; if `K <= 0`, treat as producing no results (or reject at runtime),
+  but pick one behavior and test it.
 
 **You must implement `stable_order`**
 
@@ -919,6 +945,15 @@ Even though the spec marks these as `extern`, you can implement them inside the 
   2. within same length, lexicographic by hop keys
 * Return up to `path_limit` distinct paths.
 
+**Cycle control (strongly recommended)**
+
+Even with a small `path_max_depth`, cyclic graphs can explode combinatorially. To keep witness search predictable:
+
+* Treat candidate paths as **simple** (no repeated `Def` nodes) during enumeration.
+  * This does not change shortest-path results (a shortest path never needs a cycle),
+    but dramatically reduces search blowups.
+* If you want to allow repeated nodes later (v1+), make it an explicit `.func` input knob.
+
 **Represent Path**
 
 * `Path` is an engine-opaque value:
@@ -943,6 +978,7 @@ Before path enumeration:
 
   * Seq is 0-based, increasing, no gaps
   * repeated runs return identical paths and ordering
+* cyclic graphs do not cause pathological blowups under default `path_max_depth` (8)
 
 ---
 
@@ -1183,7 +1219,8 @@ Implementation detail to bake in early:
 * Set semantics: duplicates eliminated.
 * Fixpoint: transitive closure matches expected.
 * Negation matches stratified semantics.
-* Occurs check: `X = some(X)` fails (or is rejected if you choose to make it a static error).
+* Occurs check: `X = some(X)` **must** fail the unification goal at runtime (no tuple produced),
+  matching the spec's "goal fails" behavior. (A compile-time *warning* is OK; a compile-time *rejection* is not spec-faithful.)
 
 ### 6) choose_topk determinism test
 
