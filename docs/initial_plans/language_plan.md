@@ -85,8 +85,18 @@ Treat diagnostics as a product feature, not an afterthought.
   * negation
   * `choose_topk`
   * `witness_path` / `path_hop`
-  * aggregates treated as non-monotonic for stratification (see below)
+  * aggregates: forbid recursion through aggregate subgoals (per spec; not a stratum barrier)
 * Safety/range restriction (head vars must be bound by a positive goal)
+
+Add spec-required reserved-schema checks:
+* `graph_edge/5`:
+  * if declared, it MUST have exactly the spec schema
+  * otherwise compile error
+* standard output relations and engine-owned outputs:
+  * user may not redefine `out_status/1` or emit it in rule heads/facts
+  * user may not redefine built-in output relation schemas with mismatching types
+* built-in extern key funcs (`handle`, `span_key`, `*_id`, `world_stamp`) are pre-registered
+  and redeclarations must match exactly.
 
 ### Runtime semantics
 
@@ -108,7 +118,7 @@ Treat diagnostics as a product feature, not an afterthought.
 ### Host contract (rust-analyzer adapter)
 
 * Opaque value handles: `Def`, `Span`, `TypeRef`, `Node`, etc.
-* Required externs: `handle/2`, `span_key/6`, type structure (§16.1), node context (§16.2), and whatever base schema your views use.
+* Required externs: `handle/2`, `span_key/6`, `typeref_id/2`, `node_id/2`, `call_id/2`, `ref_id/2`, `impl_id/2`, `world_stamp/1`, type structure (§16.1), node context (§16.2), and whatever base schema your views use.
 
 NOTE: this plan is now aligned to the spec's stable ordering contract:
 use `span_key/6` (not `span_loc/2`) and implement all required stable key functions.
@@ -243,8 +253,8 @@ must:
 **Responsibilities**
 
 * Provide extern relations/functions with mode-respecting access
-* Maintain stable handles and span loc strings
-* Cache expensive lookups (handle/span_loc/type normalization)
+* Maintain stable handles and span keys (as `span_key/6` components)
+* Cache expensive lookups (handle/span_key/type normalization)
 * Provide `node_at` / parent chain primitives
 
 **Key deliverable**
@@ -318,12 +328,15 @@ Define at least these error codes/messages early:
 
 * `RAQL0201` Ambiguous `none`:
   * "cannot infer type parameter T for option<T>"
-  * help: "use `none::<option<string>>` or place `none` in a typed predicate position"
+  * help: "use `none::<string>` (for `option<string>`) or add type context via a typed predicate position or `.decl`"
 * `RAQL0202` Ambiguous empty list `[]`:
   * help: "use `[]::<string>` (for list<string>) or add context"
 * `RAQL0203` Inferred schema mismatch:
   * "predicate p/3 used with inconsistent types across occurrences"
   * show two example call sites with spans
+* `RAQL0204` Mode/schema disagreement:
+  * "predicate p/2 has mode declarations inconsistent with its inferred or declared schema"
+  * show the mode site and one conflicting call site
 
 ---
 
@@ -407,7 +420,11 @@ Implement constraint-based inference in two layers:
    * create an unknown schema `p(T1, T2, ... Tn)` where each `Ti` is a fresh type variable.
 3. Add constraints for every occurrence:
    * unify the type of each argument term with the corresponding schema type variable
-4. Solve constraints to produce a concrete schema.
+4. ALSO incorporate `.mode` declarations as constraints:
+   * `.mode p(+T1, -T2, ...)` implies the schema positions are exactly `(T1, T2, ...)`
+   * arity must match
+   * if `.mode` exists but schema inference would otherwise pick a different type, error (`RAQL0204`)
+5. Solve constraints to produce a concrete schema.
 5. If any schema type variable remains unresolved:
    * error `RAQL0203` with help:
      * "add `.decl p(... )`"
@@ -442,6 +459,14 @@ Use union-find unification for type variables plus structural types:
 * list<T>
 
 Implement "occurs check" in the type solver to prevent infinite types (recommended by spec).
+
+**choose_topk static checks (spec-required)**
+
+During typing/validation:
+* enforce that the first argument `Tag` is a string literal constant
+* reject `choose_topk(TagVar, ...)` even if `TagVar` is later unified to a string
+
+Rationale: Tag is part of the semantic identity of the selection site.
 
 ### Typed literal turbofish parsing + typing
 
@@ -522,13 +547,30 @@ Implement mode planning as a bounded search:
 
 * Unification `T1 = T2`:
   * may bind previously unbound vars (respecting occurs check at runtime)
-  * in planning, treat it as runnable when it can make progress (at least one side is sufficiently grounded to bind the other)
+  * in planning, treat it as runnable when it is type-correct; it can:
+    * bind a variable to a ground term
+    * bind a variable to a structured term containing other variables
+    * merge variable equalities
+  * HOWEVER, do not treat this as making a `+` input "ground" unless the resulting term is ground
 * Arithmetic binding `X := Expr`:
   * requires all vars used in `Expr` bound as `int`
   * binds `X`
 * `!=`, `<`, `<=`, `>`, `>=`:
-  * require both sides ground before evaluation (planner must schedule them only after their vars are bound)
+  * require both sides ground before evaluation (planner must schedule them only after their vars are ground)
   * bind nothing
+
+**Bound vs Ground (spec-critical)**
+
+Track two bitsets during planning:
+* `bound_vars`: variables that have some binding (may be non-ground, e.g. `X = some(Y)`)
+* `ground_vars`: variables whose current binding is ground
+
+Rules of thumb:
+* Positive relation lookups bind variables to ground values (facts are ground).
+* `X := Expr` produces ground `int`.
+* `X = "lit"` produces ground.
+* `X = some(Y)` does NOT make `X` ground until `Y` is ground.
+* `!=` and `<` require operands ground at the point they run (enforce via `ground_vars`).
 
 **Done when**
 
@@ -570,8 +612,12 @@ For head predicate `P` and a referenced predicate `Q`:
 * **Selection edge** `P ~/> Q` for:
 
   * any predicate used inside `choose_topk(... : Goals)`
-  * any predicate used inside `witness_path(...)` / `path_hop(...)` goals (or more precisely, treat these built-ins as stratum barriers)
-  * any predicate used inside aggregate subgoals
+  * any predicate used inside `witness_path(...)` / `path_hop(...)` goals
+  * additionally, any rule using `witness_path` or `path_hop` has an implied dependency on `graph_edge/5` (the graph relation that witness_path ranges over)
+
+* **Aggregate edge** `P -agg-> Q` for any predicate used inside aggregate subgoals
+  * Aggregate edges are not stratum constraints by themselves.
+  * Instead, enforce the spec rule: no recursion through aggregates (reject any cycle that includes an aggregate edge).
 
 **Disjunction safety:**
 
@@ -588,13 +634,13 @@ For head predicate `P` and a referenced predicate `Q`:
 * Stratification constraints:
 
   * positive: stratum(P) >= stratum(Q)
-  * negative/selection/aggregate: stratum(P) > stratum(Q)
+  * negative/selection: stratum(P) > stratum(Q)
 
 * Use a real and deterministic stratum computation:
   * Build the condensation DAG (SCC graph).
   * Assign weighted constraints:
     * positive edge weight = 0 (stratum(head) >= stratum(dep))
-    * negative/selection/aggregate edge weight = 1 (stratum(head) >= stratum(dep) + 1)
+    * negative/selection edge weight = 1 (stratum(head) >= stratum(dep) + 1)
   * Compute minimal satisfying strata via longest-path DP in topological order.
   * If the constraint system is inconsistent, reject and print the cycle and which edge(s) required strictness.
 
@@ -602,7 +648,8 @@ For head predicate `P` and a referenced predicate `Q`:
 
   * `choose_topk` forbidden if rule head is in an SCC that includes any predicate referenced inside its `Goals`
   * `witness_path`/`path_hop` forbidden in recursive SCCs
-  * aggregates are stratified (per spec) and forbidden in recursive SCCs
+  * aggregate recursion forbidden (any cycle that includes an aggregate edge)
+  * `witness_path`/`path_hop` must be strictly above `graph_edge/5` and anything `graph_edge/5` depends on (enforced via the implied dependency above)
 
 **Make witness_path's implied dependency explicit**
 
@@ -616,6 +663,9 @@ In dependency analysis:
   * and any predicate referenced in the same rule that could define `graph_edge` (transitively, via normal deps)
 
 This guarantees `stratum(head) > stratum(graph_edge)` and prevents evaluating paths while edges are still growing.
+
+**Also enforce**: `witness_path` and `path_hop` require `graph_edge/5` to exist with the reserved schema.
+If a program calls `witness_path` but never declares/defines `graph_edge/5`, reject at compile-time with a clear diagnostic.
 
 **Done when**
 
@@ -653,6 +703,19 @@ Implement in this milestone:
   * `=` is unification
   * `:=` is checked integer expression evaluation
   * `!=` and order comparisons require ground operands
+
+**Important runtime representation detail (correctness)**
+
+Do NOT model the environment as "VarId -> ground Value only".
+The spec's unification allows binding a variable to a structured term containing other variables
+as long as occurs-check passes. You need a real term unifier:
+
+* Represent bindings as a substitution/term graph:
+  * nodes: `Var(VarId)`, `Lit(...)`, `Enum(...)`, `Opaque(...)`, `Some(Term)`, `None`, `List(Vec<Term>)`
+  * plus a union-find over vars (optional but helps)
+* Occurs check is performed over this graph when binding `V := Term`.
+* Groundness is computed as "term graph contains no unbound vars".
+
 * Checked arithmetic everywhere:
   * `checked_add/sub/mul`
   * `checked_div` with explicit division-by-zero detection
@@ -664,12 +727,44 @@ Implement in this milestone:
 
   * within stratum, evaluate SCCs to fixpoint
 
+**Recursion guard hook (do it now, not later)**
+
+Even if you only add the full `out_status/out_note` plumbing in Milestone 10,
+wire the iteration counter and "stop evaluating higher strata" behavior as soon as you implement recursive SCCs.
+Otherwise you risk "debug sessions that never return" during early development.
+
 **Semi-naive baseline**
 
 Implement semi-naive from the start for recursive SCCs. A naive evaluator will make even toy recursive workloads
 painful and will obscure correctness issues behind timeouts.
 
 Use naive evaluation only for non-recursive, acyclic SCCs if you want a simpler first implementation.
+
+**Make semi-naive precise (so it stays correct)**
+
+For each recursive SCC and each iteration:
+* Maintain `delta[pred]` = tuples newly derived for `pred` since last iteration.
+* For each rule in the SCC, generate one or more "delta variants":
+  * For each occurrence of a predicate from the same SCC in the rule body, create a variant where
+    exactly one such occurrence reads from `delta` and the others read from `total`.
+  * This is standard semi-naive and prevents re-deriving known tuples.
+* Apply rule variants in a deterministic order:
+  * order by `(original_rule_order, variant_index)`
+
+**Determinism requirement**
+
+Never iterate raw `HashMap/HashSet` directly in any semantics-bearing loop.
+If you store relations in a hash-based set, wrap enumeration in a deterministic view:
+* `IndexSet` insertion order (with deterministic insertion order)
+* or stable sorted iteration keyed by per-predicate tuple ordering.
+
+**Rust type system: make invariants hard to violate**
+
+Prefer typed-index collections for IR and runtime tables:
+* `IndexVec<PredId, PredInfo>`
+* `IndexVec<RuleId, RulePlan>`
+* `IndexVec<StratumId, StratumPlan>`
+so "wrong index into wrong vec" is a compile error.
 
 **Determinism under partial runs: relation iteration order**
 
@@ -714,8 +809,12 @@ To keep partial outputs reproducible:
   * so `not p(...)` is a membership check against a completed relation
 * Enforce range restriction:
 
-  * every head var must appear in some positive goal
-  * for disjunction, enforce per-branch after desugaring
+Implement the spec's safety model (after Patch 1):
+* variables can be range-restricted by:
+  * appearing in positive goals
+  * binding constraints (`=` and `:=`) when they bind from already range-restricted inputs or ground literals
+  * binder outputs (aggregate binders, choose_topk outputs, witness_path/path_hop outputs)
+* for disjunction, enforce "outside vars must be range-restricted in every branch", including via `X = "..."`
 
 **Done when**
 
@@ -763,7 +862,7 @@ N = count(V : Goals).
 
     1. Score descending
     2. `stable_order(Item)` ascending
-    3. Score ascending (int order) for final tie-break if needed
+    3. `stable_order(Score)` as a final (redundant) total-order tie-break, matching the spec
   * emit top K as bindings
 
 **You must implement `stable_order`**
@@ -772,6 +871,22 @@ N = count(V : Goals).
 * for `Def`: call host `handle(Def, string)` and compare strings
 * for `Span`: call host `span_key(Span, RelPath, L0, C0, L1, C1)` and compare the tuple
 * for `Path`: internal deterministic id
+
+Expand to match the spec's "orderable types":
+* enums: by variant ordinal in `.type` declaration order
+* `option<T>`:
+  * `none < some(_)`
+  * compare inner by `stable_order(T)`
+* `list<T>`: lexicographic by elements' `stable_order(T)`; shorter list first if prefix
+* all opaque host types listed in the spec (`TypeRef`, `Node`, `Call`, `Ref`, `Impl`) via their required `*_id` funcs
+
+Canonical TypeTag:
+* do NOT use user-surface strings
+* generate TypeTag from your internal `TypeId` graph in a canonical format like:
+  * `int`, `string`, `bool`
+  * `option<string>`, `list<option<Def>>`
+  * `RenderMode` (enum name)
+  * `Def`, `Span`, etc.
 
 **Caching**
 
@@ -859,6 +974,16 @@ which is incorrect. The spec already requires "no higher strata are evaluated" o
 
   * emit `out_status("ok")`
 
+**Runtime errors (spec-required)**
+
+* Implement checked `int` arithmetic:
+  * overflow and division by zero are runtime errors
+* Treat "extern predicate failure" (adapter error, unexpected cardinality for `.func`, etc.) as a runtime error
+* On any runtime error:
+  * halt immediately
+  * mark run partial
+  * emit `out_status("partial")` and `out_note("Errors", "runtime error: ...")`
+
 **Done when**
 
 * A deliberately divergent recursive program halts cleanly and reports partial results.
@@ -898,15 +1023,19 @@ Implement the required extern predicates/functions from §16.
 
 **Snapshot model (required)**
 
-* The adapter must construct exactly one rust-analyzer `Analysis` snapshot per RAQL run.
+* The adapter must construct exactly one rust-analyzer `Analysis` snapshot per RAQL run, obtained from an `AnalysisHost`.
 * All extern predicate answers must come from that snapshot (immutability).
 * `world_stamp/1` must describe the snapshot configuration (target/features/cfg) sufficiently for reproducibility.
+
+Rationale:
+* `AnalysisHost` owns the database and provides `Analysis` snapshots; the system is Salsa-based incremental computation.
+  Use the snapshot boundary to guarantee internal consistency across all extern answers.
 
 **Span representation**
 
 Define Span as a stable handle to:
 
-* file id (including macro-expanded "virtual files" if supported)
+* a file identity that can represent real files AND (optionally) macro-expanded files
 * byte/text range
 
 Implement `span_key/6` by computing:
@@ -917,11 +1046,16 @@ Implement `span_key/6` by computing:
 If macro-expanded spans are not supported in v0.1, document that `Span` refers only to original source files
 and macro internals map back to call-site spans.
 
+If macro-expanded spans ARE supported:
+* don't use plain `FileId` as the identity; use a representation that can model macro-expanded "files"
+  (rust-analyzer's APIs commonly distinguish real file ids from macro expansion file ids).
+* ensure `span_key/6` produces a stable virtual `RelPath` for expanded files so ordering stays deterministic.
+
 **Node representation**
 
 Do not store raw `SyntaxNode` in opaque values. Store:
 
-* file id + `SyntaxNodePtr` (or equivalent stable pointer)
+* a macro-aware file identity + `SyntaxNodePtr` (or equivalent stable pointer)
 
 This keeps nodes stable across cheap clones and avoids lifetime issues.
 
@@ -931,6 +1065,10 @@ Prefer implementing externs via:
 
 * `hir::Semantics` for syntax<->hir mapping and type queries
 * position-specific analysis tools (`SourceAnalyzer` or equivalent)
+
+Note:
+* `hir::Semantics` is the intended facade boundary: it maps syntax nodes to semantic definitions,
+  supports type queries, and can descend into macro expansions.
 
 **TypeRef representation**
 
@@ -961,10 +1099,14 @@ Prefer implementing externs via:
 * Provide:
 
   * `ty_ctor` (recommended)
-  * `ty_app`, `ty_arg`
+  * `ty_app`, `ty_arg`: expose TYPE args only
   * wrappers: `ty_ref`, `ty_ptr`, `ty_tuple`, `ty_slice`
   * `ty_param`, `ty_prim`, `ty_unknown`
   * `ty_normalize` (strongly recommended, even if initially identity)
+
+Implementation detail to bake in early:
+* rust-analyzer's generics model includes type, lifetime, and const args.
+* v0.1's `ty_arg/3` must filter ONLY the type arguments (ignore lifetimes and const generics).
 
 **Node context**
 
@@ -1019,7 +1161,8 @@ Prefer implementing externs via:
 ### 3) Mode tests
 
 * Guarded extern like `span_text(+Span,-string)` is rejected if Span not bound.
-* Mode-valid program compiles even if goals are written “out of order”.
+* Mode-valid program compiles even if goals are written "out of order".
+* Mode planning accounts for binding constraints (`T1 = T2`, `X := Expr`) and for groundness requirements (`!=`, `<`, `<=`, `>`, `>=`).
 
 ### 4) Stratification tests
 
@@ -1032,12 +1175,15 @@ Prefer implementing externs via:
   rejected for range restriction.
 * Non-stratifiable negation cycles rejected with clear message.
 * choose_topk inside recursion rejected.
+* witness_path/path_hop in a recursive SCC rejected.
+* witness_path/path_hop not strictly above graph_edge/5 rejected.
 
 ### 5) Engine semantics tests
 
 * Set semantics: duplicates eliminated.
 * Fixpoint: transitive closure matches expected.
 * Negation matches stratified semantics.
+* Occurs check: `X = some(X)` fails (or is rejected if you choose to make it a static error).
 
 ### 6) choose_topk determinism test
 
@@ -1045,7 +1191,7 @@ Prefer implementing externs via:
 
 ### 7) witness_path determinism test
 
-* Multiple shortest paths: lexicographic hop key ranking stable.
+* Multiple shortest paths: lexicographic hop-key ranking stable.
 * `Seq` from `path_hop` is 0..n-1 exactly.
 
 ### 8) Recursion guard test
@@ -1056,7 +1202,12 @@ Prefer implementing externs via:
   * note emitted
   * partial derived facts preserved
 
-### 9) Missing spec corner tests (add these)
+### 9) Aggregate corner cases
+
+* `min`/`max` with empty inner Goals fails the aggregate goal (no binding).
+* `sum` over empty inner Goals yields 0.
+
+### 10) Missing spec corner tests (add these)
 
 * Occurs check:
 

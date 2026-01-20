@@ -157,6 +157,21 @@ RAQL uses first-order structural unification when matching terms (including opti
 * A variable `V` may not be bound to any term that (transitively) contains `V`.
 * If a unification attempt would violate this, the unification goal fails.
 
+## 2.3 Groundness (required)
+
+A term is **ground** iff it contains **no unbound variables**.
+
+* Literals (`int`, `string`, `bool`) are ground.
+* Enum atoms `E::V` are ground.
+* Opaque host values (`Def`, `Span`, `TypeRef`, `Node`, `Call`, `Ref`, `Impl`, `Path`) are ground.
+* `some(T)` is ground iff `T` is ground.
+* `none` is ground.
+* A list literal is ground iff all of its elements are ground.
+
+Groundness is used by:
+* constraint semantics (`!=`, `<`, `<=`, `>`, `>=`) which require ground operands (§7.4)
+* mode-checking: a `+Type` argument must be ground at evaluation time (§6)
+
 ---
 
 # 3. Types
@@ -455,7 +470,7 @@ Modes prevent expensive or nonsensical enumeration (especially around text/synta
 
 A predicate may have **one or more** allowed modes. Each mode specifies, per argument:
 
-* `+Type`: input (must be bound at call time)
+* `+Type`: input (must be **ground** at call time; see §2.3)
 * `-Type`: output (will be produced/bound)
 * `?Type`: *either* bound or unbound is allowed (syntactic convenience)
 
@@ -533,6 +548,11 @@ A fact is a predicate application ending with `.`
 opt_include_tests().
 max_depth(3).
 ```
+
+**Groundness requirement (required):**
+
+Facts must be ground. Facts may not contain named variables and may not contain the wildcard `_`.
+If a fact contains a variable or `_`, the program is rejected at compile-time.
 
 ## 7.2 Rules
 
@@ -693,14 +713,37 @@ If impossible, program is rejected.
 
 RAQL enforces Datalog safety (range restriction).
 
-A rule is **safe** iff every variable that appears anywhere in the rule (head or body) is range-restricted by some positive evidence in the body:
+A rule is **safe** iff every variable that appears in the rule head, in any negated goal,
+or in any non-binding constraint is **range-restricted** by positive evidence in the body.
 
-* Every variable in the head must appear in at least one positive (non-negated) predicate goal in the body, outside of disjunction-only scope (§7.3).
-* Every variable used in a negated goal must also appear in some positive (non-negated) predicate goal in the body.
-* Every variable used in a constraint or arithmetic expression must also appear in some positive (non-negated) predicate goal in the body.
-* For disjunction groups, any variable referenced outside the disjunction must be range-restricted in every branch (§7.3).
-* Variables scoped only within aggregate `Goals` are local to the aggregate and do not escape except via the aggregate's binder variable.
-* Variables scoped only within `choose_topk`'s `Goals` are local to that binder and do not escape except via `Score` and `Item`.
+### 9.2.1 What counts as range-restricting evidence (required)
+
+The following are range-restricting:
+
+1) **Positive predicate goals** (non-negated atoms):
+   * variables appearing in a positive predicate goal are range-restricted (they range over that relation's set of ground facts).
+
+2) **Binding constraints**:
+   * Unification `T1 = T2` range-restricts any variable that becomes bound by unifying with a ground term,
+     or by unifying with another range-restricted variable/term.
+     Example: `EdgeKind = "direct"` range-restricts `EdgeKind`.
+   * Arithmetic binding `X := Expr` range-restricts `X` if every variable used in `Expr` is already range-restricted.
+
+3) **Binder outputs**:
+   * Aggregate binders range-restrict their binder variable (e.g., `N = count(...)` range-restricts `N`).
+   * `choose_topk` range-restricts `Score` and `Item`.
+   * `witness_path` range-restricts `P`.
+   * `path_hop` range-restricts its output variables (`Seq`, `From`, `To`, `EdgeKind`, `Evidence`).
+
+4) **Disjunction groups**:
+   After desugaring (§7.3), any variable referenced outside the disjunction must be range-restricted in every branch
+   (including via binding constraints like `X = "..."`).
+
+### 9.2.2 Non-binding constraints (required)
+
+For `!=`, `<`, `<=`, `>`, `>=`:
+* every variable appearing in the constraint must be range-restricted
+* and the operands must be ground at evaluation time (§7.4)
 
 Classic illegal example (rejected because `X` is not range-restricted by any positive goal):
 
@@ -748,10 +791,22 @@ Given an aggregate binder with inner `Goals`:
 * Evaluate the inner `Goals` under the current binding of outer variables.
 * This yields a set of satisfying bindings for the inner `Goals`' variables (set semantics).
 
-**Clarification (required):**
+**Projection rule (required, no ambiguity):**
 
-* Because the inner result is a set, `count(V : Goals)` counts distinct values of `V`.
-* `count(Goals)` counts distinct satisfying bindings ("rows") of `Goals`.
+For any aggregate written as `agg(V : Goals)`:
+* Let `Rows` be the set of satisfying bindings of all variables that appear in `Goals`
+  (with outer variables treated as fixed parameters).
+* Let `Vals` be the **set** `{ V | row ∈ Rows }` (projection to `V`, then dedup).
+* The aggregate is computed over `Vals`.
+
+Therefore:
+* `count(V : Goals)` = `|Vals|`
+* `sum(V : Goals)` = sum over elements of `Vals`
+* `min(V : Goals)` / `max(V : Goals)` are taken over `Vals`
+
+For the row-form `count(Goals)`:
+* Let `Rows` be as defined above.
+* `count(Goals)` = `|Rows|` (distinct satisfying bindings, i.e. distinct rows)
 
 **The optional `V : Goals` form:**
 
@@ -796,8 +851,7 @@ Then:
 * `sum(V : Goals)` requires `V:int`.
 * `min(V : Goals)` and `max(V : Goals)` require `V` to be orderable (§3.4, §12.2).
 * `count_distinct` is a synonym for `count` in v0.1:
-  * `count_distinct(V : Goals)` == `count(V : Goals)`
-  * both count distinct values of `V` due to set semantics
+  * `count_distinct(V : Goals)` == `count(V : Goals)` (both count `|Vals|` as defined in §10.2)
   * both are retained for readability and future evolution
 
 ---
@@ -1179,9 +1233,21 @@ Notes:
 
 * `Rank` sorts higher first.
 * `Seq` orders within `(Section, Group, Rank)` ascending.
-* `Group` may be `""` for “no grouping.”
+* `Group` may be `""` for "no grouping."
 * `Anchor` is optional (`none` means no highlight).
 * `Title` optional: renderer derives a default if `none`.
+
+**Deterministic rendering (required):**
+
+When presenting fragments, renderers MUST sort deterministically.
+At minimum, renderers MUST sort:
+* `(Section asc, Group asc, Rank desc, Seq asc, Kind asc)`
+
+If two fragments still tie on these fields, renderers MUST break ties by:
+* `stable_order(D)` for `out_def_frag` ties, or
+* `stable_order(S)` for `out_span_frag` ties.
+
+This ensures stable output even when authors accidentally reuse `(Rank, Seq, Kind)`.
 
 ## 14.2 Fragment key/value metadata (optional but included)
 
@@ -1209,6 +1275,11 @@ This attaches metadata to the fragment identified by `(Section,Group,Rank,Seq,Ki
 
 This discriminator ensures that metadata can unambiguously target a fragment even if both `out_def_frag` and `out_span_frag` emit the same `(Section,Group,Rank,Seq,Kind)` tuple.
 
+**Recommended runtime warning (v0.1):**
+
+If multiple fragments of the same `Target` share the same `(Section,Group,Rank,Seq,Kind)` key,
+the engine SHOULD emit an `out_note("Notes", "...")` warning that metadata may be ambiguous.
+
 ## 14.3 Metrics
 
 ```prolog
@@ -1222,6 +1293,13 @@ This discriminator ensures that metadata can unambiguously target a fragment eve
 .decl out_status(Status: string) output.  % "ok" | "partial"
 .decl out_note(Section: string, Message: string) output.
 ```
+
+**Reservation rule (required):**
+
+`out_status/1` is reserved for the engine. User programs may not emit `out_status/1` facts or rule heads.
+If user code attempts to populate `out_status/1`, compilation fails.
+
+User programs MAY emit `out_note/2` facts/rules (for user-level notes), and the engine may also emit `out_note/2`.
 
 ---
 
