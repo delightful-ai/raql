@@ -1,0 +1,243 @@
+RAQL v0.1 Rust API sketch (types-first)
+
+This is a concrete shape sketch for the Rust types and modules implied by
+language_plan.md. The code blocks are sketches, not drop-in code.
+
+---
+
+1) raql-ir module layout
+
+Suggested layout:
+
+raql-ir/
+  src/
+    lib.rs
+    source.rs          // RaqlFileId, SourceFile, SrcSpan
+    symbol.rs          // Symbol helpers (intern::Symbol)
+    ty.rs              // TyId, TyData, TypeInterner, TypeTag cache
+    ast.rs             // Program<AstPhase>, directives, decls, TermAst, GoalAst
+    resolved.rs        // Program<ResolvedPhase>, resolved atoms, enum ids
+    typed.rs           // Program<TypedPhase>, VarId allocation, TermTyped
+    planned.rs         // Program<PlannedPhase>, RulePlan, OpPlan, strata, SCCs
+    diag.rs            // Diagnostic structs (phase-agnostic)
+
+Phase-typed program container:
+
+pub mod phase {
+    pub trait Phase: sealed::Sealed {}
+    pub struct AstPhase { pub items: Vec<AstItem> }
+    pub struct ResolvedPhase { pub items: Vec<ResolvedItem> }
+    pub struct TypedPhase { pub rules: la_arena::Arena<TypedRule> }
+    pub struct PlannedPhase { pub strata: Box<[StratumPlan]> }
+}
+
+pub struct Program<P: phase::Phase> {
+    pub common: ProgramCommon,
+    pub phase: P,
+}
+
+pub struct ProgramCommon {
+    pub sources: SourceMap,
+    pub pragmas: Pragmas,
+    pub types: TypeTable,
+    pub preds: PredTable,
+}
+
+---
+
+2) IDs and arenas
+
+Use la_arena::Arena<T> with typed IDs everywhere.
+
+pub type PredId = la_arena::Idx<PredDef>;
+pub struct PredDef { pub sig: PredSig, pub src: SrcSpan }
+
+pub type EnumId = la_arena::Idx<EnumDef>;
+pub struct EnumDef {
+    pub name: Symbol,
+    pub variants: Box<[VariantId]>,
+}
+
+pub type VariantId = la_arena::Idx<VariantDef>;
+pub struct VariantDef { pub name: Symbol, pub ordinal: u32 }
+
+---
+
+3) Types: interned TyId graph + canonical TypeTag
+
+pub struct TyId(la_arena::Idx<TyData>);
+
+enum TyData {
+    Int,
+    String,
+    Bool,
+    Opaque(OpaqueTy),
+    Enum(EnumId),
+    Option(TyId),
+    List(TyId),
+}
+
+pub enum OpaqueTy { Def, Span, TypeRef, Node, Call, Ref, Impl, Path }
+
+TypeTag is a cached canonical string, used by stable_order:
+
+int, string, bool
+option<T>, list<T>
+RenderMode
+Def, Span, TypeRef, Node, Call, Ref, Impl, Path
+
+---
+
+4) Terms: AST vs typed vs runtime
+
+AST term:
+
+pub enum TermAst {
+    Var(Symbol),
+    Wildcard,
+    Int(i64),
+    Str(Symbol),
+    Bool(bool),
+    EnumAtom { enm: Symbol, var: Symbol },
+    None { ann: Option<TypeAst> },
+    Some(Box<TermAst>),
+    List { elems: Vec<TermAst>, ann: Option<TypeAst> },
+}
+
+Typed term:
+
+pub struct TermTyped {
+    pub ty: TyId,
+    pub kind: TermKindTyped,
+}
+
+pub enum TermKindTyped {
+    Var(VarId),
+    Wildcard,
+    Int(i64),
+    Str(Symbol),
+    Bool(bool),
+    Enum { enum_id: EnumId, variant: VariantId },
+    None,
+    Some(Box<TermTyped>),
+    List(Vec<TermTyped>),
+}
+
+Runtime term graph (unification + occurs check):
+
+pub enum RTerm<H: HostTypes> {
+    Var(VarId),
+    Value(Value<H>),
+    Some(TermId),
+    None(TyId),
+    List(Box<[TermId]>),
+}
+
+---
+
+5) Predicate signatures and modes
+
+pub enum PredKind { Rel, Func }
+
+bitflags::bitflags! {
+    pub struct PredAttr: u8 {
+        const EXTERN = 0b0001;
+        const INPUT  = 0b0010;
+        const OUTPUT = 0b0100;
+    }
+}
+
+pub struct PredSig {
+    pub name: Symbol,
+    pub arity: u32,
+    pub args: Box<[TyId]>,
+    pub kind: PredKind,
+    pub attr: PredAttr,
+}
+
+pub struct ModeSig {
+    pub pred: PredId,
+    pub args: Box<[ModeArg]>,
+}
+
+pub struct ModeArg {
+    pub dir: ModeDir,
+    pub ty: TyId,
+}
+
+pub enum ModeDir { In, Out }
+
+After parsing, expand ? to explicit modes and store only explicit modes.
+
+---
+
+6) Planned ops: executable only
+
+pub enum Slot {
+    Var(VarId),
+    Const(ConstId),
+}
+
+pub enum OpPlan {
+    Lookup { pred: PredId, mode: ModeId, args: Box<[Slot]> },
+    Not    { pred: PredId, args: Box<[Slot]> },
+    Unify  { a: TermTyped, b: TermTyped },
+    Compare { op: CmpOp, a: TermTyped, b: TermTyped },
+    ArithBind { out: VarId, expr: ArithExpr },
+    Aggregate { out: VarId, agg: AggKind, inner: SubPlan },
+    ChooseTopK { site: ChooseSiteId, tag: Symbol, k: Slot, group: Slot, score: VarId, item: VarId, inner: SubPlan },
+    WitnessPath { site: WitnessSiteId, graph: Slot, from: Slot, to: Slot, out: VarId },
+    PathHop { path: Slot, seq: VarId, from: VarId, to: VarId, kind: VarId, evidence: VarId },
+}
+
+The engine never runs mode logic; it executes this plan directly.
+
+---
+
+7) Host traits (rust-analyzer adapter lives in raql-host-ra)
+
+pub trait HostTypes {
+    type Def: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    type Span: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    type TypeRef: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    type Node: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    type Call: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    type Ref: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+    type Impl: Copy + Eq + std::hash::Hash + std::fmt::Debug;
+}
+
+pub struct SpanKey {
+    pub rel_path: Symbol,
+    pub l0: i64,
+    pub c0: i64,
+    pub l1: i64,
+    pub c1: i64,
+}
+
+pub trait HostStableKeys: HostTypes {
+    fn def_handle(&mut self, d: Self::Def) -> Symbol;
+    fn span_key(&mut self, s: Self::Span) -> SpanKey;
+    fn typeref_id(&mut self, tr: Self::TypeRef) -> Symbol;
+    fn node_id(&mut self, n: Self::Node) -> Symbol;
+    fn call_id(&mut self, c: Self::Call) -> Symbol;
+    fn ref_id(&mut self, r: Self::Ref) -> Symbol;
+    fn impl_id(&mut self, i: Self::Impl) -> Symbol;
+    fn world_stamp(&mut self) -> Symbol;
+}
+
+For v0.1, prefer a typed extern trait over stringly dispatch. The engine can
+translate from RAQL predicates to these methods once at compile time.
+
+---
+
+8) raql-host-ra mappings (rust-analyzer types)
+
+Recommended concrete types:
+
+* Span = rust-analyzer span::Span
+* Node = (hir_expand::HirFileId, syntax::SyntaxNodePtr)
+* Def  = small enum wrapping the HIR id variants you need
+* TypeRef = host-interned handle keyed by hir_ty::Ty
+
+The host must cache stable keys aggressively. The engine assumes these methods
+are deterministic within a single analysis snapshot.

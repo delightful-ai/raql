@@ -1,0 +1,3196 @@
+
+
+# RAQL Stdlib One-File Oracle Context Bundle
+
+Snapshot date: 2026-02-12
+**goal**: Design the standard library for RAQL. Your goal is to make it a DELIGHT to use. 
+
+
+## How to use this bundle
+
+- Treat this bundle as authoritative for current project reality and constraints.
+- If any conflict appears:
+1. `language_spec.md` required clauses
+2. acceptance matrix coverage expectations
+3. current `crates/` implementation behavior
+4. `language_plan.md` milestone guidance
+5. conceptual sketches
+
+## Explicit guarantee
+
+This bundle contains the full `language_spec.md` (not excerpts).
+
+
+
+## Project Purpose (README)
+
+Source: `/Users/darin/Projects/raql/README.md:1-180`
+
+```text
+# RAQL
+
+semantic queries for rust. returns readable context, not file:line coordinates.
+
+```bash
+raql callers process
+```
+
+```
+FN  fn process(&self, req: Request) -> Result<Response, ProcessError>
+at src/processor.rs:41-78  @H:fn:6b11d0
+
+# Summary
+callers:    4 direct, 2 through-trait
+scope:      workspace, no-tests
+
+# Callers
+
+## fn handle_request  @H:fn:c3d4e5
+at src/http.rs:45-89
+
+> |     let result = self.processor.process(req)?;
+  |     match result {
+  |         Ok(resp) => Ok(resp.into()),
+
+## fn batch_ingest  @H:fn:e5f6a7
+at src/ingest.rs:112-156
+
+  | for item in items {
+> |     processor.process(item)?;
+  | }
+
+... 2 more callers. expand: --show callers=all
+```
+
+the `@H:...` handles are stable identifiers. paste them into the next query.
+
+## install
+
+```bash
+cargo install raql
+```
+
+## how it works
+
+raql spawns a background daemon per project. first query loads the workspace (~3s). subsequent queries hit the warm cache (<100ms). daemon exits after 10 minutes idle.
+
+file changes are watched and applied incrementally. no manual reload.
+
+## commands
+
+```
+raql <selector>           dossier: "what is this and what do I need?"
+raql search <query>       find symbols by name
+raql callers <fn>         who calls this, with surrounding code
+raql callees <fn>         what does this call
+raql refs <def>           value usage: reads, writes, comparisons, moves
+raql uses <type>          type sites: params, returns, fields, locals
+raql interface <type>     API surface: methods, trait impls
+raql impls <Trait>        types implementing a trait (supports intersection)
+raql trace <def>          multi-hop flow through the code
+raql audit <check> <def>  verification: compare, write, construct, handle
+raql bundle <def>         pack a subsystem for reading
+```
+
+## selectors
+
+```bash
+raql @H:fn:6b11d0                 # handle (precise)
+raql crate::processor::process    # qualified path
+raql process                      # bare name (shows alternatives if ambiguous)
+raql src/lib.rs:42                # file:line
+raql src/lib.rs:42/process        # file:line with disambiguator
+```
+
+## output
+
+```bash
+raql callers X               # readable artifact (default)
+raql callers X --only nav    # locations only, for jumping
+raql callers X --only counts # just the numbers
+raql callers X --jsonl       # structured stream
+```
+
+## scope and filtering
+
+```bash
+--scope crate              # current crate only
+--scope workspace          # all workspace members (default)
+--include-tests            # include test code
+--include-blanket          # include blanket impls
+--show callers=all         # remove budget limits
+--why                      # annotate why each fragment was included
+```
+
+## why this exists
+
+grepping for callers gives you file:line hits. you then open each one, scan for context, figure out if it's relevant. repeat 30 times.
+
+raql gives you the context directly: the surrounding code, grouped by caller, with the callsite highlighted. one query, one answer.
+
+same for references, type usage, error flow. the output is bounded and readable by default. if you need more, expand with `--show X=all`.
+
+designed for agents that pay per tool call, and humans who don't want to play editor ping-pong.
+
+## license
+
+MIT
+```
+
+## Full Language Specification
+
+Source: `/Users/darin/Projects/raql/docs/initial_plans/language_spec.md`
+
+```text
+Below is a **canonical, self-contained RAQL v0.1 language spec** (Datalog/Prolog-inspired) that incorporates exactly the v0 priorities you listed:
+
+**Included in v0.1**
+
+1. **Type structure** (`ty_app`, `ty_arg`, …)
+2. **Node/expr domain** (minimal, enough for enclosing control structure)
+3. **`witness_path` + `path_hop`**
+4. **`choose_topk`** (single built-in binder)
+5. **`Seq` field** in output predicates
+
+**Deferred**
+
+* multi-world cfg/features/targets (v1)
+* full CFG/dataflow (v1 unless RA makes it trivial)
+
+It also addresses the explicit issues you raised:
+
+* **Optionality** (no more “two rules every time” for docs/parents)
+* **Mode declarations** (including whether you can enumerate args)
+* **Recursion guard** (enforced fixpoint iteration limit)
+
+I’m being deliberately explicit so there are no “interpretation gaps.”
+
+---
+
+# RAQL v0.1 Language Specification
+
+## Type inference usability upgrade (v0.1)
+
+This spec includes an inference-focused usability upgrade intended to support one-off queries
+written by humans and agents:
+
+* Derived predicates may omit `.decl` and have their schemas inferred.
+* `none` and `[]` participate in constraint-based inference and do not immediately error.
+* When inference is still ambiguous, users can annotate `none` and list literals using Rust-style turbofish:
+  `none::<T>`, `[]::<T>`, `[... ]::<T>`.
+
+## Change log (v0.1 spec errata)
+
+This spec is intended to be the contract for the RAQL v0.1 implementation. The following clarifications/fixes
+resolve ambiguities discovered during plan review:
+
+* Arithmetic binding is now written with `:=` (not `=`) to eliminate grammar ambiguity between unification and
+  arithmetic evaluation.
+* Integer division semantics are now explicitly defined (truncation toward zero).
+
+## 0. Model and terminology
+
+RAQL is a **Datalog** language with a **Prolog-like surface**:
+
+* Programs consist of **facts** and **rules**:
+  `head :- body.`
+* Semantics are **set-based** (no duplicates) and **bottom-up** (least fixpoint).
+* Output is produced by populating standard **output relations** (fragments + metrics).
+
+RAQL runs against an **analysis snapshot** provided by a host (rust-analyzer adapter). All extern predicates read from that snapshot. In v0.1, there is exactly **one analysis world** (one feature/target configuration); the host is required to expose a stamp of that configuration (see §13.4).
+
+## 0.1 Compile-time errors and diagnostics (required)
+
+If a program fails to parse or fails any static check (name resolution, typing, safety/range restriction,
+mode validity, stratification), the program is rejected and evaluation does not start.
+
+Implementations must produce diagnostics that include:
+
+* a primary source location (file/line/col span)
+* a clear error message
+* optional secondary labels and actionable help text (recommended)
+* include-stack context for `.include` chains when relevant
+
+---
+
+# 1. Lexical syntax
+
+## 1.1 Whitespace
+
+Spaces, tabs, and newlines separate tokens and otherwise have no meaning.
+
+## 1.2 Comments
+
+* Line comments:
+
+  * `% ...` (preferred)
+  * `// ...` (allowed)
+* Block comments:
+
+  * `/* ... */` (nesting recommended; if not supported, behavior must be documented)
+
+## 1.3 Identifiers
+
+* Predicate names, type names: `[A-Za-z_][A-Za-z0-9_]*`
+* Convention:
+
+  * Predicates: `snake_case`
+  * Types/enums: `PascalCase`
+
+## 1.4 Variables
+
+Variables begin with an uppercase letter or `_`:
+
+* `Def`, `CallerFn`, `S`, `_Tmp`
+* `_` alone is the **anonymous variable** (wildcard), never binds.
+
+Note:
+
+* Because uppercase identifiers are reserved for variables, enum values are never written as bare identifiers.
+* Enum values are always written in qualified form: `EnumType::Variant` (see §3.3).
+
+## 1.5 Literals
+
+* `int`: `0`, `42`, `-7`
+* `string`: `"..."` with escapes (`\"`, `\\`, `\n`, `\t`)
+* `bool`: `true`, `false`
+
+---
+
+# 2. Terms (values)
+
+A **term** is one of:
+
+* Variable: `X`
+* Wildcard: `_`
+* Literal: `123`, `"hi"`, `true`
+* Enum variant atom: `RenderMode::DOC_SIG`, `RefKind::COMPARE`
+* Option value: `none`, `none::<Type>`, `some(Term)`
+* List literal: `[Term, Term, ...]`, with optional `::<Type>` annotation
+
+## 2.1 Option values (built-in)
+
+RAQL has a built-in generic option type `option<T>` with two constructors:
+
+* `none`
+* `some(Value)`
+
+Unification works structurally, so this is legal and idiomatic:
+
+```prolog
+def_doc_summary(D, some(Doc)), contains(Doc, "safety").
+def_doc_summary(D, none).   % matches defs with no doc summary
+```
+
+## 2.2 Unification (precise)
+
+RAQL uses first-order structural unification when matching terms (including option/list constructors) and in `=` relational constraints (§7.4).
+
+**Rules:**
+
+* Variables may be unbound or bound.
+* The anonymous variable `_` matches any term and never binds.
+* Unifying an unbound variable `V` with a term `T` binds `V := T`, subject to the occurs check below.
+* Unifying two bound terms succeeds iff they are structurally equal (including enum type + variant).
+* Opaque host types (`Def`, `Span`, `TypeRef`, `Node`, `Call`, `Ref`, `Impl`, `Path`) are atomic:
+  * They unify only by equality (same value).
+  * They never unify with structured terms such as `some(...)`, lists, or literals.
+
+**Occurs check (required):**
+
+* A variable `V` may not be bound to any term that (transitively) contains `V`.
+* If a unification attempt would violate this, the unification goal fails.
+
+## 2.3 Groundness (required)
+
+A term is **ground** iff it contains **no unbound variables**.
+
+* Literals (`int`, `string`, `bool`) are ground.
+* Enum atoms `E::V` are ground.
+* Opaque host values (`Def`, `Span`, `TypeRef`, `Node`, `Call`, `Ref`, `Impl`, `Path`) are ground.
+* `some(T)` is ground iff `T` is ground.
+* `none` is ground.
+* A list literal is ground iff all of its elements are ground.
+
+Groundness is used by:
+* constraint semantics (`!=`, `<`, `<=`, `>`, `>=`) which require ground operands (§7.4)
+* mode-checking: a `+Type` argument must be ground at evaluation time (§6)
+
+---
+
+# 3. Types
+
+RAQL is **lightly typed**. Types exist to:
+
+* prevent obvious mismatches (`Span` vs `Def`)
+* enforce **guarded/demand-driven** predicates via modes (§6)
+* provide reliable tooling (linting/autocomplete)
+
+## 3.1 Primitive types
+
+* `int`, `string`, `bool`
+
+**`int` semantics (v0.1):**
+
+* `int` is a signed 64-bit integer (two's complement), range `[-2^63, 2^63-1]`.
+* Arithmetic in constraints and aggregates is checked.
+* Integer overflow and division by zero are runtime errors (see §13.5).
+
+## 3.2 Opaque host types (v0.1)
+
+Opaque types are values produced only by extern predicates:
+
+* `Def`
+* `Span`
+* `TypeRef`
+* `Node`
+* `Call`
+* `Ref`
+* `Impl`
+* `Path` (for witness paths)
+
+Opaque values are equality-comparable and orderable by the language’s stable ordering rules (§12.2), but cannot be constructed directly.
+
+## 3.3 Enums
+
+Enums may be declared via directive:
+
+```prolog
+.type RenderMode = { DOC_SIG, ITEM, HEADER, LINE, STMT, BLOCK, EXPR }.
+.type RefKind    = { READ, WRITE, COMPARE, PASS, MOVE, FIELD }.
+.type Mutability = { IMM, MUT }.
+.type NodeKind   = { IF, MATCH, WHILE, FOR, LOOP, BLOCK, TRY, ARM, OTHER }.
+```
+
+Enum values are written as qualified identifiers, e.g. `RenderMode::BLOCK`.
+This avoids ambiguity with variables, which are also uppercase-initial (§1.4).
+
+## 3.4 Type checking and inference (v0.1)
+
+RAQL programs are type-checked at compile-time against predicate schemas declared via `.decl` and `.func`.
+Programs with type errors are rejected.
+
+Additionally, for usability, schemas for derived predicates may be inferred when `.decl` is omitted (§5.3).
+Inferred schemas are still statically typed and monomorphic.
+
+**Variable typing (rule-local, monomorphic):**
+
+* Within a single rule, each named variable has exactly one type.
+* A variable's type is inferred from the positions it appears in (predicate schemas, constructors, constraints).
+* If a variable is used in incompatible typed positions, it is a compile-time error.
+
+**Wildcard typing:**
+
+* Each occurrence of `_` is treated as a fresh anonymous variable.
+* It is type-checked from context, but never binds and never shares identity with other `_` occurrences.
+
+**Literal typing:**
+
+* `int` literals have type `int`.
+* `string` literals have type `string`.
+* `true`/`false` have type `bool`.
+* Enum atoms `E::V` have type `E`.
+
+**Constructor typing:**
+
+* `some(T)` has type `option<T>`.
+* `none` has type `option<Tv>` where `Tv` is a fresh type variable resolved by inference (§3.5).
+  * If `Tv` remains unresolved when a concrete schema is required, it is a compile-time error.
+* List literals are homogeneous:
+  * `[ ]` has type `list<Tv>` where `Tv` is a fresh type variable resolved by inference (§3.5).
+  * `[T1, T2, ...]` has type `list<T>` where all elements unify to the same type `T`.
+
+**Constraint typing:**
+
+* Relational `=` unifies types structurally.
+* Relational `!=` and order comparisons require both sides to have the same type.
+* Arithmetic binding `X := Expr` requires `X:int` and `Expr:int`.
+
+**Aggregate typing:**
+
+* `count(...)` and `count_distinct(...)` produce `int`.
+* `sum(V : ...)` produces `int` and requires `V:int`.
+* `min(V : ...)` and `max(V : ...)` produce the type of `V` and require `V` to be orderable (see below).
+
+**Orderable types (v0.1):**
+
+An orderable type is any type for which `stable_order` is defined (§12.2), including:
+
+* `int`, `string`, `bool`
+* enums
+* `Def`, `Span`, `Path`, `TypeRef`, `Node`, `Call`, `Ref`, `Impl`
+* `option<T>` where `T` is orderable
+* `list<T>` where `T` is orderable
+
+**`choose_topk` typing constraint:**
+
+* `Group` and `Item` must be orderable types.
+
+## 3.5 Type inference model (v0.1, required)
+
+RAQL uses constraint-based type inference to support ergonomic queries.
+
+Key properties:
+
+* Inference is monomorphic:
+  * each variable within a rule has exactly one type
+  * each predicate argument position has exactly one type
+* Type variables (meta-variables) may be introduced internally during inference
+  (e.g. for `none` and `[]`), but they must be resolved to concrete types before execution.
+
+### 3.5.1 Sources of constraints
+
+The type checker generates equality/compatibility constraints from:
+
+* predicate schemas:
+  * declared via `.decl` / `.func`
+  * inferred for derived predicates when `.decl` is omitted (§5.3)
+* constructors:
+  * `some(T)` implies `some(T): option<type(T)>`
+  * `none` implies `none: option<Tv>` for fresh `Tv`
+  * `[]` implies `[]: list<Tv>` for fresh `Tv`
+  * `[a,b,c]` implies `list<T>` and `type(a)=type(b)=type(c)=T`
+* constraints:
+  * `T1 = T2` implies `type(T1) = type(T2)`
+  * `T1 != T2` implies `type(T1) = type(T2)` and both sides ground at evaluation time
+  * order comparisons imply both sides share a comparable type
+  * arithmetic binding `X := Expr` implies `type(X)=int` and `type(Expr)=int`
+* aggregates:
+  * `count`/`count_distinct` produce `int`
+  * `sum` requires and produces `int`
+  * `min`/`max` require orderable types and produce that type
+
+### 3.5.2 Resolution requirement
+
+After constraint solving:
+
+* all predicate argument types (declared or inferred) must be concrete (no remaining type variables)
+* all rule-local variable types must be concrete
+* any remaining unconstrained type variable is a compile-time error
+
+### 3.5.3 Infinite type protection (recommended)
+
+Implementations SHOULD reject inferred infinite types (e.g. constraints like `Tv = option<Tv>`)
+with a compile-time diagnostic.
+
+Rationale: even if a rule would be unsatisfiable at runtime due to occurs check, infinite types degrade tooling and
+produce confusing downstream errors.
+
+## 3.6 Typed literal annotations (v0.1)
+
+When inference is ambiguous, users may annotate `none` and list literals using Rust-style turbofish:
+
+* `none::<T>` has type `option<T>`
+* `[]::<T>` has type `list<T>`
+* `[a,b,c]::<T>` asserts the list has type `list<T>` (elements must unify with `T`)
+
+These annotations are purely type-level and do not affect runtime semantics.
+
+## 3.7 Parametric built-ins (v0.1)
+
+The spec describes some built-in extern predicates/functions using schematic type variables such as `T`
+(for example `coalesce(option<T>, T, T)`).
+
+Rules:
+
+* User programs cannot declare their own type variables in v0.1.
+* For each call site, the compiler must infer a single concrete monomorphic type for each schematic variable.
+* If the type cannot be inferred from context, the program is rejected at compile-time.
+
+---
+
+# 4. Program structure
+
+A RAQL program is a set of:
+
+* directives
+* declarations
+* rules and facts
+
+Order does not affect meaning (except for name resolution in includes).
+
+## 4.1 Includes
+
+```prolog
+.include "std.raql".
+.include "views/callers.raql".
+```
+
+Include paths are resolved relative to a configured search path.
+
+---
+
+# 5. Declarations
+
+## 5.1 Relation declarations: `.decl`
+
+Declares a predicate schema.
+
+```prolog
+.decl def_kind(D: Def, K: string) extern.
+.decl target_def(D: Def) input.
+.decl out_def_frag(...) output.
+```
+
+### Attributes
+
+* `extern`: provided by the runtime environment (built-ins and/or host adapters)
+* `input`: facts injected by runtime (CLI options, selected target, etc.)
+* `output`: consumed by renderer / printed in query mode
+
+If no attribute is given, the predicate is **derived** (defined by rules).
+
+**Note:**
+
+* The required rust-analyzer-backed extern predicates for v0.1 are specified in §16 and §20.
+* Other extern predicates may be implemented by the RAQL engine runtime (e.g. string helpers, witness selection).
+
+## 5.2 Functional predicates: `.func`
+
+`.func` declares a deterministic mapping from bound inputs to exactly one output tuple.
+
+Syntax:
+
+```prolog
+.func def_doc_summary(D: Def, Doc: option<string>) extern.
+```
+
+Meaning:
+
+* For any **bound** `D` for which the call is well-typed, `def_doc_summary(D, Doc)` produces **exactly one** tuple.
+* Absence is represented via `none`, not "no tuple".
+
+**Host contract requirement:**
+
+* If an extern `.func` produces zero or multiple results for a bound input, this is a runtime error (see §13.5).
+  This is considered a host contract violation.
+
+This is RAQL's canonical answer to optionality (§8).
+
+> Rule: "attribute-like" properties must be `.func` returning `option<T>` when absence is common (docs, parent, display name, etc.). Multi-valued edges remain `.decl` relations.
+
+## 5.3 Implicit schemas for derived predicates (v0.1 usability, required)
+
+To support one-off queries, `.decl` is OPTIONAL for predicates that are:
+
+* not marked `extern`
+* not marked `input`
+* not marked `output`
+
+Such predicates are treated as **derived** and their schemas are inferred.
+
+### 5.3.1 What is inferred
+
+For each derived predicate `p/n` lacking a `.decl`, the compiler infers:
+
+* arity `n`
+* the type of each argument position
+
+### 5.3.2 Constraint sources for schema inference
+
+Schema inference must incorporate constraints from:
+
+* all rule heads with predicate `p(...)`
+* all call sites of `p(...)` in rule bodies
+
+Rules:
+
+* All occurrences must agree on arity, otherwise compile-time error.
+* Types are inferred using the same constraint system as §3.5.
+* The final inferred schema must be monomorphic and fully concrete (no type variables).
+
+### 5.3.3 Interaction with explicit `.decl`
+
+If a predicate has an explicit `.decl`, that schema is authoritative.
+All call sites and rule heads must type-check against it; otherwise compile-time error.
+
+---
+
+# 6. Modes (binding discipline)
+
+Modes prevent expensive or nonsensical enumeration (especially around text/syntax).
+
+## 6.1 Mode declaration: `.mode`
+
+A predicate may have **one or more** allowed modes. Each mode specifies, per argument:
+
+* `+Type`: input (must be **ground** at call time; see §2.3)
+* `-Type`: output (will be produced/bound)
+* `?Type`: *either* bound or unbound is allowed (syntactic convenience)
+
+Example:
+
+```prolog
+.mode ty_arg(+TypeRef, -int, -TypeRef).
+.mode ty_arg(+TypeRef, +int, -TypeRef).
+```
+
+`?Type` is shorthand for defining both the `+` and `-` variants.
+
+**Expansion rule (precise):**
+
+* A `.mode` declaration containing one or more `?Type` positions expands to the cartesian product of replacing each `?` with `+` and `-`.
+* Duplicate modes after expansion are permitted but redundant.
+
+Example:
+
+```prolog
+.mode p(?int, +string, ?Def).
+```
+
+expands to:
+
+```prolog
+.mode p(+int, +string, +Def).
+.mode p(+int, +string, -Def).
+.mode p(-int, +string, +Def).
+.mode p(-int, +string, -Def).
+```
+
+## 6.2 Mode checking rule (no ambiguity)
+
+Because RAQL is Datalog (order-independent), mode checking is defined as:
+
+A rule is **mode-valid** iff the compiler can find **some ordering** of the positive (non-negated) goals in its body such that, when each goal is evaluated, all of its `+` arguments are bound by:
+
+* constants, or
+* variables bound by earlier positive goals, or
+* variables bound by aggregates already evaluated, or
+* variables bound by `.func` calls whose required inputs are already bound, or
+* variables newly bound by earlier constraints:
+  * unification constraints `T1 = T2` may bind variables (§2.2, §7.4)
+  * arithmetic binding `X := Expr` may bind `X` (§7.4)
+
+If no such ordering exists, the rule is rejected at compile-time.
+
+## 6.3 Guarded predicates
+
+Any predicate with a mode requiring `+Span` (or similar) is effectively guarded. Example:
+
+```prolog
+.decl span_text(S: Span, Text: string) extern.
+.mode span_text(+Span, -string).
+```
+
+You cannot call `span_text(S, Text)` unless `S` is bound by other goals. This is non-negotiable for safety.
+
+## 6.4 Multi-mode predicates (call-site selection)
+
+If a predicate has multiple allowed modes, a call site is valid if there exists at least one mode under which the call can be evaluated (given the chosen goal ordering) with all `+` arguments bound.
+
+The compiler may select any such mode as part of finding a mode-valid ordering; this selection does not change the logical meaning of the program.
+
+---
+
+# 7. Facts and rules
+
+## 7.1 Facts
+
+A fact is a predicate application ending with `.`
+
+```prolog
+opt_include_tests().
+max_depth(3).
+```
+
+**Groundness requirement (required):**
+
+Facts must be ground. Facts may not contain named variables and may not contain the wildcard `_`.
+If a fact contains a variable or `_`, the program is rejected at compile-time.
+
+## 7.2 Rules
+
+A rule has a head and body:
+
+```prolog
+Head :- Goal1, Goal2, ..., GoalN.
+```
+
+### Goals can be:
+
+1. A predicate atom: `p(X, Y)`
+2. A negated atom: `not p(X, Y)`
+3. A disjunction group: `(A ; B ; C)` where each branch is a comma-separated goal list (semantics in §7.3)
+4. A constraint: `X := Y + 1`, `X != Y`, `X < 3`
+5. An aggregate binder: `N = count(V : Goals...)`
+6. A selection binder: `choose_topk(...)` (defined in §11.1)
+
+## 7.3 Disjunction groups (`;`) (precise semantics)
+
+A disjunction group in a rule body is syntactic sugar for multiple rules.
+
+**Rewrite rule:**
+
+```
+H :- G0, (B1 ; B2 ; ... ; Bn), G1.
+```
+
+is equivalent to the set of rules:
+
+```
+H :- G0, B1, G1.
+H :- G0, B2, G1.
+...
+H :- G0, Bn, G1.
+```
+
+**Variable scope and safety rule for disjunction:**
+
+* Variables introduced only inside a branch are local to that branch after rewriting.
+* Any variable referenced outside the disjunction group must be range-restricted in every branch (otherwise the program is rejected).
+
+## 7.4 Constraints and expressions (precise semantics)
+
+Constraints are evaluated as goals. They may bind variables (via unification or arithmetic binding), or they may purely test and filter bindings.
+
+There are two constraint forms:
+
+**A) Relational constraints:** `T1 relop T2`
+
+where `relop ∈ { "=", "!=", "<", "<=", ">", ">=" }`.
+
+* `T1 = T2`:
+  * Performs unification as defined in §2.2.
+  * May bind previously unbound variables.
+* `T1 != T2`:
+  * Is a pure disequality test.
+  * Requires that both `T1` and `T2` are ground (contain no unbound variables) at evaluation time.
+  * Succeeds iff `T1` and `T2` are not equal.
+* Order comparisons (`<`, `<=`, `>`, `>=`):
+  * Are pure comparisons (never bind variables).
+  * Require both sides to be ground at evaluation time.
+  * Require both sides to have the same type, and that type must support ordering:
+    * `int`: numeric order
+    * `string`: lexicographic UTF-8 byte order
+    * `bool`: `false < true`
+    * enums: by variant ordinal in declaration order (§12.2)
+  * If the types are not comparable, the program is rejected at compile-time (type error).
+
+**B) Arithmetic binding:** `X := Expr`
+
+* This is the `var := expr` constraint form in the grammar (§19).
+* `Expr` must be an int expression using `+`, `-`, `*`, `/`, unary `-`, and parentheses.
+* All variables referenced by `Expr` must be bound to int at evaluation time.
+* Evaluate `Expr` to an int value `V`, then:
+  * If `X` is unbound, bind `X := V`.
+  * If `X` is bound, require `X == V`, otherwise fail the goal.
+* This form never solves for variables inside `Expr` (no algebraic rearrangement).
+* Division `/` is truncating integer division toward zero.
+* Division by zero and integer overflow are runtime errors (see §13.5).
+
+---
+
+# 8. Optionality (fully specified)
+
+This is the part that fixes the “two rules every time” pain.
+
+## 8.1 Default Datalog semantics: missing tuple means false
+
+For normal relations (`.decl`, derived relations):
+
+* If `p(D, X)` has no matching tuple, the goal fails and the rule body fails.
+* This is correct for edges/events.
+
+## 8.2 Optional attributes: use `.func` returning `option<T>`
+
+For properties that are often missing (docs, parent, display label, trait parent), RAQL requires they be modeled as `.func` returning option:
+
+```prolog
+.func def_doc_summary(D: Def, Doc: option<string>) extern.
+.mode def_doc_summary(+Def, -option<string>).
+```
+
+Now the join never “drops” `D`. You get `Doc = none`.
+
+## 8.3 Pattern matching on option values
+
+You can filter on presence without extra helper predicates:
+
+```prolog
+def_doc_summary(D, some(Doc)), contains(Doc, "unsafe").
+def_doc_summary(D, none).
+```
+
+## 8.4 Coalesce helper (built-in)
+
+Built-in functional predicate (parametric in `T`, see §3.5):
+
+```prolog
+.func coalesce(Opt: option<T>, Default: T, Out: T) extern.
+.mode coalesce(+option<T>, +T, -T).
+.mode coalesce(+option<T>, +T, +T).  % validate
+```
+
+Semantics:
+
+* if `Opt = some(V)`, then `Out = V`
+* if `Opt = none`, then `Out = Default`
+
+This makes view writing compact:
+
+```prolog
+def_doc_summary(D, OptDoc),
+coalesce(OptDoc, "", DocLine).
+```
+
+---
+
+# 9. Negation
+
+RAQL supports `not` with **stratified negation**.
+
+## 9.1 Stratification rule
+
+Let predicate dependency edges be:
+
+* positive dependency: `p -> q` if `p` uses `q(...)`
+* negative dependency: `p -/-> q` if `p` uses `not q(...)`
+
+A program is valid iff there exists an assignment of strata integers to predicates such that:
+
+* positive edges do not decrease stratum
+* negative edges strictly increase stratum
+
+If impossible, program is rejected.
+
+## 9.2 Range restriction (safety)
+
+RAQL enforces Datalog safety (range restriction).
+
+A rule is **safe** iff every variable that appears in the rule head, in any negated goal,
+or in any non-binding constraint is **range-restricted** by positive evidence in the body.
+
+### 9.2.1 What counts as range-restricting evidence (required)
+
+The following are range-restricting:
+
+1) **Positive predicate goals** (non-negated atoms):
+   * variables appearing in a positive predicate goal are range-restricted (they range over that relation's set of ground facts).
+
+2) **Binding constraints**:
+   * Unification `T1 = T2` range-restricts any variable that becomes bound by unifying with a ground term,
+     or by unifying with another range-restricted variable/term.
+     Example: `EdgeKind = "direct"` range-restricts `EdgeKind`.
+   * Arithmetic binding `X := Expr` range-restricts `X` if every variable used in `Expr` is already range-restricted.
+
+3) **Binder outputs**:
+   * Aggregate binders range-restrict their binder variable (e.g., `N = count(...)` range-restricts `N`).
+   * `choose_topk` range-restricts `Score` and `Item`.
+   * `witness_path` range-restricts `P`.
+   * `path_hop` range-restricts its output variables (`Seq`, `From`, `To`, `EdgeKind`, `Evidence`).
+
+4) **Disjunction groups**:
+   After desugaring (§7.3), any variable referenced outside the disjunction must be range-restricted in every branch
+   (including via binding constraints like `X = "..."`).
+
+### 9.2.2 Non-binding constraints (required)
+
+For `!=`, `<`, `<=`, `>`, `>=`:
+* every variable appearing in the constraint must be range-restricted
+* and the operands must be ground at evaluation time (§7.4)
+
+Classic illegal example (rejected because `X` is not range-restricted by any positive goal):
+
+```prolog
+p(X) :- not q(X).
+```
+
+Another illegal example (rejected because `Y` is not range-restricted by any positive goal):
+
+```prolog
+p(X) :- q(X), not r(Y).
+```
+
+---
+
+# 10. Aggregates
+
+RAQL supports aggregates as **binders** in rule bodies.
+
+## 10.1 Syntax
+
+General form:
+
+```prolog
+N = count(V : Goals).
+N = count(Goals).                 % count rows
+N = count_distinct(V : Goals).
+S = sum(V : Goals).
+M = min(V : Goals).
+M = max(V : Goals).
+```
+
+* `Goals` is a comma-separated list of goals, with its own local variables.
+* Variables mentioned only inside `Goals` are scoped to the aggregate.
+* Variables from the outer rule may be referenced inside `Goals` (capture).
+
+## 10.2 Semantics
+
+The aggregate is evaluated for each binding of the outer variables (implicit grouping by outer variables), producing a single value.
+
+**Aggregate evaluation model (precise):**
+
+Given an aggregate binder with inner `Goals`:
+
+* Evaluate the inner `Goals` under the current binding of outer variables.
+* This yields a set of satisfying bindings for the inner `Goals`' variables (set semantics).
+
+**Projection rule (required, no ambiguity):**
+
+For any aggregate written as `agg(V : Goals)`:
+* Let `Rows` be the set of satisfying bindings of all variables that appear in `Goals`
+  (with outer variables treated as fixed parameters).
+* Let `Vals` be the **set** `{ V | row ∈ Rows }` (projection to `V`, then dedup).
+* The aggregate is computed over `Vals`.
+
+Therefore:
+* `count(V : Goals)` = `|Vals|`
+* `sum(V : Goals)` = sum over elements of `Vals`
+* `min(V : Goals)` / `max(V : Goals)` are taken over `Vals`
+
+For the row-form `count(Goals)`:
+* Let `Rows` be as defined above.
+* `count(Goals)` = `|Rows|` (distinct satisfying bindings, i.e. distinct rows)
+
+**The optional `V : Goals` form:**
+
+* When an aggregate is written as `agg(V : Goals)`, `V` must be a variable that appears in `Goals`.
+* The aggregate is computed over the set of values that `V` takes across all satisfying bindings of `Goals`.
+
+**Row-form:**
+
+* `count(Goals)` counts the number of satisfying bindings ("rows") of `Goals`.
+
+## 10.3 Restrictions
+
+Aggregates are **non-monotonic** and must be **stratified**.
+
+For stratification purposes, an aggregate introduces an *aggregate dependency*:
+
+* If predicate `p` contains an aggregate binder whose inner `Goals` reference predicate `q`,
+  then `p` has an aggregate dependency on `q`.
+
+Rules (required):
+
+* Aggregate dependencies must go to a strictly lower stratum (same rule as negation and `choose_topk`/`witness_path`).
+* Aggregates are forbidden inside any recursive SCC (directly or indirectly).
+
+Rationale: aggregates must observe a complete input set. Requiring lower-stratum inputs eliminates ambiguity and
+ensures deterministic, set-based semantics.
+
+## 10.4 Empty input semantics (required)
+
+Let the inner `Goals` produce an empty set of satisfying bindings.
+Then:
+
+* `count(Goals)` = 0
+* `count(V : Goals)` = 0
+* `count_distinct(V : Goals)` = 0
+* `sum(V : Goals)` = 0
+* `min(V : Goals)` **fails the goal** (produces no binding)
+* `max(V : Goals)` **fails the goal** (produces no binding)
+
+## 10.5 Type restrictions (required)
+
+* `sum(V : Goals)` requires `V:int`.
+* `min(V : Goals)` and `max(V : Goals)` require `V` to be orderable (§3.4, §12.2).
+* `count_distinct` is a synonym for `count` in v0.1:
+  * `count_distinct(V : Goals)` == `count(V : Goals)` (both count `|Vals|` as defined in §10.2)
+  * both are retained for readability and future evolution
+
+---
+
+# 11. Non-monotonic selection built-ins (v0.1)
+
+Two built-ins are deliberately non-monotonic but are essential for RAQL as an assembly language:
+
+* `choose_topk` (top-K selection)
+* `witness_path` (path witness selection)
+
+They are treated like negation for stratification purposes.
+
+## 11.1 `choose_topk` (single built-in binder)
+
+### Purpose
+
+Select top-K items per group by integer score, deterministically, without awkward self-joins.
+
+### Syntax
+
+`choose_topk` is a **binder goal**:
+
+```prolog
+choose_topk(Tag, K, Group, Score, Item : Goals).
+```
+
+* `Tag: string` — must be a string literal constant used to namespace the selection site.
+  * Tag is not required to be globally unique.
+  * Each syntactic occurrence of `choose_topk(...)` is semantically independent.
+  * Engines should key any internal caches by `(Tag, occurrence-id)` (not Tag alone) to prevent collisions.
+* `K: int` — must be bound at call time (literal, input fact, or previously bound variable).
+* `Group` — grouping key (any orderable term).
+* `Score: int` — score variable bound inside `Goals`.
+* `Item` — item variable bound inside `Goals`.
+* `Goals` — goals that generate candidates `(Score, Item)`.
+
+### Semantics (precise)
+
+For each binding of the outer variables (including `Group`), define the candidate multiset:
+
+`C = { (Score, Item) | Goals succeeds }`
+
+Convert to set by removing duplicate `(Score, Item)` pairs.
+
+Then keep at most `K` pairs with largest `Score`:
+
+* Sort candidates by:
+
+  1. Score descending
+  2. `stable_order(Item)` ascending
+  3. if still tied, `stable_order(Score)` (int order)
+
+Return a solution per selected `(Score, Item)`, binding `Score` and `Item` in the outer rule.
+
+### Stability (required)
+
+`stable_order(Term)` is defined in §12.2 and must be total.
+
+### Stratification rule for choose_topk
+
+`choose_topk` introduces a **selection dependency**:
+
+* any predicate that uses `choose_topk` must be in a strictly higher stratum than predicates used in `Goals`.
+
+Additionally:
+
+* `choose_topk` is forbidden inside any recursive SCC (direct or indirect recursion). If detected, reject program.
+
+This makes evaluation unambiguous.
+
+### Modes
+
+Because it's a binder, mode is structural:
+
+* `Tag` must be a string literal constant.
+* `K` must be bound at call time.
+* `Group` must be **ground** at binder evaluation time (bound by outer goals or a constant term).
+* `Score` and `Item` are outputs of the binder (bound by `Goals` + selection).
+
+**Clarification (required):**
+
+`choose_topk` is defined "per `Group`." If `Group` is not ground at binder evaluation time, the semantics are undefined,
+so such programs are rejected by mode checking.
+
+---
+
+## 11.2 `witness_path` and `path_hop`
+
+### Purpose
+
+Produce actionable traces: a connected, ordered witness path, not a bag of reachable nodes.
+
+### Standard graph relation
+
+Paths are computed over a standard relation defined by the program:
+
+```prolog
+.decl graph_edge(Graph: string, From: Def, To: Def,
+                 EdgeKind: string, Evidence: Span).
+```
+
+**Required well-formedness rule:**
+
+* `graph_edge/5` is a reserved predicate name and arity for v0.1.
+* Programs may declare `graph_edge` only with exactly this schema; otherwise compilation fails.
+
+* `Graph` is a string namespace (e.g. `"call"`, `"error"`, `"convert"`).
+* `EdgeKind` is a free-form label (e.g. `"direct"`, `"trait"`, `"qmark"`).
+* `Evidence` is a span grounding the edge.
+
+### witness_path declaration
+
+```prolog
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
+```
+
+### path_hop declaration
+
+```prolog
+.decl path_hop(P: Path, Seq: int,
+               From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.
+.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
+```
+
+### Inputs controlling path selection
+
+These are scalar inputs (injected by runtime); defaults are specified:
+
+```prolog
+% These are scalar inputs and must be single-valued.
+.func path_limit(N: int) input.         % default 1 (runtime inject)
+.mode path_limit(-int).
+
+.func path_max_depth(N: int) input.     % default 8 (runtime inject)
+.mode path_max_depth(-int).
+```
+
+If not provided, the runtime must inject the default fact.
+
+### Semantics (precise)
+
+Given `Graph`, `From`, `To`, define the directed multigraph `G` from all tuples in `graph_edge(Graph, A, B, Kind, S)`.
+
+`witness_path(Graph, From, To, P)` returns up to `path_limit(N)` distinct paths subject to `path_max_depth`.
+
+Paths are ranked deterministically by:
+
+1. hop count ascending (shorter paths first)
+2. lexicographic order over the hop sequence’s **edge stable keys** where each hop key is:
+   `(stable_order(From), stable_order(To), EdgeKind, stable_order(Evidence))`
+
+A returned `Path` is opaque but stable for the lifetime of the evaluation.
+
+`path_hop(P, Seq, A, B, Kind, Evidence)` enumerates the hops:
+
+* `Seq` is 0-based and strictly increasing with no gaps for a given `P`.
+* The hops must correspond to edges from `graph_edge` for the same `Graph` used in `witness_path`.
+
+### Stratification rule for witness_path
+
+Like choose_topk:
+
+* `witness_path` and `path_hop` may not appear in recursive SCCs.
+* They must be in a stratum strictly above `graph_edge/5` (and anything `graph_edge` depends on).
+
+---
+
+# 12. Determinism and ordering
+
+Datalog is unordered; RAQL artifacts require stable ordering. RAQL enforces determinism via explicit keys and stable orders.
+
+## 12.1 Output ordering is not “query order”
+
+There is no procedural evaluation order. If you need ordering, you encode it in fields (Rank/Seq) or you use `choose_topk`.
+
+## 12.2 `stable_order(Term)` (required total order)
+
+RAQL defines a total order for tie-breaking in choose_topk and witness_path.
+
+**Definition (no ambiguity)**
+
+`stable_order` is defined by comparing the tuple:
+    `(TypeTag, ValueKey...)`
+where:
+
+* `TypeTag` is the fully elaborated static type name of the term (e.g. `"int"`, `"Def"`, `"option<string>"`, `"RenderMode"`).
+* `ValueKey` is defined below per type.
+
+Cross-type ordering is by `TypeTag` first, then `ValueKey`.
+
+**Clarification (required):**
+
+* `TypeTag` comparison uses lexicographic UTF-8 byte order over the canonical textual `TypeTag` string.
+
+**ValueKey per type/form:**
+
+* `int`: numeric order
+* `string`: lexicographic UTF-8 byte order
+* `bool`: `false < true`
+* enum `E`: by variant ordinal in its `.type` declaration (0-based), i.e. declaration order is the stable order
+* `option<T>`:
+  * `none < some(_)`
+  * `some(A) < some(B)` iff `stable_order(A) < stable_order(B)`
+* `list<T>`: lexicographic by element `stable_order`; shorter list first when one list is a prefix of the other
+* `Def`: order by `handle(D, HandleStr)` (host-provided)
+* `Span`: order by `(RelPath, L0, C0, L1, C1)` using `span_key/6` (host-provided)
+* `TypeRef`: order by `typeref_id(TR, IdStr)` (host-provided)
+* `Node`: order by `node_id(N, IdStr)` (host-provided)
+* `Call`: order by `call_id(C, IdStr)` (host-provided)
+* `Ref`: order by `ref_id(R, IdStr)` (host-provided)
+* `Impl`: order by `impl_id(I, IdStr)` (host-provided)
+* `Path`: order by internal deterministic ID (opaque but total)
+
+**Host requirements for stable_order**
+
+The host must provide the following stable key functions. Their exact formats are not specified, but they must be stable within a repo snapshot.
+
+```prolog
+.func handle(D: Def, H: string) extern.
+.mode handle(+Def, -string).
+
+.func span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
+.mode span_key(+Span, -string, -int, -int, -int, -int).
+
+.func typeref_id(TR: TypeRef, H: string) extern.
+.mode typeref_id(+TypeRef, -string).
+
+.func node_id(N: Node, H: string) extern.
+.mode node_id(+Node, -string).
+
+.func call_id(C: Call, H: string) extern.
+.mode call_id(+Call, -string).
+
+.func ref_id(R: Ref, H: string) extern.
+.mode ref_id(+Ref, -string).
+
+.func impl_id(I: Impl, H: string) extern.
+.mode impl_id(+Impl, -string).
+```
+
+---
+
+# 13. Recursion and the recursion guard (enforced)
+
+## 13.1 Fixpoint evaluation
+
+For each stratum, RAQL evaluates derived predicates to least fixpoint using semi-naive or equivalent.
+
+## 13.2 Global iteration limit (required)
+
+To prevent runaway in malformed views, RAQL includes an enforced fixpoint iteration bound.
+
+### Directive form
+
+```prolog
+.pragma max_iters = 128.
+```
+
+### Runtime override
+
+```prolog
+% Scalar override modeled as option for uniqueness and simplicity.
+.func opt_max_iters(N: option<int>) input.
+.mode opt_max_iters(-option<int>).
+```
+
+**Default injection:**
+
+* If not provided by the runtime, the runtime must inject `opt_max_iters(none)`.
+
+**Effective max_iters (required, no ambiguity):**
+
+* If `opt_max_iters(some(N))` then `max_iters = N`.
+* Else if a `.pragma max_iters = P` is present then `max_iters = P`.
+* Else `max_iters = 128`.
+
+## 13.3 Behavior when exceeded (no ambiguity)
+
+If any recursive SCC exceeds `max_iters` iterations:
+
+* evaluation **halts**
+* the run is marked **partial**
+* the engine must emit:
+
+```prolog
+out_status("partial").
+out_note("Notes", "fixpoint iteration limit exceeded in SCC: <name>").
+```
+
+…and still returns all facts derived up to the stopping point.
+This is intentionally "fail-soft but honest," which is better for an agent tool than silent truncation or hanging.
+
+`out_status/1` and `out_note/2` are built-in output predicates (declared in §14.4).
+The engine must emit `out_status("ok")` if evaluation completes without hitting limits.
+
+**Clarification (required):**
+
+* When evaluation halts due to the iteration limit, no higher strata are evaluated.
+* The engine still returns all facts derived in completed strata, plus the partial facts derived in the stratum where the limit was exceeded.
+
+## 13.4 Analysis world stamp (required)
+
+The runtime must expose a stable stamp identifying the analysis world used to produce the snapshot (e.g. target triple, enabled features, relevant cfg).
+
+This is exposed via a required extern functional predicate:
+
+```prolog
+.func world_stamp(Stamp: string) extern.
+.mode world_stamp(-string).
+```
+
+**Semantics:**
+
+* `world_stamp/1` must produce exactly one tuple per run.
+* The stamp format is not specified, but it must be stable within a repo snapshot.
+
+## 13.5 Runtime errors (required)
+
+Some operations may encounter runtime errors, including:
+
+* division by zero in arithmetic binding (§7.4, `:=`)
+* int overflow in arithmetic or sum (§3.1, §10.4)
+* extern `.func` cardinality violations (0 or >1 results for bound input) (§5.2)
+* implementation-defined failures in extern predicates (e.g. adapter I/O failure)
+
+**On any runtime error:**
+
+* evaluation halts immediately
+* the run is marked partial
+* the engine must emit:
+
+```prolog
+out_status("partial").
+out_note("Errors", "runtime error: <description>").
+```
+
+* the engine returns all facts derived up to the stopping point
+
+If the run is already partial, additional errors may emit additional `out_note/2` facts, but the status remains `"partial"`.
+
+---
+
+# 14. Standard output relations (v0.1, with Seq)
+
+These relations define the artifact contract. Views populate them; renderer consumes them.
+
+## 14.1 Fragments
+
+### Def fragments
+
+```prolog
+.decl out_def_frag(
+  Section: string,
+  Group: string,
+  Rank: int,
+  Seq: int,
+  Kind: string,
+  Render: RenderMode,
+  D: Def,
+  Anchor: option<Span>,
+  Title: option<string>
+) output.
+```
+
+### Span fragments
+
+```prolog
+.decl out_span_frag(
+  Section: string,
+  Group: string,
+  Rank: int,
+  Seq: int,
+  Kind: string,
+  Render: RenderMode,
+  S: Span,
+  Anchor: option<Span>,
+  Title: option<string>
+) output.
+```
+
+Notes:
+
+* `Rank` sorts higher first.
+* `Seq` orders within `(Section, Group, Rank)` ascending.
+* `Group` may be `""` for "no grouping."
+* `Anchor` is optional (`none` means no highlight).
+* `Title` optional: renderer derives a default if `none`.
+
+**Deterministic rendering (required):**
+
+When presenting fragments, renderers MUST sort deterministically.
+At minimum, renderers MUST sort:
+* `(Section asc, Group asc, Rank desc, Seq asc, Kind asc)`
+
+If two fragments still tie on these fields, renderers MUST break ties by:
+* `stable_order(D)` for `out_def_frag` ties, or
+* `stable_order(S)` for `out_span_frag` ties.
+
+This ensures stable output even when authors accidentally reuse `(Rank, Seq, Kind)`.
+
+## 14.2 Fragment key/value metadata (optional but included)
+
+To avoid requiring map types, and to disambiguate between def and span fragments:
+
+```prolog
+.type FragTarget = { DEF, SPAN }.
+
+.decl out_frag_kv(
+  Section: string,
+  Group: string,
+  Rank: int,
+  Seq: int,
+  Kind: string,
+  Target: FragTarget,
+  Key: string,
+  Val: string
+) output.
+```
+
+This attaches metadata to the fragment identified by `(Section,Group,Rank,Seq,Kind,Target)`.
+
+* `Target = FragTarget::DEF` refers to `out_def_frag`
+* `Target = FragTarget::SPAN` refers to `out_span_frag`
+
+This discriminator ensures that metadata can unambiguously target a fragment even if both `out_def_frag` and `out_span_frag` emit the same `(Section,Group,Rank,Seq,Kind)` tuple.
+
+**Recommended runtime warning (v0.1):**
+
+If multiple fragments of the same `Target` share the same `(Section,Group,Rank,Seq,Kind)` key,
+the engine SHOULD emit an `out_note("Notes", "...")` warning that metadata may be ambiguous.
+
+## 14.3 Metrics
+
+```prolog
+.decl out_metric_int(Section: string, Name: string, Value: int) output.
+.decl out_metric_str(Section: string, Name: string, Value: string) output.
+```
+
+## 14.4 Run status and notes
+
+```prolog
+.decl out_status(Status: string) output.  % "ok" | "partial"
+.decl out_note(Section: string, Message: string) output.
+```
+
+**Reservation rule (required):**
+
+`out_status/1` is reserved for the engine. User programs may not emit `out_status/1` facts or rule heads.
+If user code attempts to populate `out_status/1`, compilation fails.
+
+User programs MAY emit `out_note/2` facts/rules (for user-level notes), and the engine may also emit `out_note/2`.
+
+---
+
+# 15. Built-in helpers (required)
+
+## 15.1 String predicates
+
+All are pure and deterministic.
+
+```prolog
+.decl contains(Haystack: string, Needle: string) extern.
+.decl starts_with(S: string, Prefix: string) extern.
+.decl fmt(Format: string, Args: list<string>, Out: string) extern.
+```
+
+Modes:
+
+```prolog
+.mode contains(+string, +string).
+.mode starts_with(+string, +string).
+.mode fmt(+string, +list<string>, -string).
+```
+
+(You can add more later; v0.1 requires at least these.)
+
+## 15.2 Option predicates
+
+These are pure, deterministic helpers. `coalesce/3` is required for v0.1.
+
+```prolog
+.func coalesce(Opt: option<T>, Default: T, Out: T) extern.
+.mode coalesce(+option<T>, +T, -T).
+.mode coalesce(+option<T>, +T, +T).
+```
+
+---
+
+# 16. v0.1 REQUIRED rust-analyzer-backed predicates (the "new" core)
+
+This section is the “load-bearing” set you prioritized. These are not “nice-to-haves”; they are required for v0.1.
+
+## 16.1 Type structure predicates
+
+### `ty_ctor` (optional but recommended; reduces awkwardness)
+
+Functional: always returns the top-level constructor kind.
+
+```prolog
+.type TyCtor = { APP, REF, PTR, TUPLE, SLICE, ARRAY, DYN, IMPL_TRAIT, PROJ, PARAM, PRIM, NEVER, UNIT, UNKNOWN }.
+.func ty_ctor(TR: TypeRef, C: TyCtor) extern.
+.mode ty_ctor(+TypeRef, -TyCtor).
+```
+
+### `ty_app` and `ty_arg` (required)
+
+As-written application head and type args.
+
+```prolog
+.decl ty_app(TR: TypeRef, Head: Def) extern.
+.mode ty_app(+TypeRef, -Def).
+
+.decl ty_arg(TR: TypeRef, Index: int, Arg: TypeRef) extern.
+.mode ty_arg(+TypeRef, -int, -TypeRef).
+.mode ty_arg(+TypeRef, +int, -TypeRef).
+```
+
+**Indexing rule (no ambiguity):** `Index` is **0-based**.
+
+**What counts as an arg:** `ty_arg/3` enumerates **type arguments only**. Lifetimes and const generics are not exposed in v0.1.
+
+### Wrappers (required subset)
+
+```prolog
+.decl ty_ref(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
+.mode ty_ref(+TypeRef, -Mutability, -TypeRef).
+
+.decl ty_ptr(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
+.mode ty_ptr(+TypeRef, -Mutability, -TypeRef).
+
+.decl ty_tuple(TR: TypeRef, Index: int, Elem: TypeRef) extern.
+.mode ty_tuple(+TypeRef, -int, -TypeRef).
+.mode ty_tuple(+TypeRef, +int, -TypeRef).
+
+.decl ty_slice(TR: TypeRef, Elem: TypeRef) extern.
+.mode ty_slice(+TypeRef, -TypeRef).
+```
+
+### Parameters and primitives (required)
+
+```prolog
+.decl ty_param(TR: TypeRef, Param: Def) extern.
+.mode ty_param(+TypeRef, -Def).
+
+.decl ty_prim(TR: TypeRef, Name: string) extern.
+.mode ty_prim(+TypeRef, -string).
+
+.decl ty_unknown(TR: TypeRef) extern.
+.mode ty_unknown(+TypeRef).
+```
+
+### Normalization (optional in v0.1 but strongly recommended)
+
+To avoid painting yourself into “as-written only” corners:
+
+```prolog
+.func ty_normalize(TR: TypeRef, Norm: TypeRef) extern.
+.mode ty_normalize(+TypeRef, -TypeRef).
+```
+
+**Semantics:** returns a normalized type ref (alias-expanded, projection-reduced where RA can), or returns `TR` unchanged if normalization is not available.
+
+---
+
+## 16.2 Node / minimal context predicates (enclosing control)
+
+We want enough to answer: “what control structure is this span in?”
+
+### Mapping from span to node (required, functional + optional)
+
+```prolog
+.func node_at(S: Span, N: option<Node>) extern.
+.mode node_at(+Span, -option<Node]).
+```
+
+**Determinism rule for `node_at` (required):**
+
+Let `Candidates` be the set of nodes `N` such that `node_span(N, NS)` and span `S` is fully contained in `NS`.
+If `Candidates` is empty, return `none`.
+Otherwise return `some(N*)` where `N*` is the node with the smallest `node_span` (most specific).
+
+If multiple candidates have equal `node_span` (implementation-defined), break ties by `stable_order(N)`.
+
+### Node attributes (required, functional)
+
+```prolog
+.func node_kind(N: Node, K: NodeKind) extern.
+.mode node_kind(+Node, -NodeKind).
+
+.func node_span(N: Node, S: Span) extern.
+.mode node_span(+Node, -Span).
+
+.func node_parent(N: Node, P: option<Node>) extern.
+.mode node_parent(+Node, -option<Node]).
+```
+
+**Why node_parent is option:** root nodes exist; this avoids “two rules” when walking parents.
+
+### “Enough for enclosing control structure” (required via std)
+
+The standard library must provide a derived predicate:
+
+```prolog
+% enclosing_control(Span, ControlKind, ControlSpan, Distance)
+.decl enclosing_control(S: Span, K: NodeKind, ControlS: Span, Dist: int).
+```
+
+**Precise semantics:**
+
+* Let `node_at(S, some(N0))`. If `none`, then `enclosing_control` has no tuples.
+* Walk parent chain `N0 -> N1 -> N2 -> ...` until:
+
+  * first node `Ni` with `node_kind(Ni, K)` where `K ∈ { IF, MATCH, WHILE, FOR, LOOP }`.
+
+Bearing in mind §3.3, the control kinds above are the NodeKind enum variants:
+
+  * `K ∈ { NodeKind::IF, NodeKind::MATCH, NodeKind::WHILE, NodeKind::FOR, NodeKind::LOOP }`.
+
+* Then:
+
+  * `ControlS = node_span(Ni)`
+  * `Dist = i` (0 means the anchor node itself is control kind)
+* If no such ancestor exists, no tuples.
+
+**Boundedness requirement (mandatory):**
+The std implementation must respect a bounded climb depth to avoid accidental huge traversals:
+
+```prolog
+% Scalar input and must be single-valued.
+.func control_max_depth(N: int) input.   % default 32 (runtime inject)
+.mode control_max_depth(-int).
+```
+
+If no control node found within depth, return no tuple.
+
+(Implementation can be recursive in Datalog or implemented by host; either is valid as long as the semantics match.)
+
+---
+
+# 17. Putting it together: canonical patterns
+
+## 17.1 Optional doc summary, without defensive rules
+
+```prolog
+emit_def("Search", "", 0, "HIT", D) :-
+  search(Q, D, _Score),
+  def_doc_summary(D, OptDoc),
+  coalesce(OptDoc, "", DocLine),
+  contains(DocLine, "processor").
+```
+
+No second rule required.
+
+## 17.2 Type matching without string hacks
+
+“Return type is Result<_, MyError>”:
+
+```prolog
+returns_myerror(F) :-
+  fn_return_type(F, TR),
+  ty_app(TR, ResultDef),
+  def_path(ResultDef, "std::result::Result"),
+  ty_arg(TR, 1, ETR),
+  ty_app(ETR, MyErrorDef),
+  def_path(MyErrorDef, "crate::error::MyError").
+```
+
+## 17.3 Enclosing control structure
+
+```prolog
+out_span_frag("Findings", "", 0, 0, "CONTROL_CTX", RenderMode::BLOCK, ControlSpan, some(S), none) :-
+  ref_event(_, Def, RefKind::COMPARE, S, _Fn),
+  enclosing_control(S, _K, ControlSpan, _Dist).
+```
+
+## 17.4 Trace with witness path
+
+```prolog
+% define graph edges
+graph_edge("call", Caller, Callee, EdgeKind, S) :-
+  call(Call),
+  call_in_fn(Call, Caller),
+  call_span(Call, S),
+  ( call_target(Call, Callee), EdgeKind = "direct"
+  ; call_trait_target(Call, Callee), EdgeKind = "through_trait"
+  ),
+  span_allowed(S).
+
+% pick a path and emit hops
+out_metric_int("Summary", "paths", N) :-
+  N = count(P : witness_path("call", A, B, P)),
+  target_pair(A, B).
+
+out_span_frag("Trace", "", 100, Seq, "HOP", RenderMode::BLOCK, Evidence, some(Evidence), none) :-
+  target_pair(A, B),
+  witness_path("call", A, B, P),
+  path_hop(P, Seq, _From, _To, _Kind, Evidence).
+```
+
+(Enum render mode is qualified per §3.3.)
+
+---
+
+# 18. Deferred items (explicitly out of scope)
+
+RAQL v0.1 does **not** provide:
+
+* multiple analysis worlds, cfg exploration, feature toggling in-language
+* first-class CFG blocks or general dataflow lattices
+
+However, v0.1 **does** support:
+
+* ref_event kinds including MOVE/WRITE/etc if the host provides them
+* honest status + notes when evaluation is partial (§13.3)
+
+---
+
+# 19. Grammar (EBNF-ish, complete for v0.1)
+
+This is sufficient to implement a parser.
+
+```
+program        := { stmt } ;
+
+stmt           := directive
+               | decl
+               | rule
+               | fact
+               ;
+
+directive      := ".include" string "."
+               | ".type" ident "=" "{" ident { "," ident } "}" "."
+               | ".mode" ident "(" mode_args ")" "."
+               | ".pragma" ident "=" int "."
+               ;
+
+mode_args      := [ mode_arg { "," mode_arg } ] ;
+mode_arg       := ("+"|"-"|"?") type ;
+
+decl           := ".decl" ident "(" args ")" { attr } "."
+               | ".func" ident "(" args ")" { attr } "."
+               ;
+
+attr           := "extern" | "input" | "output" ;
+
+args           := [ arg { "," arg } ] ;
+arg            := ident ":" type ;
+
+type           := ident
+               | "int" | "string" | "bool"
+               | "option" "<" type ">"
+               | "list" "<" type ">"
+               ;
+
+fact           := atom "." ;
+
+rule           := atom ":-" goals "." ;
+
+goals          := goal { "," goal } ;
+
+goal           := atom
+               | "not" atom
+               | constraint
+               | aggregate
+               | choose_topk
+               | "(" goals ";" goals { ";" goals } ")"
+               ;
+
+atom           := ident "(" [ terms ] ")" ;
+terms          := term { "," term } ;
+
+term           := var
+               | "_"
+               | int
+               | string
+               | "true" | "false"
+               | enum_atom
+               | "none" [ "::" "<" type ">" ]
+               | "some" "(" term ")"
+               | list
+               ;
+
+enum_atom      := ident "::" ident ;
+
+list           := "[" [ term { "," term } ] "]" [ "::" "<" type ">" ] ;
+
+constraint     := term relop term
+               | var ":=" expr
+               ;
+
+relop          := "=" | "!=" | "<" | "<=" | ">" | ">=" ;
+
+expr           := expr_add ;
+expr_add       := expr_mul { ("+"|"-") expr_mul } ;
+expr_mul       := expr_unary { ("*"|"/") expr_unary } ;
+expr_unary     := term | "-" expr_unary | "(" expr ")" ;
+
+aggregate      := var "=" agg_name "(" [ var ":" ] goals ")"
+               ;
+
+agg_name       := "count" | "count_distinct" | "sum" | "min" | "max" ;
+
+choose_topk    := "choose_topk" "("
+                   string "," term "," term "," var "," var ":" goals
+                 ")" ;
+
+% Lexical tokens (derived from §1; included here for completeness):
+ident          := /[A-Za-z_][A-Za-z0-9_]*/ ;
+var            := /[A-Z_][A-Za-z0-9_]*/ ;
+int            := /-?[0-9]+/ ;
+string         := a double-quoted string literal with escapes as in §1.5 ;
+```
+
+Notes:
+
+* Aggregate syntax is `N = count(V : goals)` as specified.
+* `choose_topk` syntax is a dedicated binder form, not a normal atom.
+
+---
+
+# 20. Minimal “host contract” summary (what rust-analyzer adapter must provide)
+
+To build a working RAQL v0.1 engine, the host must provide, at minimum:
+
+* Identity and grounding
+
+  * `handle/2` as `.func`
+  * `span_key/6` as `.func` (stable ordering key for spans; see §12.2)
+  * `typeref_id/2`, `node_id/2`, `call_id/2`, `ref_id/2`, `impl_id/2` as `.func` (stable ordering keys for opaque host types; see §12.2)
+  * `world_stamp/1` as `.func` (analysis world stamp; see §13.4)
+* Type structure predicates in §16.1
+* Node predicates in §16.2
+* Text extraction predicates (if you want rendering in-language; renderer can also do it directly)
+
+  * `span_text(+Span, -string)` (guarded)
+  * `def_sig_span/2`, `def_item_span/2`, `def_header_span/2` (guarded/functional)
+  * `expand_span(+Span, +RenderMode, -Span)` (guarded)
+* Enough semantic base relations for your views (calls, refs, type sites, etc.) — not restated here since this is the language spec, not the full RA fact schema.
+
+---
+
+## Why this v0.1 is “actually RAQL”
+
+With these five upgrades, RAQL stops being “a def/span graph query tool” and becomes a language that can express Rust-aware questions:
+
+* structural type queries (no string hacks)
+* contextual queries (“inside match arm / if guard”)
+* true trace narratives (witness path, hop evidence)
+* curated selection (top-K) without schema bloat
+* ordered artifacts (Seq) without relying on accidental ordering
+
+…and it does so while staying **Datalog/Prolog intuitive**.
+
+```
+
+## Language Plan: Milestone 11 Standard Library
+
+Source: `/Users/darin/Projects/raql/docs/initial_plans/language_plan.md:1952-1981`
+
+```text
+---
+
+### Milestone 11: Standard library `std.raql` (v0.1)
+
+**Provide (at minimum)**
+
+* `enclosing_control/4` as derived predicate using:
+
+  * `node_at`, `node_parent`, `node_kind`, `node_span`
+  * bounded by `control_max_depth` default 32 (runtime inject)
+* convenience helpers:
+
+  * `span_allowed` / repo scoping hooks (optional)
+  * `default_title` helpers (optional)
+
+**Implementation choice**
+
+* You can implement `enclosing_control`:
+
+  * in RAQL itself (recursive parent walk with depth counter), or
+  * as a host extern/built-in for speed
+    Either is spec-compliant as long as semantics match.
+
+**Done when**
+
+* Example 17.3 produces correct enclosing control spans.
+
+---
+
+### Milestone 12: rust-analyzer adapter (the "load-bearing externs")
+```
+
+## Language Plan: Canonical std.raql + Golden Views Note
+
+Source: `/Users/darin/Projects/raql/docs/initial_plans/language_plan.md:2312-2320`
+
+```text
+---
+
+If you want, I can also produce (in the same “no interpretation gaps” style as your spec):
+
+* a **module-by-module Rust API sketch** (traits, structs, key methods), and
+* the **canonical `std.raql`** plus **three golden example views** as executable acceptance tests, exactly as you suggested.
+```
+
+## Required Spec Acceptance Matrix
+
+Source: `/Users/darin/Projects/raql/docs/required_spec_acceptance_matrix.md:1-110`
+
+```text
+# RAQL v0.1 Required Spec Acceptance Matrix
+
+This matrix is a 1:1 mapping from each `(required)` section in
+`docs/initial_plans/language_spec.md` to a concrete acceptance test.
+
+Legend:
+- `Covered`: mapped to an executable test.
+- `Uncovered`: no concrete acceptance test currently exists.
+
+| Required spec section | Primary acceptance test | Status |
+| --- | --- | --- |
+| `0.1 Compile-time errors and diagnostics (required)` | `crates/raql-compiler/src/lib.rs::reports_unknown_mode_predicate_with_exact_code` | Covered |
+| `2.3 Groundness (required)` | `crates/raql-compiler/src/lib.rs::rejects_variable_fact` | Covered |
+| `3.5 Type inference model (v0.1, required)` | `crates/raql-compiler/src/lib.rs::catches_ambiguous_none` | Covered |
+| `5.3 Implicit schemas for derived predicates (v0.1 usability, required)` | `crates/raql-compiler/src/lib.rs::catches_ambiguous_empty_list` | Covered |
+| `9.2.1 What counts as range-restricting evidence (required)` | `crates/raql-compiler/src/lib.rs::rejects_unrestricted_negation_variable` | Covered |
+| `9.2.2 Non-binding constraints (required)` | `crates/raql-compiler/src/lib.rs::rejects_unrestricted_non_binding_constraint_variable` | Covered |
+| `10.4 Empty input semantics (required)` | `crates/raql-engine/src/lib.rs::aggregate_empty_input_semantics_match_spec` | Covered |
+| `10.5 Type restrictions (required)` | `crates/raql-compiler/src/lib.rs::{rejects_sum_with_non_int_projection,rejects_min_without_projection_form}` | Covered |
+| `11.1 choose_topk Stability (required)` | `crates/raql-engine/src/lib.rs::choose_topk_is_deterministic_for_score_ties` | Covered |
+| `12.2 stable_order(Term) (required total order)` | `crates/raql-engine/src/lib.rs::{relational_order_for_enums_uses_declaration_order,aggregate_min_max_for_enums_uses_declaration_order,choose_topk_ties_use_enum_declaration_order_for_items,witness_path_hop_order_uses_stable_order}` | Covered |
+| `13.2 Global iteration limit (required)` | `crates/raql-engine/src/lib.rs::reports_iteration_limit_as_partial_with_notes_section` | Covered |
+| `13.4 Analysis world stamp (required)` | `crates/raql-host/src/lib.rs::world_stamp_is_exposed_and_overridable` + `crates/raql-engine/src/lib.rs::world_stamp_is_injected_from_host_runtime` | Covered |
+| `13.5 Runtime errors (required)` | `crates/raql-engine/src/lib.rs::{reports_division_by_zero_as_partial,runtime_error_codes_are_stable}` | Covered |
+| `15. Built-in helpers (required)` | `crates/raql-engine/src/lib.rs::builtin_helpers_execute_without_host_relations` | Covered |
+| `16.1 ty_app and ty_arg (required)` | `crates/raql-host-ra/tests/required_sections_16.rs::ty_app_and_ty_arg_are_zero_based_and_type_only` | Covered |
+| `16.1 Wrappers (required subset)` | `crates/raql-host-ra/tests/required_sections_16.rs::wrappers_are_exposed_with_stable_indexing` | Covered |
+| `16.1 Parameters and primitives (required)` | `crates/raql-host-ra/tests/required_sections_16.rs::parameters_primitives_and_unknown_are_exposed` | Covered |
+| `16.2 Mapping from span to node (required, functional + optional)` | `crates/raql-host-ra/tests/required_sections_16.rs::{node_at_picks_the_most_specific_containing_node,node_at_tie_breaks_with_stable_order_node_id}` | Covered |
+| `16.2 Node attributes (required, functional)` | `crates/raql-host-ra/tests/required_sections_16.rs::node_attributes_are_functional_and_optional_parent_is_supported` | Covered |
+| `16.2 Enough for enclosing control structure (required via std)` | `crates/raql-host-ra/tests/required_sections_16.rs::{enclosing_control_returns_first_control_ancestor_with_distance,enclosing_control_respects_default_and_overridden_max_depth}` | Covered |
+
+Additional required semantics tracked by this patch:
+
+| Required semantic | Primary acceptance test | Status |
+| --- | --- | --- |
+| `14.4 Reservation rule (required): out_status/1 is engine-reserved` | `crates/raql-compiler/src/lib.rs::{rejects_reserved_out_status_output_declaration,rejects_reserved_out_status_fact,rejects_reserved_out_status_rule_head}` | Covered |
+| `2.2 Occurs check (required within unification semantics)` | `crates/raql-compiler/src/lib.rs::occurs_check_rejects_recursive_unification` | Covered |
+| `2.2 Structural unification over option/list terms in atoms` | `crates/raql-engine/src/lib.rs::atom_matching_binds_nested_some_and_list_variables` | Covered |
+| `7.4 Relational '=' unification binds variables structurally` | `crates/raql-engine/src/lib.rs::equality_constraint_unifies_structural_terms_and_binds_nested_vars` | Covered |
+| `6.2 Mode planner defers '=' until an operand is ground` | `crates/raql-compiler/src/lib.rs::planner_defers_eq_until_one_side_is_ground` | Covered |
+| `10.2 Aggregate projection-and-dedup set semantics` | `crates/raql-engine/src/lib.rs::aggregate_count_uses_set_semantics_for_rows_and_projection` | Covered |
+| `10.3 Aggregates forbidden in recursive SCC` | `crates/raql-compiler/src/lib.rs::{aggregate_recursion_cycle_is_rejected,aggregate_is_forbidden_inside_indirect_recursive_scc}` | Covered |
+| `11.1 choose_topk forbidden inside recursive SCC` | `crates/raql-compiler/src/lib.rs::choose_topk_is_forbidden_inside_indirect_recursive_scc` | Covered |
+| `11.2 witness_path/path_hop forbidden inside recursive SCC` | `crates/raql-compiler/src/lib.rs::witness_path_is_forbidden_inside_recursive_scc` | Covered |
+| `11.2 witness_path/path_hop stratification above graph_edge` | `crates/raql-compiler/src/lib.rs::{witness_path_induces_selection_dependency_on_graph_edge,path_hop_induces_selection_dependency_on_graph_edge}` | Covered |
+| `11.1 choose_topk clarification: Group must be ground` | `crates/raql-compiler/src/lib.rs::choose_topk_requires_ground_group` | Covered |
+| `11.1 choose_topk candidates must bind Score/Item inside Goals` | `crates/raql-compiler/src/lib.rs::choose_topk_score_and_item_must_appear_in_goals` | Covered |
+| `11.2 graph_edge/5 required host schema (Def/Def/Span columns)` | `crates/raql-compiler/src/lib.rs::{rejects_invalid_graph_edge_endpoint_or_evidence_types,accepts_required_graph_edge_schema}` | Covered |
+| `10.2 aggregate projection variable must appear in Goals` | `crates/raql-compiler/src/lib.rs::aggregate_projection_variable_must_appear_in_goals` | Covered |
+| `Planner failure when no runnable goal ordering exists` | `crates/raql-compiler/src/lib.rs::planner_reports_stuck_mode_with_exact_code` | Covered |
+| `Stratification rejects non-monotonic cycles` | `crates/raql-compiler/src/lib.rs::stratification_rejects_negation_cycle_with_exact_code` | Covered |
+| `witness_path/path_hop basic execution` | `crates/raql-engine/src/lib.rs::witness_path_and_path_hop_produce_expected_hops` | Covered |
+| `16.2 enclosing_control default depth input contract (control_max_depth=32)` | `crates/raql-engine/src/lib.rs::injects_default_control_max_depth_input` | Covered |
+| `Parse-level acceptance surface for witness_path/path_hop and Seq output fields` | `crates/raql-syntax/tests/parser_tests.rs::parses_witness_path_path_hop_and_seq_output_surface` | Covered |
+| `16.x Engine executes RA extern predicates against repository snapshot` | `crates/raql-host-ra/tests/extern_runtime_dispatch.rs::{engine_dispatches_required_ra_extern_predicates,engine_executes_enclosing_control_with_default_depth,engine_executes_enclosing_control_with_overridden_depth_limit}` | Covered |
+```
+
+## Syntax Include Loader (Current Behavior)
+
+Source: `/Users/darin/Projects/raql/crates/raql-syntax/src/include_loader.rs:1-220`
+
+```text
+use crate::ast::{AstPhase, Directive, Program, Stmt};
+use crate::diag::{Diagnostic, DiagnosticKind, DiagnosticLabel, ParseResult};
+use crate::parser::parse_source;
+use crate::source::{SourceMap, Spanned, SrcSpan};
+use camino::{Utf8Path, Utf8PathBuf};
+use std::fs;
+
+#[derive(Clone, Debug, Default)]
+pub struct IncludeLoaderOptions {
+    pub include_dirs: Vec<Utf8PathBuf>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IncludeLoader {
+    options: IncludeLoaderOptions,
+}
+
+impl IncludeLoader {
+    #[must_use]
+    pub fn new(include_dirs: Vec<Utf8PathBuf>) -> Self {
+        Self {
+            options: IncludeLoaderOptions { include_dirs },
+        }
+    }
+
+    #[must_use]
+    pub fn with_options(options: IncludeLoaderOptions) -> Self {
+        Self { options }
+    }
+
+    pub fn load_program(&self, entry_path: &Utf8Path) -> ParseResult<Program<AstPhase>> {
+        let mut state = LoaderState::new(self.options.include_dirs.clone());
+        let statements = state.load_file(entry_path.to_path_buf(), Vec::new(), Vec::new());
+
+        if state.diagnostics.is_empty() {
+            Ok(Program::new(state.sources, AstPhase { statements }))
+        } else {
+            Err(state.diagnostics)
+        }
+    }
+}
+
+#[must_use]
+pub fn parse_program_from_file(
+    entry_path: &Utf8Path,
+    include_dirs: &[Utf8PathBuf],
+) -> ParseResult<Program<AstPhase>> {
+    IncludeLoader::new(include_dirs.to_vec()).load_program(entry_path)
+}
+
+struct LoaderState {
+    include_dirs: Vec<Utf8PathBuf>,
+    sources: SourceMap,
+    diagnostics: Vec<Diagnostic>,
+    visiting: Vec<Utf8PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct IncludeEdge {
+    from_path: Utf8PathBuf,
+    include_text: String,
+    span: SrcSpan,
+}
+
+impl IncludeEdge {
+    fn new(from_path: Utf8PathBuf, include_text: impl Into<String>, span: SrcSpan) -> Self {
+        Self {
+            from_path,
+            include_text: include_text.into(),
+            span,
+        }
+    }
+}
+
+impl LoaderState {
+    fn new(include_dirs: Vec<Utf8PathBuf>) -> Self {
+        Self {
+            include_dirs,
+            sources: SourceMap::new(),
+            diagnostics: Vec::new(),
+            visiting: Vec::new(),
+        }
+    }
+
+    fn load_file(
+        &mut self,
+        requested_path: Utf8PathBuf,
+        include_stack: Vec<Utf8PathBuf>,
+        include_edges: Vec<IncludeEdge>,
+    ) -> Vec<Spanned<Stmt>> {
+        let normalized_path =
+            normalize_existing_path(&requested_path).unwrap_or(requested_path.clone());
+        let mut current_stack = include_stack.clone();
+        current_stack.push(normalized_path.clone());
+
+        if let Some(cycle_index) = self
+            .visiting
+            .iter()
+            .position(|path| path == &normalized_path)
+        {
+            let mut cycle_paths = self.visiting[cycle_index..].to_vec();
+            cycle_paths.push(normalized_path.clone());
+            let cycle_text = cycle_paths
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            let mut diagnostic = Diagnostic::include_cycle(
+                format!(
+                    "include cycle detected while expanding `.include`: {cycle_text}; remove one `.include` edge or move shared declarations into a third file"
+                ),
+                None,
+            )
+            .with_include_stack(current_stack.clone())
+            .with_note(
+                "includes are expanded depth-first from the current file; this include re-entered a file already on the active stack",
+            );
+            diagnostic = self.annotate_include_legs(diagnostic, &include_edges, "cycle closes at");
+            for path in cycle_paths {
+                diagnostic = diagnostic.with_note(format!("cycle member: {path}"));
+            }
+            self.diagnostics.push(diagnostic);
+            return Vec::new();
+        }
+
+        let text = match fs::read_to_string(normalized_path.as_std_path()) {
+            Ok(text) => text,
+            Err(err) => {
+                let diagnostic = self.annotate_include_legs(
+                    Diagnostic::io(format!("failed to read `{}`: {err}", normalized_path), None)
+                        .with_include_stack(current_stack),
+                    &include_edges,
+                    "failed while following",
+                );
+                self.diagnostics.push(diagnostic);
+                return Vec::new();
+            }
+        };
+
+        self.visiting.push(normalized_path.clone());
+
+        let file_id = self.sources.add_file(
+            normalized_path.clone(),
+            text.clone(),
+            current_stack.clone().into_boxed_slice(),
+        );
+        let (phase, parse_diagnostics) = parse_source(file_id, &text, &current_stack);
+        let parse_diagnostics = parse_diagnostics
+            .into_iter()
+            .map(|diag| self.annotate_parse_include_context(diag, &include_edges))
+            .collect::<Vec<_>>();
+        self.diagnostics.extend(parse_diagnostics);
+
+        let mut statements = Vec::new();
+        for stmt in phase.statements {
+            let include_spec = match &stmt.value {
+                Stmt::Directive(Directive::Include(include_directive)) => Some((
+                    include_directive.path.value.clone(),
+                    include_directive.path.span,
+                )),
+                _ => None,
+            };
+
+            statements.push(stmt);
+
+            let Some((include_text, include_span)) = include_spec else {
+                continue;
+            };
+
+            let (resolved, attempted) =
+                self.resolve_include_path(&normalized_path, include_text.as_str());
+            let mut child_stack = include_stack.clone();
+            child_stack.push(normalized_path.clone());
+            let include_edge =
+                IncludeEdge::new(normalized_path.clone(), include_text.as_str(), include_span);
+
+            let Some(resolved_path) = resolved else {
+                let mut edge_chain = include_edges.clone();
+                edge_chain.push(include_edge.clone());
+
+                let mut diagnostic = Diagnostic::missing_include(
+                    format!(
+                        "unable to resolve include `{include_text}`; searched include locations in order and found no readable file"
+                    ),
+                    None,
+                )
+                .with_include_stack(child_stack)
+                .with_note(
+                    "search order: absolute paths are checked as written; relative paths are checked in the including file directory, then each configured include directory",
+                )
+                .with_note(
+                    "corrective action: fix the include path, place the file in one of the searched directories, or add an include directory to IncludeLoader options",
+                );
+                diagnostic =
+                    self.annotate_include_legs(diagnostic, &edge_chain, "missing target at");
+
+                for candidate in attempted {
+                    diagnostic = diagnostic.with_note(format!("tried candidate `{candidate}`"));
+                }
+                self.diagnostics.push(diagnostic);
+                continue;
+            };
+
+            let mut child_edges = include_edges.clone();
+            child_edges.push(include_edge);
+
+            let mut nested = self.load_file(resolved_path, child_stack, child_edges);
+            statements.append(&mut nested);
+        }
+
+        self.visiting.pop();
+        statements
+    }
+
+    fn resolve_include_path(
+        &self,
+        current_file: &Utf8Path,
+        include_text: &str,
+    ) -> (Option<Utf8PathBuf>, Vec<Utf8PathBuf>) {
+        let include_path = Utf8Path::new(include_text);
+```
+
+## Compiler Pipeline Entrypoints + Directive Handling + out_status Reservation
+
+Source: `/Users/darin/Projects/raql/crates/raql-compiler/src/lib.rs:690-875`
+
+```text
+pub fn resolve(program: Program<AstPhase>) -> Result<ResolvedProgram, DiagBundle> {
+    let (sources, phase) = program.into_parts();
+    let mut diagnostics = Vec::new();
+    let mut predicates = BTreeMap::<String, PredicateDecl>::new();
+    let mut enums = BTreeMap::<String, EnumDecl>::new();
+    let mut modes = BTreeMap::<String, Vec<ModeSig>>::new();
+    let mut mode_spans = BTreeMap::<String, Vec<SrcSpan>>::new();
+    let mut pragmas = BTreeMap::<String, i64>::new();
+    let mut facts = Vec::new();
+    let mut rules = Vec::new();
+
+    for stmt in &phase.statements {
+        match &stmt.value {
+            Stmt::Directive(dir) => match dir {
+                Directive::Include(_) => {}
+                Directive::Type(td) => {
+                    let name = td.name.value.to_string();
+                    let mut variants = Vec::new();
+                    let mut seen = BTreeSet::new();
+                    for v in &td.variants {
+                        let variant = v.value.to_string();
+                        if seen.insert(variant.clone()) {
+                            variants.push(variant);
+                        }
+                    }
+                    if enums
+                        .insert(
+                            name.clone(),
+                            EnumDecl {
+                                variants,
+                                span: stmt.span,
+                            },
+                        )
+                        .is_some()
+                    {
+                        diagnostics.push(CompilerDiagnostic::error(
+                            "RAQL0102",
+                            format!("duplicate enum `{name}`"),
+                            Some(td.name.span),
+                        ));
+                    }
+                }
+                Directive::Mode(md) => {
+                    let name = md.predicate.value.to_string();
+                    let mut expanded = vec![Vec::<(ModeDir, CompilerType)>::new()];
+                    for arg in &md.args {
+                        let arg_ty = parse_type_ast(
+                            &arg.value.ty.value,
+                            Some(arg.value.ty.span),
+                            &mut diagnostics,
+                        );
+                        let dirs = match arg.value.direction.value {
+                            ModeDirection::In => vec![ModeDir::In],
+                            ModeDirection::Out => vec![ModeDir::Out],
+                            ModeDirection::Any => vec![ModeDir::In, ModeDir::Out],
+                        };
+                        let mut next = Vec::new();
+                        for base in &expanded {
+                            for d in &dirs {
+                                let mut row = base.clone();
+                                row.push((*d, arg_ty.clone()));
+                                next.push(row);
+                            }
+                        }
+                        expanded = next;
+                    }
+                    let entry = modes.entry(name).or_default();
+                    let span_entry = mode_spans
+                        .entry(md.predicate.value.to_string())
+                        .or_default();
+                    for args in expanded {
+                        entry.push(ModeSig { args });
+                        span_entry.push(md.predicate.span);
+                    }
+                }
+                Directive::Pragma(p) => {
+                    pragmas.insert(p.name.value.to_string(), p.value.value);
+                }
+            },
+            Stmt::Declaration(d) => {
+                let name = d.name.value.to_string();
+                let mut args = Vec::new();
+                for arg in &d.args {
+                    args.push(parse_type_ast(
+                        &arg.value.ty.value,
+                        Some(arg.value.ty.span),
+                        &mut diagnostics,
+                    ));
+                }
+                let attrs = d.attrs.iter().map(|a| a.value).collect::<Vec<_>>();
+                if predicates
+                    .insert(
+                        name.clone(),
+                        PredicateDecl {
+                            kind: d.kind,
+                            args,
+                            attrs,
+                            span: d.name.span,
+                            inferred: false,
+                            inferred_from: None,
+                        },
+                    )
+                    .is_some()
+                {
+                    diagnostics.push(CompilerDiagnostic::error(
+                        "RAQL0101",
+                        format!("duplicate predicate declaration `{name}`"),
+                        Some(d.name.span),
+                    ));
+                }
+            }
+            Stmt::Fact(f) => facts.push(Spanned::new(stmt.span, f.clone())),
+            Stmt::Rule(r) => rules.push(Spanned::new(stmt.span, r.clone())),
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        enrich_include_stack_context(&mut diagnostics, &sources);
+        return Err(diagnostics);
+    }
+
+    Ok(ResolvedProgram {
+        sources,
+        predicates,
+        enums,
+        modes,
+        mode_spans,
+        pragmas,
+        facts,
+        rules,
+    })
+}
+
+pub fn typecheck(mut resolved: ResolvedProgram) -> Result<TypedProgram, DiagBundle> {
+    let mut diagnostics = Vec::new();
+    let mut infer = InferCtx::default();
+
+    collect_missing_predicates(
+        &mut resolved.predicates,
+        &resolved.facts,
+        &resolved.rules,
+        &resolved.sources,
+        &mut infer,
+        &mut diagnostics,
+    );
+    if !diagnostics.is_empty() {
+        enrich_include_stack_context(&mut diagnostics, &resolved.sources);
+        return Err(diagnostics);
+    }
+
+    for (name, predicate) in &resolved.predicates {
+        if predicate.is_output() && name == "out_status" && predicate.args.len() == 1 {
+            diagnostics.push(CompilerDiagnostic::error(
+                "RAQL0404",
+                "`out_status/1` is reserved for engine output only",
+                Some(predicate.span),
+            ));
+        }
+    }
+
+    for fact in &resolved.facts {
+        if fact.value.atom.value.name.value == "out_status" {
+            diagnostics.push(CompilerDiagnostic::error(
+                "RAQL0404",
+                "`out_status/1` is reserved for engine output only",
+                Some(fact.value.atom.span),
+            ));
+        }
+        type_atom(
+            &fact.value.atom.value,
+            Some(fact.value.atom.span),
+            &resolved.enums,
+            &resolved.sources,
+            &mut resolved.predicates,
+            &mut infer,
+            &mut BTreeMap::new(),
+            &mut diagnostics,
+        );
+        if fact_contains_var(&fact.value.atom.value) {
+            diagnostics.push(CompilerDiagnostic::error(
+                "RAQL0402",
+                "facts must be ground and cannot contain variables or wildcard",
+                Some(fact.span),
+            ));
+        }
+    }
+```
+
+## Compiler Planning Entrypoint
+
+Source: `/Users/darin/Projects/raql/crates/raql-compiler/src/lib.rs:1052-1128`
+
+```text
+pub fn plan(typed: TypedProgram) -> Result<PlannedProgram, DiagBundle> {
+    let mut diagnostics = Vec::new();
+    let expanded_rules = expand_rules(&typed.rules);
+
+    for typed_rule in &expanded_rules {
+        check_range_restriction(typed_rule, &mut diagnostics);
+    }
+    if !diagnostics.is_empty() {
+        enrich_include_stack_context(&mut diagnostics, &typed.sources);
+        return Err(diagnostics);
+    }
+
+    let mut planned_rules = Vec::new();
+    for typed_rule in expanded_rules {
+        let head_pred = typed_rule.rule.value.head.value.name.value.to_string();
+        if head_pred == "out_status" {
+            diagnostics.push(CompilerDiagnostic::error(
+                "RAQL0404",
+                "`out_status/1` is reserved for engine output only",
+                Some(typed_rule.rule.value.head.span),
+            ));
+        }
+        let mut remaining: BTreeSet<usize> = (0..typed_rule.goals().len()).collect();
+        let mut bound = BTreeSet::<String>::new();
+        let mut ground = BTreeSet::<String>::new();
+        let mut ordered = Vec::new();
+
+        while !remaining.is_empty() {
+            let mut progress = false;
+            for idx in remaining.clone() {
+                let goal = typed_rule
+                    .goal(idx)
+                    .expect("planner invariant: goal index must exist");
+                if let Some(chosen_mode) =
+                    goal_runnable(goal, &typed, &bound, &ground, &typed_rule.var_types)
+                {
+                    apply_goal_bindings(goal, &mut bound, &mut ground);
+                    ordered.push(GoalPlan {
+                        index: idx,
+                        chosen_mode,
+                    });
+                    remaining.remove(&idx);
+                    progress = true;
+                    break;
+                }
+            }
+            if !progress {
+                let first_blocked_idx = remaining.iter().next().copied().unwrap_or_default();
+                let first_blocked_goal = typed_rule
+                    .goal(first_blocked_idx)
+                    .expect("planner invariant: blocked goal index must exist");
+                let blocked_goal_text =
+                    format_span_excerpt(&typed.sources, first_blocked_goal.span);
+                let blocked_details = blocked_goal_details(
+                    first_blocked_goal,
+                    &typed,
+                    &ground,
+                    &typed_rule.var_types,
+                );
+                let missing_inputs = format_missing_inputs_summary(&blocked_details.missing_inputs);
+                let selected_mode = blocked_details
+                    .selected_mode_signature
+                    .as_ref()
+                    .map(|sig| format!("; selected mode: {sig}"))
+                    .unwrap_or_default();
+                let context = format!(
+                    "{}; current variable context: {}",
+                    blocked_details.reason,
+                    format_var_context(&bound, &ground)
+                );
+                let missing_input_help = if blocked_details.missing_inputs.is_empty() {
+                    "no specific ungrounded inputs were identified".to_string()
+                } else {
+                    format!("ground these first: {missing_inputs}")
+                };
+                let selected_mode_help = blocked_details
+                    .selected_mode_signature
+```
+
+## Engine: Default Inputs, out_status/out_note, max_iters
+
+Source: `/Users/darin/Projects/raql/crates/raql-engine/src/lib.rs:836-940`
+
+```text
+fn inject_default_scalar_inputs(relations: &mut BTreeMap<String, IndexSet<Vec<RuntimeValue>>>) {
+    ensure_default_input(relations, "path_limit", vec![RuntimeValue::Int(1)]);
+    ensure_default_input(relations, "path_max_depth", vec![RuntimeValue::Int(8)]);
+    ensure_default_input(relations, "control_max_depth", vec![RuntimeValue::Int(32)]);
+    ensure_default_input(relations, "opt_max_iters", vec![RuntimeValue::None]);
+}
+
+fn ensure_default_input(
+    relations: &mut BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    name: &str,
+    row: Vec<RuntimeValue>,
+) {
+    let rel = relations.entry(name.to_string()).or_default();
+    if rel.is_empty() {
+        rel.insert(row);
+    }
+}
+
+fn ensure_engine_output_relations(relations: &mut BTreeMap<String, IndexSet<Vec<RuntimeValue>>>) {
+    relations.entry("out_status".to_string()).or_default();
+    relations.entry("out_note".to_string()).or_default();
+}
+
+fn emit_ok_status(relations: &mut BTreeMap<String, IndexSet<Vec<RuntimeValue>>>) {
+    relations
+        .entry("out_status".to_string())
+        .or_default()
+        .insert(vec![RuntimeValue::String("ok".to_string())]);
+}
+
+fn emit_partial_status(
+    relations: &mut BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    notes: &mut Vec<EvalNote>,
+    section: &str,
+    message: String,
+) {
+    relations
+        .entry("out_status".to_string())
+        .or_default()
+        .insert(vec![RuntimeValue::String("partial".to_string())]);
+    relations
+        .entry("out_note".to_string())
+        .or_default()
+        .insert(vec![
+            RuntimeValue::String(section.to_string()),
+            RuntimeValue::String(message.clone()),
+        ]);
+    if !notes
+        .iter()
+        .any(|n| n.section == section && n.message == message)
+    {
+        notes.push(EvalNote {
+            section: section.to_string(),
+            message,
+        });
+    }
+}
+
+fn effective_max_iters(
+    program: &PlannedProgram,
+    relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+) -> Result<usize, RuntimeError> {
+    let pragma_default = program.pragma_i64("max_iters").unwrap_or(128).max(1);
+    match scalar_option_i64_input(relations, "opt_max_iters")? {
+        Some(v) => Ok(v.max(1) as usize),
+        None => Ok(pragma_default as usize),
+    }
+}
+
+fn scalar_option_i64_input(
+    relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    name: &str,
+) -> Result<Option<i64>, RuntimeError> {
+    let Some(values) = relations.get(name) else {
+        return Ok(None);
+    };
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 1 {
+        return Err(RuntimeError::FunctionCardinality {
+            predicate: name.to_string(),
+            got: values.len(),
+            context: format!(
+                "input `{name}` expected exactly one optional scalar row, found {} rows ({})",
+                values.len(),
+                format_indexed_rows(values, 3)
+            ),
+        });
+    }
+    let row = values.first().expect("checked non-empty");
+    if row.len() != 1 {
+        return Err(RuntimeError::TypeMismatchContext {
+            context: format!(
+                "input `{name}` row 1 expected arity 1 with `option<int>`, found arity {} in row 1 = {}",
+                row.len(),
+                format_runtime_row(row)
+            ),
+        });
+    }
+    match &row[0] {
+        RuntimeValue::None => Ok(None),
+        RuntimeValue::Some(inner) => match inner.as_ref() {
+            RuntimeValue::Int(v) => Ok(Some(*v)),
+            _other => Err(RuntimeError::TypeMismatchContext {
+```
+
+## Engine: Goal Evaluation Dispatch (builtins + witness hooks)
+
+Source: `/Users/darin/Projects/raql/crates/raql-engine/src/lib.rs:1224-1325`
+
+```text
+fn eval_goal(
+    program: &PlannedProgram,
+    goal: &Spanned<Goal>,
+    selected_mode: Option<usize>,
+    env: &Env,
+    var_types: &BTreeMap<String, CompilerType>,
+    relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    host: &mut impl EngineHostView,
+) -> Result<Vec<Env>, RuntimeError> {
+    match &goal.value {
+        Goal::Atom(atom) => {
+            if let Some(out) = eval_builtin_atom(atom, env)? {
+                return Ok(out);
+            }
+            let name = atom.name.value.to_string();
+            if name == "witness_path" {
+                return eval_witness_path_atom(program, goal.span, atom, env, relations, host);
+            }
+            if name == "path_hop" {
+                return eval_path_hop_atom(atom, env, relations);
+            }
+            let rel = relations
+                .get(&name)
+                .ok_or_else(|| RuntimeError::MissingRelation {
+                    relation: name.clone(),
+                    context: format!(
+                        "referenced by goal `{}`{}",
+                        format_atom(atom),
+                        goal_anchor_suffix(program, goal.span)
+                    ),
+                })?;
+            if is_function_predicate(program, name.as_str()) {
+                let constraints = function_input_constraints(program, atom, env, selected_mode)?;
+                let cardinality = function_match_count(atom, rel, &constraints);
+                if cardinality != 1 {
+                    return Err(RuntimeError::FunctionCardinality {
+                        predicate: name.clone(),
+                        got: cardinality,
+                        context: format_function_input_context(atom, &constraints),
+                    });
+                }
+            }
+            let mut out = Vec::new();
+            for tuple in rel {
+                if tuple.len() != atom.terms.len() {
+                    continue;
+                }
+                let mut candidate = env.clone();
+                if unify_terms_with_tuple(&atom.terms, tuple, &mut candidate)? {
+                    out.push(candidate);
+                }
+            }
+            Ok(out)
+        }
+        Goal::Not(not) => {
+            let atom = &not.atom.value;
+            let name = atom.name.value.to_string();
+            let rel = relations
+                .get(&name)
+                .ok_or_else(|| RuntimeError::MissingRelation {
+                    relation: name.clone(),
+                    context: format!(
+                        "referenced by negated goal `not {}`{}",
+                        format_atom(atom),
+                        goal_anchor_suffix(program, goal.span)
+                    ),
+                })?;
+            let mut exists = false;
+            for tuple in rel {
+                if tuple.len() != atom.terms.len() {
+                    continue;
+                }
+                let mut candidate = env.clone();
+                if unify_terms_with_tuple(&atom.terms, tuple, &mut candidate)? {
+                    exists = true;
+                    break;
+                }
+            }
+            if exists {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![env.clone()])
+            }
+        }
+        Goal::Constraint(c) => match c {
+            Constraint::Relational(r) => match r.op.value {
+                RelOp::Eq => {
+                    let mut candidate = env.clone();
+                    if unify_terms(&r.lhs, &r.rhs, &mut candidate)? {
+                        Ok(vec![candidate])
+                    } else {
+                        Ok(Vec::new())
+                    }
+                }
+                _ => eval_relational_constraint(program, r, env, var_types, host)
+                    .map(|ok| if ok { vec![env.clone()] } else { Vec::new() }),
+            },
+            Constraint::ArithmeticBind(b) => eval_arithmetic_bind_constraint(b, env),
+        },
+        Goal::Aggregate(a) => eval_aggregate(program, a, env, var_types, relations, host),
+        Goal::ChooseTopK(c) => eval_choose_topk(program, c, env, var_types, relations, host),
+        Goal::Disjunction(d) => {
+```
+
+## Host-RA: Extern Relation Rows (required type/node/span + enclosing_control)
+
+Source: `/Users/darin/Projects/raql/crates/raql-host-ra/src/lib.rs:589-760`
+
+```text
+    pub(crate) fn extern_relation_rows_for_predicate(
+        &self,
+        predicate: &str,
+    ) -> Option<Vec<Vec<RuntimeValue>>> {
+        match predicate {
+            "world_stamp" => Some(vec![vec![RuntimeValue::String(
+                self.world_stamp.as_str().to_string(),
+            )]]),
+            "ty_app" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if let TypeShape::App { head, .. } = shape {
+                        rows.push(vec![rv_typeref(*type_ref), rv_def(*head)]);
+                    }
+                }
+                Some(rows)
+            }
+            "ty_arg" => {
+                let mut rows = Vec::new();
+                for type_ref in self.type_shapes.keys() {
+                    for (index, arg) in self.ty_args(*type_ref) {
+                        rows.push(vec![
+                            rv_typeref(*type_ref),
+                            RuntimeValue::Int(index as i64),
+                            rv_typeref(arg),
+                        ]);
+                    }
+                }
+                Some(rows)
+            }
+            "ty_ref" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if let TypeShape::Ref { mutability, inner } = shape {
+                        rows.push(vec![
+                            rv_typeref(*type_ref),
+                            rv_mutability(*mutability),
+                            rv_typeref(*inner),
+                        ]);
+                    }
+                }
+                Some(rows)
+            }
+            "ty_ptr" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if let TypeShape::Ptr { mutability, inner } = shape {
+                        rows.push(vec![
+                            rv_typeref(*type_ref),
+                            rv_mutability(*mutability),
+                            rv_typeref(*inner),
+                        ]);
+                    }
+                }
+                Some(rows)
+            }
+            "ty_tuple" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if let TypeShape::Tuple(items) = shape {
+                        for (index, elem) in items.iter().copied().enumerate() {
+                            rows.push(vec![
+                                rv_typeref(*type_ref),
+                                RuntimeValue::Int(index as i64),
+                                rv_typeref(elem),
+                            ]);
+                        }
+                    }
+                }
+                Some(rows)
+            }
+            "ty_slice" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if let TypeShape::Slice(inner) = shape {
+                        rows.push(vec![rv_typeref(*type_ref), rv_typeref(*inner)]);
+                    }
+                }
+                Some(rows)
+            }
+            "ty_param" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if let TypeShape::Param(param) = shape {
+                        rows.push(vec![rv_typeref(*type_ref), rv_def(*param)]);
+                    }
+                }
+                Some(rows)
+            }
+            "ty_prim" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if let TypeShape::Prim(name) = shape {
+                        rows.push(vec![
+                            rv_typeref(*type_ref),
+                            RuntimeValue::String(name.clone()),
+                        ]);
+                    }
+                }
+                Some(rows)
+            }
+            "ty_unknown" => {
+                let mut rows = Vec::new();
+                for (type_ref, shape) in &self.type_shapes {
+                    if matches!(shape, TypeShape::Unknown) {
+                        rows.push(vec![rv_typeref(*type_ref)]);
+                    }
+                }
+                Some(rows)
+            }
+            "node_at" => {
+                let mut rows = Vec::new();
+                for span in self.known_spans() {
+                    rows.push(vec![rv_span(span), rv_option_node(self.node_at(span))]);
+                }
+                Some(rows)
+            }
+            "node_kind" => {
+                let mut rows = Vec::new();
+                for (node, record) in &self.node_records {
+                    rows.push(vec![rv_node(*node), rv_node_kind(record.kind)]);
+                }
+                Some(rows)
+            }
+            "node_span" => {
+                let mut rows = Vec::new();
+                for (node, record) in &self.node_records {
+                    rows.push(vec![rv_node(*node), rv_span(record.span)]);
+                }
+                Some(rows)
+            }
+            "node_parent" => {
+                let mut rows = Vec::new();
+                for (node, record) in &self.node_records {
+                    rows.push(vec![rv_node(*node), rv_option_node(record.parent)]);
+                }
+                Some(rows)
+            }
+            "enclosing_control" => {
+                let mut rows = Vec::new();
+                for span in self.known_spans() {
+                    let Some(control) = self.enclosing_control(span) else {
+                        continue;
+                    };
+                    rows.push(vec![
+                        rv_span(span),
+                        rv_node_kind(control.kind),
+                        rv_span(control.span),
+                        RuntimeValue::Int(control.distance as i64),
+                    ]);
+                }
+                Some(rows)
+            }
+            "handle" => {
+                let mut defs = BTreeSet::new();
+                defs.extend(self.handle_keys.keys().copied());
+                for shape in self.type_shapes.values() {
+                    match shape {
+                        TypeShape::App { head, .. } | TypeShape::Param(head) => {
+                            defs.insert(*head);
+                        }
+                        _ => {}
+                    }
+                }
+
+                let mut rows = Vec::new();
+                for def in defs {
+                    rows.push(handle_relation_row(def, self.handle(def)));
+                }
+                Some(rows)
+            }
+            "span_key" => {
+```
+
+## Integration Test: Engine Dispatches Required RA Extern Predicates + Enclosing Control
+
+Source: `/Users/darin/Projects/raql/crates/raql-host-ra/tests/extern_runtime_dispatch.rs:1-260`
+
+```text
+use camino::Utf8PathBuf;
+use raql_compiler::{plan, resolve, typecheck};
+use raql_engine::{EvalStatus, RuntimeValue, execute};
+use raql_host::{DefId, NodeId, SpanCoord, SpanId, SpanKey, TypeRefId};
+use raql_host_ra::{GenericArg, NodeKind, RaHostRuntime, TypeShape};
+use raql_ir::StableId;
+use raql_syntax::parse_program;
+
+fn repo_root() -> Utf8PathBuf {
+    let manifest_dir = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("raql workspace root")
+        .to_path_buf()
+}
+
+#[test]
+fn engine_dispatches_required_ra_extern_predicates() {
+    let repo = repo_root();
+    let target = repo.join("crates/raql-host-ra/src/lib.rs");
+    let mut runtime = RaHostRuntime::from_file_path(target.as_std_path()).expect("runtime");
+
+    let tr = TypeRefId::new(StableId::new(0x100));
+    let arg = TypeRefId::new(StableId::new(0x101));
+    let head = DefId::new(StableId::new(0x200));
+    runtime.insert_type(
+        tr,
+        TypeShape::App {
+            head,
+            args: vec![GenericArg::Type(arg)],
+        },
+    );
+    runtime.insert_type(arg, TypeShape::Prim("i32".to_string()));
+    runtime.insert_handle(head, "def://Result");
+
+    let span = SpanId::new(StableId::new(0x300));
+    runtime.insert_span(
+        span,
+        SpanKey::new(
+            "crates/raql-host-ra/src/lib.rs",
+            SpanCoord::new(1, 0),
+            SpanCoord::new(1, 8),
+        ),
+    );
+    let node = NodeId::new(StableId::new(0x301));
+    runtime.insert_node(node, NodeKind::If, span, None);
+
+    let src = r#"
+.type NodeKind = { IF, MATCH, WHILE, FOR, LOOP, BLOCK, TRY, ARM, OTHER }.
+.decl ty_app(TR: TypeRef, Head: Def) extern.
+.decl ty_arg(TR: TypeRef, Index: int, Arg: TypeRef) extern.
+.decl ty_prim(TR: TypeRef, Name: string) extern.
+.decl handle(D: Def, H: string) extern.
+.decl node_kind(N: Node, K: NodeKind) extern.
+.decl node_span(N: Node, S: Span) extern.
+.decl node_at(S: Span, N: option<Node>) extern.
+.decl span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
+
+.decl type_row(I: int, Name: string, Handle: string).
+.decl node_row(RelPath: string, Kind: NodeKind).
+
+type_row(I, Name, Handle) :-
+  ty_app(TR, D),
+  ty_arg(TR, I, Arg),
+  ty_prim(Arg, Name),
+  handle(D, Handle).
+
+node_row(RelPath, Kind) :-
+  node_kind(N, Kind),
+  node_span(N, S),
+  node_at(S, some(N)),
+  span_key(S, RelPath, _L0, _C0, _L1, _C1).
+"#;
+
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let result = execute(&planned, &mut runtime);
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(result.relations.get("type_row").is_some_and(|rows| {
+        rows.contains(&vec![
+            RuntimeValue::Int(0),
+            RuntimeValue::String("i32".to_string()),
+            RuntimeValue::String("def://Result".to_string()),
+        ])
+    }));
+    assert!(result.relations.get("node_row").is_some_and(|rows| {
+        rows.contains(&vec![
+            RuntimeValue::String("crates/raql-host-ra/src/lib.rs".to_string()),
+            RuntimeValue::Enum {
+                name: "NodeKind".to_string(),
+                variant: "IF".to_string(),
+            },
+        ])
+    }));
+}
+
+fn seeded_runtime_for_enclosing_control() -> RaHostRuntime {
+    let repo = repo_root();
+    let target = repo.join("crates/raql-host-ra/src/lib.rs");
+    let mut runtime = RaHostRuntime::from_file_path(target.as_std_path()).expect("runtime");
+
+    let query_span = SpanId::new(StableId::new(0x500));
+    let expr_span = SpanId::new(StableId::new(0x501));
+    let block_span = SpanId::new(StableId::new(0x502));
+    let if_span = SpanId::new(StableId::new(0x503));
+
+    runtime.insert_span(
+        query_span,
+        SpanKey::new(
+            "crates/raql-host-ra/src/lib.rs",
+            SpanCoord::new(12, 7),
+            SpanCoord::new(12, 8),
+        ),
+    );
+    runtime.insert_span(
+        expr_span,
+        SpanKey::new(
+            "crates/raql-host-ra/src/lib.rs",
+            SpanCoord::new(12, 6),
+            SpanCoord::new(12, 9),
+        ),
+    );
+    runtime.insert_span(
+        block_span,
+        SpanKey::new(
+            "crates/raql-host-ra/src/lib.rs",
+            SpanCoord::new(12, 4),
+            SpanCoord::new(14, 1),
+        ),
+    );
+    runtime.insert_span(
+        if_span,
+        SpanKey::new(
+            "crates/raql-host-ra/src/lib.rs",
+            SpanCoord::new(10, 0),
+            SpanCoord::new(16, 1),
+        ),
+    );
+
+    let if_node = NodeId::new(StableId::new(0x510));
+    let block_node = NodeId::new(StableId::new(0x511));
+    let expr_node = NodeId::new(StableId::new(0x512));
+
+    runtime.insert_node(if_node, NodeKind::If, if_span, None);
+    runtime.insert_node(block_node, NodeKind::Block, block_span, Some(if_node));
+    runtime.insert_node(expr_node, NodeKind::Expr, expr_span, Some(block_node));
+
+    runtime
+}
+
+#[test]
+fn engine_executes_enclosing_control_with_default_depth() {
+    let mut runtime = seeded_runtime_for_enclosing_control();
+    let src = r#"
+.type NodeKind = { IF, MATCH, WHILE, FOR, LOOP, BLOCK, TRY, ARM, OTHER }.
+.decl span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
+.decl enclosing_control(S: Span, K: NodeKind, ControlS: Span, Dist: int) extern.
+.decl hit(Dist: int).
+
+hit(Dist) :-
+  span_key(S, "crates/raql-host-ra/src/lib.rs", 12, 7, 12, 8),
+  enclosing_control(S, NodeKind::IF, _ControlS, Dist).
+"#;
+
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let result = execute(&planned, &mut runtime);
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("hit")
+            .is_some_and(|rows| { rows.contains(&vec![RuntimeValue::Int(2)]) })
+    );
+}
+
+#[test]
+fn engine_executes_enclosing_control_with_overridden_depth_limit() {
+    let mut runtime = seeded_runtime_for_enclosing_control();
+    let src = r#"
+.type NodeKind = { IF, MATCH, WHILE, FOR, LOOP, BLOCK, TRY, ARM, OTHER }.
+.decl span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
+.decl enclosing_control(S: Span, K: NodeKind, ControlS: Span, Dist: int) extern.
+.decl control_max_depth(N: int) input.
+.decl hit(Dist: int).
+
+control_max_depth(1).
+hit(Dist) :-
+  span_key(S, "crates/raql-host-ra/src/lib.rs", 12, 7, 12, 8),
+  enclosing_control(S, NodeKind::IF, _ControlS, Dist).
+"#;
+
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let result = execute(&planned, &mut runtime);
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("hit")
+            .is_some_and(|rows| rows.is_empty())
+    );
+}
+```
+
+## Required Section 16 Tests: Enclosing Control Semantics
+
+Source: `/Users/darin/Projects/raql/crates/raql-host-ra/tests/required_sections_16.rs:250-325`
+
+```text
+    assert_eq!(host.node_kind(root), Some(NodeKind::Item));
+    assert_eq!(host.node_span(child), Some(child_span));
+    assert_eq!(host.node_parent(root), Some(None));
+    assert_eq!(host.node_parent(child), Some(Some(root)));
+    assert_eq!(host.node_parent(node(0x499)), None);
+}
+
+#[test]
+fn enclosing_control_returns_first_control_ancestor_with_distance() {
+    let mut host = DeterministicRaHost::new();
+
+    let query = span(0x500);
+    let expr_span = span(0x501);
+    let block_span = span(0x502);
+    let if_span = span(0x503);
+    let while_span = span(0x504);
+
+    host.insert_span(query, key("src/main.rs", 12, 7, 12, 8));
+    host.insert_span(expr_span, key("src/main.rs", 12, 6, 12, 9));
+    host.insert_span(block_span, key("src/main.rs", 12, 4, 14, 1));
+    host.insert_span(if_span, key("src/main.rs", 10, 0, 16, 1));
+    host.insert_span(while_span, key("src/main.rs", 8, 0, 20, 1));
+
+    let while_node = node(0x510);
+    let if_node = node(0x511);
+    let block_node = node(0x512);
+    let expr_node = node(0x513);
+
+    host.insert_node(while_node, NodeKind::While, while_span, None);
+    host.insert_node(if_node, NodeKind::If, if_span, Some(while_node));
+    host.insert_node(block_node, NodeKind::Block, block_span, Some(if_node));
+    host.insert_node(expr_node, NodeKind::Expr, expr_span, Some(block_node));
+
+    let control = host
+        .enclosing_control(query)
+        .expect("should find the nearest control ancestor");
+    assert_eq!(control.kind, NodeKind::If);
+    assert_eq!(control.span, if_span);
+    assert_eq!(control.distance, 2);
+}
+
+#[test]
+fn enclosing_control_respects_default_and_overridden_max_depth() {
+    let mut host = DeterministicRaHost::new();
+
+    let query = span(0x600);
+    let expr_span = span(0x601);
+    let block_span = span(0x602);
+    let if_span = span(0x603);
+
+    host.insert_span(query, key("src/lib.rs", 30, 5, 30, 6));
+    host.insert_span(expr_span, key("src/lib.rs", 30, 4, 30, 7));
+    host.insert_span(block_span, key("src/lib.rs", 30, 2, 31, 1));
+    host.insert_span(if_span, key("src/lib.rs", 28, 0, 34, 1));
+
+    let if_node = node(0x610);
+    let block_node = node(0x611);
+    let expr_node = node(0x612);
+
+    host.insert_node(if_node, NodeKind::If, if_span, None);
+    host.insert_node(block_node, NodeKind::Block, block_span, Some(if_node));
+    host.insert_node(expr_node, NodeKind::Expr, expr_span, Some(block_node));
+
+    assert_eq!(host.control_max_depth(), 32);
+    assert!(host.enclosing_control(query).is_some());
+
+    host.set_control_max_depth(1);
+    assert_eq!(host.enclosing_control(query), None);
+
+    let deep_override = host.enclosing_control_with_depth(query, 2);
+    assert!(deep_override.is_some());
+}
+
+#[test]
+fn invalid_span_range_includes_source_path_context() {
+    let mut host = DeterministicRaHost::new();
+```
+
+## Paste Prompt Template (for Oracle)
+
+```text
+Treat this bundle as authoritative as of 2026-02-12.
+Do not assume any RAQL features beyond what appears here.
+
+Task: design RAQL v0.1 standard library and produce exact files to add.
+
+Hard constraints:
+- Must satisfy required semantics in the included full language specification.
+- Must match currently implemented parser/compiler/runtime/host behaviors in included code excerpts.
+- Do not invent new syntax or runtime primitives unless clearly marked optional and isolated.
+- Prefer minimal, testable stdlib first; optional helpers second.
+
+Deliverables:
+1) Proposed stdlib file tree.
+2) Full content for each file.
+3) Acceptance tests mapped to included matrix rows.
+4) Required vs optional code deltas outside stdlib.
+5) Suggested smallest safe PR sequence.
+```

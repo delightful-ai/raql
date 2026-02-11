@@ -4,6 +4,906 @@ I'll assume Rust for the engine + a rust-analyzer-backed host adapter, because y
 
 ---
 
+## Repo layout and dependencies (this repo, not rust-analyzer workspace)
+
+We are building RAQL in this repo (not inside the rust-analyzer workspace), but the host adapter
+must depend on the published rust-analyzer crates for analysis types and utilities.
+
+Recommended crate set (v0.1):
+
+* crates/raql-ir
+  * phase-typed IR + shared types
+* crates/raql-syntax
+  * lexer/parser + include loading into AST
+* crates/raql-compiler
+  * name resolution, schema inference, typing, mode planning, stratification, safety
+* crates/raql-engine
+  * fixpoint evaluator + built-ins (choose_topk, witness_path)
+* crates/raql-host-ra
+  * rust-analyzer adapter: extern predicates required by v0.1
+* crates/raql-cli (optional)
+  * thin CLI wrapper over compiler + engine + host
+
+Dependency direction (keep it acyclic and obvious):
+
+* raql-syntax -> raql-ir
+* raql-compiler -> raql-ir
+* raql-engine -> raql-ir
+* raql-host-ra -> (raql-engine + raql-ir + rust-analyzer crates)
+* raql-cli -> (raql-syntax + raql-compiler + raql-engine + raql-host-ra)
+
+Hard rule: raql-ir must not depend on rust-analyzer analysis crates (hir/ide/etc).
+
+### Dependency policy
+
+Use rust-analyzer crates where we need real analysis types or shared utilities, and crates.io
+for everything else.
+
+Rust-analyzer crates (published; typically under ra_ap_* on crates.io):
+
+* intern
+* text-size
+* paths
+* span (host adapter only)
+* syntax, hir, ide, vfs, line_index (host adapter only)
+
+Crates.io utilities:
+
+* indexmap (deterministic relation storage)
+* rustc-hash (fast deterministic hashing)
+* smallvec (compact collections)
+* fixedbitset (mode planner bound/ground sets)
+* typed-index-collections or index_vec (typed IDs)
+* miette + thiserror (diagnostics)
+* clap (CLI)
+* insta or expect-test (diagnostic snapshots)
+
+---
+
+## 1. Core design rule: phase-typed IR (typestate)
+
+The largest source of logic engine bugs is mixing phases:
+
+* evaluating before mode planning
+* checking safety before disjunction desugaring
+* stable_order without resolved enum ordinals
+
+Use typestate so it is a compile-time error to run the engine on anything except a planned program.
+
+Pattern:
+
+```rust
+pub struct Program<P: Phase> {
+    pub common: ProgramCommon,
+    pub phase: P,
+}
+
+pub trait Phase: sealed::Sealed {}
+pub struct AstPhase { /* parsed, unresolved */ }
+pub struct ResolvedPhase { /* ids resolved, still untyped */ }
+pub struct TypedPhase { /* every term annotated with TyId */ }
+pub struct PlannedPhase { /* goal order, chosen modes, strata, SCCs */ }
+```
+
+Compiler pipeline types:
+
+* parse(..) -> Program<AstPhase>
+* resolve(..) -> Program<ResolvedPhase>
+* typeck(..) -> Program<TypedPhase>
+* plan(..) -> Program<PlannedPhase>
+
+Only Program<PlannedPhase> is executable.
+
+---
+
+## 2. raql-ir: strongly typed IDs, spans, symbols, types, terms
+
+### 2.1 Typed IDs: “wrong index into wrong vec” becomes impossible
+
+Prefer la_arena::Arena<T> + la_arena::Idx<T> everywhere.
+
+Core ID kinds:
+
+* PredId, RuleId, GoalId, VarId
+* TyId, EnumId, VariantId
+* StratumId, SccId
+* “syntactic site ids” where spec needs occurrence identity:
+  * ChooseSiteId (each choose_topk occurrence)
+  * WitnessSiteId (each witness_path occurrence)
+
+Implementation detail:
+
+* Store each data type in its own Arena<...>, and use Idx<ThatType> as the ID.
+* Keep the arena element types private to the module, and re-export the Idx<T> alias.
+
+### 2.2 Source spans for diagnostics: reuse text_size::TextRange
+
+Define:
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RaqlFileId(u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SrcSpan {
+    pub file: RaqlFileId,
+    pub range: text_size::TextRange,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceFile {
+    pub path: paths::Utf8PathBuf,
+    pub text: String,
+    pub include_stack: Box<[paths::Utf8PathBuf]>,
+}
+```
+
+Notes:
+
+* include_stack is carried on every file for diagnostics. This is easier than reconstructing stacks later.
+* SrcSpan is for RAQL program text locations, not for RAQL’s Span host type.
+
+### 2.3 Symbols: use intern::Symbol
+
+Use intern::Symbol for:
+
+* predicate names
+* type names
+* enum names and variant names
+* string literals (optional, but recommended for stable hashing and dedup)
+
+### 2.4 Type representation: interned TyId graph + canonical TypeTag
+
+RAQL types are monomorphic, but we still need:
+
+* structural types (option<T>, list<T>)
+* named types (enums, opaque host types)
+* canonical TypeTag rendering for stable_order
+
+Use a type interner so every type has a unique TyId.
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TyId(la_arena::Idx<TyData>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TyData {
+    Int,
+    String,
+    Bool,
+    Opaque(OpaqueTy),      // Def, Span, TypeRef, Node, Call, Ref, Impl, Path
+    Enum(EnumId),
+    Option(TyId),
+    List(TyId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OpaqueTy { Def, Span, TypeRef, Node, Call, Ref, Impl, Path }
+```
+
+Interner:
+
+* Arena<TyData> stores canonical nodes
+* FxHashMap<TyData, TyId> maps structural nodes to existing IDs
+* TypeTag cache: FxHashMap<TyId, Symbol> storing canonical string like option<string>
+
+Canonical type tags must match the spec’s textual format exactly:
+
+* int, string, bool
+* option<T>, list<T>
+* enum name: RenderMode
+* opaque: Def, Span, ...
+
+This is non-negotiable because stable_order compares tags lexicographically.
+
+### 2.5 Term representation: AST terms vs runtime terms
+
+Keep three distinct representations to use the type system as guard rails:
+
+1. AST term (ast::Term): parsed surface forms (names, literals, constructors), no typing
+2. Typed term (typed::Term): every node has a TyId and is closed over resolved enums
+3. Runtime term graph (engine::RTerm / engine::TermId): supports unification, variables, occurs check
+
+Do not try to reuse one enum for all three. That leads to optional fields everywhere and forgotten invariants.
+
+AST term shape:
+
+```rust
+pub enum TermAst {
+    Var(Symbol),                 // uppercase identifiers (except "_")
+    Wildcard,                    // "_"
+    Int(i64),
+    Str(Symbol),
+    Bool(bool),
+    EnumAtom { enm: Symbol, var: Symbol }, // EnumType::Variant (unresolved in AST)
+    None { ann: Option<TypeAst> },         // none::<T>
+    Some(Box<TermAst>),
+    List { elems: Vec<TermAst>, ann: Option<TypeAst> },
+}
+```
+
+Typed term shape:
+
+```rust
+pub struct TermTyped {
+    pub ty: TyId,
+    pub kind: TermKindTyped,
+}
+
+pub enum TermKindTyped {
+    Var(VarId),
+    Wildcard,
+    Int(i64),
+    Str(Symbol),
+    Bool(bool),
+    Enum { enum_id: EnumId, variant: VariantId },
+    None,                        // its type is in ty (option<T>)
+    Some(Box<TermTyped>),
+    List(Vec<TermTyped>),
+}
+```
+
+Notice: None does not carry an inner type. The outer ty is option<T>.
+
+### 2.6 Predicate signatures: .decl and .func are different in IR
+
+Make .decl vs .func impossible to confuse at runtime:
+
+```rust
+pub enum PredKind {
+    Rel,        // .decl
+    Func,       // .func (must return exactly 1 tuple per bound inputs)
+}
+
+bitflags::bitflags! {
+    pub struct PredAttr: u8 {
+        const EXTERN = 0b0001;
+        const INPUT  = 0b0010;
+        const OUTPUT = 0b0100;
+    }
+}
+
+pub struct PredSig {
+    pub name: Symbol,
+    pub arity: u32,
+    pub args: Box<[TyId]>,
+    pub kind: PredKind,
+    pub attr: PredAttr,
+}
+```
+
+Avoid attr-only representation, because .func extern has runtime cardinality semantics that .decl extern does not.
+
+### 2.7 Modes: store expanded modes only
+
+After parsing .mode with ?, expand to explicit modes immediately and store only explicit modes:
+
+```rust
+pub struct ModeSig {
+    pub pred: PredId,
+    pub args: Box<[ModeArg]>,
+}
+
+pub struct ModeArg {
+    pub dir: ModeDir,   // In or Out
+    pub ty: TyId,
+}
+
+pub enum ModeDir { In, Out }
+```
+
+Also record at compile time:
+
+* which modes are legal for each predicate
+* which mode was selected for each call site (in planned IR)
+
+---
+
+## 3. raql-syntax: lexer, parser, include loading
+
+### 3.1 Lexer: explicit token kinds, spans everywhere
+
+Use a tiny token enum with SrcSpan:
+
+```rust
+pub struct Token { pub kind: TokenKind, pub span: text_size::TextRange }
+pub enum TokenKind { Ident(Symbol), Var(Symbol), Int(i64), Str(Symbol), /* punctuation */ }
+```
+
+Parser then wraps tokens with file id to produce SrcSpan.
+
+### 3.2 Parser output: an AST that preserves source locations
+
+Every AST node should carry a SrcSpan:
+
+```rust
+pub struct Spanned<T> { pub span: SrcSpan, pub value: T }
+```
+
+If you do this consistently, you can generate diagnostics later without retrofitting spans.
+
+### 3.3 Include loader: make include cycles impossible
+
+Include resolution happens before compilation phases.
+
+* keep a Vec<Utf8PathBuf> stack during DFS
+* emit cycle diagnostics with the exact stack
+* store include_stack into SourceFile
+
+---
+
+## 4. raql-compiler: make static checks a type-directed pipeline
+
+The compiler is best modeled as a sequence of transforms over the phase-typed Program<P>.
+
+Each step has:
+
+* input type that guarantees prerequisites are done
+* output type that guarantees new invariants
+
+### 4.1 Resolution: names to IDs
+
+Resolve in this order:
+
+1. type declarations .type to EnumId + VariantId ordinals (declaration order)
+2. predicate declarations .decl / .func to PredId + PredSig
+3. built-ins pre-registered into the same tables (so later stages are uniform)
+4. mode declarations:
+   * resolve predicate name to PredId
+   * resolve each type name to TyId
+5. rule bodies:
+   * predicate names to PredId
+   * enum atoms E::V to (EnumId, VariantId)
+
+Keep resolution errors separate from type errors (error codes differ).
+
+### 4.2 Schema inference for undeclared derived predicates
+
+This must happen before rule-local type inference and before mode planning.
+
+Key implementation detail: schema inference uses the same type solver, but introduces
+“schema arg variables” distinct from “rule-local variables”.
+
+Use distinct namespaces:
+
+* SchemaTyVar for predicate argument positions (global-ish)
+* RuleTyVar for variables and ambiguous literals within a rule
+
+Do not unify these into one pool or you will create confusing cross-rule coupling.
+
+Algorithm:
+
+* for every derived predicate lacking .decl:
+  * allocate n schema vars p_arg[i]
+  * add constraints from:
+    * rule heads for that predicate
+    * positive/negative call sites
+    * .mode declarations (must match arity and types)
+  * solve to concrete TyId values
+  * finalize and freeze inferred PredSig as if explicitly declared
+
+Freeze means: from this point onward, predicate signatures are immutable and all future checks refer to them.
+
+### 4.3 Type inference and checking: one solver, two layers
+
+#### 4.3.1 Concrete type solver shape
+
+Use a unification-based solver with occurs check for type variables.
+
+Key data structures:
+
+```rust
+pub struct TypeSolver {
+    // Union-find of type variables
+    parent: Vec<TyVarId>,
+    // Optional binding of var root to a type expression
+    binding: Vec<Option<TyExpr>>,
+}
+
+pub enum TyExpr {
+    Concrete(TyId),
+    Option(Box<TyExpr>),
+    List(Box<TyExpr>),
+}
+```
+
+This is sufficient because RAQL v0.1 types are a small algebra.
+
+Important: keep TyId as the canonical concrete type, and TyExpr for intermediate unification forms.
+
+Occurs check requirement:
+
+* reject constraints like Tv = option<Tv> during solving (compile-time diagnostic)
+
+#### 4.3.2 Rule-local typing
+
+Within each rule:
+
+* allocate a type var for each named variable on first occurrence
+* allocate fresh vars for none and [] inner type vars
+* generate constraints from:
+  * predicate argument positions (using frozen PredSig)
+  * constructors (some, list literals, turbofish annotations)
+  * constraints (=, !=, comparisons, :=)
+  * aggregates (binder type rules)
+  * built-ins and externs
+* solve and then produce:
+  * VarId -> TyId table
+  * a typed rule body + head terms
+
+Fail if any rule-local type var is unresolved.
+
+#### 4.3.3 Orderable is a compile-time predicate on TyId
+
+Add a helper:
+
+fn is_orderable(ty: TyId, types: &TypeInterner, enums: &EnumTable) -> bool
+
+It must implement the spec’s orderable domain:
+
+* primitives + enums + opaque + option/list recursively
+
+Use this to type-check:
+
+* choose_topk group/item constraints
+* min/max constraints
+
+### 4.4 Disjunction desugaring: do it early, do it hygienically
+
+Perform desugaring before safety/mode/strata checks.
+
+To avoid variable capture:
+
+* during desugaring, alpha-rename any variable that is introduced solely within a branch
+* represent variables internally as VarId, not Symbol, so renaming is just allocating a new VarId
+
+Practical approach:
+
+* in AST/resolved phases, variables are Symbol
+* in typed phase, allocate VarId for each unique variable symbol within a rule
+* disjunction desugaring happens after VarId allocation, so renaming is cheap and safe
+
+### 4.5 Mode planning: compile body into an executable plan
+
+The planner produces:
+
+* a linear order of executable ops for each rule
+* a selected mode for every predicate call site (when multiple modes exist)
+* an explanation object for diagnostics when planning fails
+
+#### 4.5.1 Planner state: explicitly track boundness vs groundness
+
+Make the difference explicit with a typed struct:
+
+```rust
+#[derive(Clone, Copy)]
+pub struct VarFlags {
+    pub bound: bool,
+    pub ground: bool,
+}
+```
+
+At planning time, maintain:
+
+* VarId -> VarFlags
+* remaining_goals: GoalMask (bitset)
+
+Represent goal selection search states as:
+
+```rust
+struct PlanState {
+    remaining: GoalMask,
+    flags: Box<[VarFlags]>,
+}
+```
+
+Memoize PlanState by hashing (remaining, flags) using a deterministic hasher.
+
+#### 4.5.2 Goal-level “runnable” predicates: make them explicit
+
+Encode each goal’s runnable preconditions as a function that returns:
+
+* whether runnable now
+* which variables become bound and/or ground if executed
+
+This prevents subtle mistakes where a goal is scheduled too early.
+
+Special rules:
+
+* !=, <, <=, >, >= require operands ground
+* predicate mode +T requires argument ground
+* .func outputs are ground if all inputs are ground (externs only produce ground)
+* unification = may bind, but does not guarantee groundness unless RHS is ground
+* arithmetic := binds LHS ground if all vars in expr are ground
+
+#### 4.5.3 Search strategy
+
+Use bounded DFS with pruning:
+
+* always prefer goals that:
+  * require the most inputs but are already runnable
+  * or bind the most new vars
+* branch when multiple runnable goals exist
+* memoize visited states
+
+This avoids a fragile greedy approach without exploding in practice.
+
+#### 4.5.4 Output of planning: an explicit instruction list
+
+Planned rule body becomes:
+
+```rust
+pub struct RulePlan {
+    pub head: HeadPlan,
+    pub ops: Box<[OpPlan]>,
+}
+
+pub enum OpPlan {
+    Lookup { pred: PredId, mode: ModeSigId, args: Box<[Slot]> },
+    Not { pred: PredId, args: Box<[Slot]> },
+    Unify { a: TermTyped, b: TermTyped },
+    Compare { op: CmpOp, a: TermTyped, b: TermTyped },
+    ArithBind { out: VarId, expr: ArithExpr },
+    Aggregate { out: VarId, agg: AggKind, inner: SubPlan },
+    ChooseTopK { site: ChooseSiteId, tag: Symbol, k: Slot, group: Slot, score: VarId, item: VarId, inner: SubPlan },
+    WitnessPath { site: WitnessSiteId, graph: Slot, from: Slot, to: Slot, out: VarId },
+    PathHop { path: Slot, seq: VarId, from: VarId, to: VarId, kind: VarId, evidence: VarId },
+}
+```
+
+Notes:
+
+* Slot is either a constant or a variable reference.
+* SubPlan is a nested rule-plan fragment used for aggregates and binders.
+
+This representation ensures runtime never has to re-run mode logic. It is already compiled.
+
+### 4.6 Stratification + SCC: represent dependency edges as a typed enum
+
+Dependency edges are not all equal; encode edge kinds in the type system:
+
+```
+pub enum DepKind { Pos, Neg, Agg, Select }
+pub struct DepEdge { pub from: PredId, pub to: PredId, pub kind: DepKind, pub at: SrcSpan }
+```
+
+Then build SCCs over PredId and compute strata with weighted constraints:
+
+* Pos weight 0
+* Neg/Agg/Select weight 1
+
+Reject:
+
+* any SCC that contains Agg, choose_topk, witness_path, or path_hop
+* any cycle that violates stratification constraints
+
+Make graph_edge/5 special in the resolver:
+
+* either it is absent (and witness_path use is a compile-time error)
+* or it matches the reserved schema exactly
+
+### 4.7 Safety (range restriction): compute from planned ops
+
+Safety checking is simplest after planning because:
+
+* disjunction is already desugared
+* you have an order of evaluation
+* binder outputs are explicit in ops
+
+Compute range restriction as a dataflow over ops:
+
+* start with empty restricted set
+* for each op, update restricted vars:
+  * Lookup restricts output vars and binds them to ground
+  * Unify restricts vars only if it binds them from a ground term or already restricted var
+  * ArithBind restricts LHS if all expr vars restricted
+  * binder ops restrict their explicit outputs
+* after pass, verify:
+  * head vars restricted
+  * vars in not restricted
+  * vars in non-binding comparisons restricted
+
+Because you already have typed terms, you can precisely identify which vars occur where.
+
+---
+
+## 5. raql-engine: runtime that matches the spec exactly
+
+### 5.1 Runtime types: separate ground values from terms
+
+Avoid conflating runtime value with runtime term.
+
+Ground value:
+
+```rust
+pub enum Value<H: HostTypes> {
+    Int(i64),
+    Str(intern::Symbol),
+    Bool(bool),
+    Enum { enum_id: EnumId, variant: VariantId },
+    Opaque(OpaqueValue<H>),
+    Option(Option<Box<Value<H>>>),
+    List(Box<[Value<H>]>),
+}
+```
+
+Runtime term graph (for unification) must be able to hold variables and structured terms:
+
+```rust
+pub enum RTerm<H: HostTypes> {
+    Var(VarId),
+    Value(Value<H>),
+    Some(TermId),
+    None(TyId),          // carries full option<T> type via TyId
+    List(Box<[TermId]>),
+}
+```
+
+Use TermId = Idx<RTermNode> allocated from an arena to make sharing cheap and to implement occurs checks.
+
+### 5.2 Unification: explicit occurs check using the term arena + env
+
+Runtime env:
+
+```rust
+pub struct Env<H: HostTypes> {
+    // Union-find for variable equivalence (VarId roots)
+    parent: Box<[VarId]>,
+    // Optional binding for each var-root to a term
+    binding: Box<[Option<TermId>]>,
+    // Term arena for structured terms
+    terms: la_arena::Arena<RTermNode<H>>,
+}
+```
+
+Unify algorithm must:
+
+* follow var roots
+* perform occurs check when binding a var root to a term containing that var
+* treat opaque host values as atomic:
+  * they unify only if equal
+  * they never unify with some(...), lists, literals
+
+This is required by spec and cannot be approximated.
+
+### 5.3 Relation storage: deterministic set semantics + index-by-mode
+
+Per predicate relation:
+
+* set semantics: dedup tuples
+* deterministic iteration order
+
+Use indexmap::IndexSet with rustc_hash::FxHasher for deterministic insertion order.
+
+Store:
+
+```rust
+pub struct Relation<H: HostTypes> {
+    pub sig: PredSig,
+    pub tuples: indexmap::IndexSet<Tuple<H>, FxBuildHasher>,
+    pub indexes: Vec<RelationIndex<H>>, // keyed by (pred, key_cols)
+}
+```
+
+Tuple representation:
+
+* fixed arity, so use Box<[Value<H>]> (heap once, cheap clone by cloning values)
+
+Index representation:
+
+* key_cols: Box<[u32]> (column indices)
+* map from Key to Box<[TupleId]> or Vec<TupleId>
+
+Important: query-time iteration order should always be:
+
+* tuple insertion order (IndexSet index)
+* never HashMap iteration order
+
+### 5.4 Fixpoint evaluation: SCC-local semi-naive with stable scheduling
+
+Within a stratum:
+
+1. evaluate SCCs in deterministic order (topological order of SCC DAG, and stable sort SCC ids)
+2. for a recursive SCC:
+   * run semi-naive with delta relations
+   * stop after max_iters and emit partial status
+
+Represent SCC plan explicitly:
+
+```rust
+pub struct StratumPlan {
+    pub sccs: Box<[SccPlan]>,
+}
+pub struct SccPlan {
+    pub preds: Box<[PredId]>,
+    pub rules: Box<[RuleId]>,
+    pub recursive: bool,
+}
+```
+
+Semi-naive rule variant generation is compile-time work:
+
+* for each rule, precompute delta variants as additional RulePlans
+* store them in planned IR so runtime is simple and deterministic
+
+### 5.5 Constraints and arithmetic: always checked, runtime error halts
+
+Implement:
+
+* checked add/sub/mul
+* division by zero error
+* overflow error
+
+On any runtime error:
+
+* mark run partial
+* emit out_status("partial") once
+* emit out_note("Errors", "...")
+* halt evaluation immediately
+
+### 5.6 Aggregates: implement the spec’s projection-and-dedup rule literally
+
+Avoid the classic bug: counting rows instead of distinct projected values.
+
+Implement aggregate evaluation as:
+
+* run inner subplan under captured outer env
+* collect satisfying bindings as a set
+* for agg(V : Goals):
+  * project to V
+  * dedup projected values
+  * aggregate over that set
+
+Encode the two aggregate forms distinctly in the planned IR:
+
+```
+pub enum AggInput {
+    Rows,          // count(Goals)
+    Project(VarId) // agg(V : Goals)
+}
+```
+
+This prevents accidentally implementing the wrong semantics.
+
+### 5.7 choose_topk: binder op with explicit site identity
+
+Implement as an op that evaluates its inner subplan to candidates, then selects:
+
+* dedup candidate (Score, Item)
+* sort by:
+  1. Score desc
+  2. stable_order(Item) asc
+  3. stable_order(Score) asc
+* take first K
+
+Key detail: selection site identity is (tag, ChooseSiteId) not tag alone.
+
+Make ChooseSiteId part of the planned IR and part of any cache key.
+
+### 5.8 witness_path / path_hop: built-in binder reading completed graph_edge/5
+
+Implement in-engine as a built-in that reads the materialized graph_edge/5 relation.
+
+Because stratification enforces witness_path is above graph_edge, the relation is complete.
+
+Algorithm:
+
+* build adjacency map per (Graph, From) once per stratum (or per call site), stable-sorted by hop key
+* enumerate ranked shortest paths with lexicographic tie-break as per spec
+* store returned paths in a PathArena:
+  * PathId is a stable integer
+  * path_hop enumerates hops with Seq 0..n-1
+
+Strongly recommended: avoid cycles by forbidding repeated nodes within a path (simple path), given depth bounds.
+
+### 5.9 Stable ordering: make it a separate, testable module
+
+Implement stable_order(Value) using:
+
+* cached TypeTag for TyId
+* primitive comparisons
+* enum ordinal
+* option/list recursive order
+* host-provided stable keys for opaque values
+
+Do not build stable order by formatting values to strings. That is slow and easy to get subtly wrong.
+
+Provide a dedicated cache layer:
+
+* def_handle: FxHashMap<Def, Symbol>
+* span_key: FxHashMap<Span, SpanKey>
+* *_id: FxHashMap<Opaque, Symbol>
+
+Make cache ownership explicit:
+
+* caches belong to the host adapter (preferred), because the host knows how to compute keys and can reuse across runs
+* engine calls host.stable_key_* methods that are required to be deterministic within a snapshot
+
+---
+
+## 6. raql-host-ra: rust-analyzer adapter as a real typed layer
+
+### 6.1 Snapshot contract: use ide::Analysis snapshots
+
+On each RAQL run:
+
+* load workspace (reuse patterns from existing rust-analyzer CLI code)
+* obtain AnalysisHost
+* take Analysis snapshot
+* all extern predicate queries read from that snapshot
+
+This gives:
+
+* internal consistency across all queries
+* stable results for deterministic RAQL runs
+
+### 6.2 Reuse rust-analyzer’s span::Span as RAQL’s Span opaque type
+
+Do not invent a second span system.
+
+span::Span is already:
+
+* Copy
+* Eq + Hash
+* macro-aware
+
+So the RAQL host opaque type Span can literally be span::Span (or a repr(transparent) newtype wrapper).
+
+### 6.3 Opaque host types: prefer real RA handles, wrapped
+
+For v0.1, define wrappers that are:
+
+* small, Copy where possible
+* Eq + Hash
+* stable within a snapshot
+
+Examples:
+
+* Def: wrap a sum of HIR IDs, or a single internal hir_def::DefId if you can unify them safely
+* TypeRef: wrap a stable hir_ty::Ty handle via an intern table (likely a host-specific TypeRefId)
+* Node: wrap (hir_expand::HirFileId, syntax::SyntaxNodePtr) rather than SyntaxNode
+
+### 6.4 Stable key functions: implement once, cache aggressively
+
+Implement required externs as thin wrappers around cached host methods:
+
+* handle(Def, string)
+* span_key(Span, RelPath, L0, C0, L1, C1)
+* typeref_id(TypeRef, string)
+* node_id(Node, string)
+* call_id(Call, string)
+* ref_id(Ref, string)
+* impl_id(Impl, string)
+* world_stamp(string)
+
+The span_key implementation should:
+
+* map span anchor file identity to a stable virtual path (macro expansions need a deterministic representation)
+* compute line/col with LineIndexDatabase or LineIndex
+
+### 6.5 Required predicates: map directly to RA semantics layer
+
+For type structure:
+
+* ty_app(TypeRef, HeadDef)
+  * use hir_ty to inspect application head
+* ty_arg(TypeRef, Index, ArgTypeRef)
+  * expose type args only, ignore lifetimes and const generics
+* wrappers (ty_ref, ty_ptr, ty_tuple, ty_slice) map to HIR type constructors
+* ty_param exposes generic parameter defs
+* ty_prim for primitives
+* ty_unknown for unknown/error types
+* ty_normalize should be best-effort, returning input unchanged if normalization fails
+
+For node context:
+
+* node_at(Span) -> option<Node>
+  * must follow spec’s “smallest covering node” rule
+* node_kind, node_span, node_parent
+  * use syntax tree and stable pointers
+
+---
+
 ## Type inference upgrade: usability-first, still static
 
 Goal: agents and humans can write short one-off queries without `.decl` boilerplate and without fighting inference.
@@ -264,6 +1164,8 @@ must:
 
 * `impl Host for RaHost { … }`
 
+See §6 “raql-host-ra” for the required extern surface and rust-analyzer type mappings.
+
 ### 5) CLI + renderer crate: `raql_cli`
 
 **Responsibilities**
@@ -276,9 +1178,32 @@ must:
   * sort fragments by `(Section, Group, Rank desc, Seq asc, Kind)`
   * display spans using host/renderer expansion rules
 
+**CLI shape**
+
+Two viable options:
+
+1. Add a separate raql binary crate in this repo
+2. Expose a library API and keep a thin CLI wrapper
+
+Recommended flags:
+
+* --program path.raql
+* --include-dir ... (repeatable)
+* --max-iters N (maps to opt_max_iters)
+* --explain-types
+* --dump-ir (debug only)
+
 ---
 
 ## Milestones (ordered so you always have something runnable)
+
+These milestones align to the phase-typed pipeline:
+
+* parse -> Program<AstPhase>
+* resolve -> Program<ResolvedPhase>
+* typeck -> Program<TypedPhase>
+* plan -> Program<PlannedPhase> (engine can now accept programs)
+* engine features layered on top: negation, aggregates, choose_topk, witness_path, recursion guard, host adapter, CLI
 
 No time estimates, just build order and “definition of done.”
 
@@ -1182,6 +2107,31 @@ Implementation detail to bake in early:
 
 ## Acceptance tests: a matrix tied to your spec
 
+Also ensure per-crate coverage (in addition to the matrix below):
+
+* raql-syntax:
+  * golden parse tests from spec examples
+  * include cycle diagnostics
+* raql-compiler:
+  * schema inference
+  * type inference with none::<T> and []::<T>
+  * mode planning success/failure with explanation
+  * stratification and SCC rejection
+  * reserved predicate/schema checks (graph_edge/5, out_status/1)
+* raql-engine:
+  * fixpoint on transitive closure
+  * occurs check runtime behavior: X = some(X) fails goal
+  * aggregate projection-and-dedup semantics
+  * choose_topk determinism
+  * witness_path determinism and Seq correctness
+  * recursion guard partial semantics: no higher strata evaluated
+* raql-host-ra:
+  * small fixture project with deterministic stable keys
+  * type structure sanity (Result<_, E> matching example)
+  * node_at + enclosing control scenario
+
+Prefer expect-test or insta snapshots for diagnostics output.
+
 ### 1) Parser golden tests
 
 * All examples in §17 parse.
@@ -1365,4 +2315,3 @@ If you want, I can also produce (in the same “no interpretation gaps” style 
 
 * a **module-by-module Rust API sketch** (traits, structs, key methods), and
 * the **canonical `std.raql`** plus **three golden example views** as executable acceptance tests, exactly as you suggested.
-

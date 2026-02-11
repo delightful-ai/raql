@@ -1,0 +1,18 @@
+[package]
+name = "raql-syntax"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+raql-ir = { path = "../raql-ir" }
+
+text-size.workspace = true
+smol_str.workspace = true
+camino.workspace = true
+
+rustc-hash.workspace = true
+logos.workspace = true
+chumsky.workspace = true

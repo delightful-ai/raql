@@ -1,0 +1,18 @@
+[package]
+name = "raql-engine"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+raql-ir = { path = "../raql-ir" }
+raql-compiler = { path = "../raql-compiler" }
+raql-syntax = { path = "../raql-syntax" }
+raql-host = { path = "../raql-host" }
+
+indexmap.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true

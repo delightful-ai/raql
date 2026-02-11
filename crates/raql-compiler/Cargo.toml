@@ -1,0 +1,21 @@
+[package]
+name = "raql-compiler"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+raql-ir = { path = "../raql-ir" }
+raql-syntax = { path = "../raql-syntax" }
+
+rustc-hash.workspace = true
+smallvec.workspace = true
+fixedbitset.workspace = true
+index_vec.workspace = true
+bitflags.workspace = true
+miette.workspace = true
+thiserror.workspace = true
+petgraph.workspace = true
+camino.workspace = true

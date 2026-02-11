@@ -1,0 +1,87 @@
+.include "std.raql".
+
+% Demo selector: hard-coded function name so the view is executable today.
+.decl selected_target(T: Def).
+selected_target(T) :-
+  def_name(T, "extern_relation_rows_for_predicate"),
+  is_fn(T).
+
+.decl caller_site(Target: Def, CallerFn: Def, Site: Span, Dispatch: DispatchKind).
+caller_site(Target, CallerFn, Site, Dispatch) :-
+  selected_target(Target),
+  caller(Target, CallerFn, Site, Dispatch),
+  span_allowed(Site).
+
+.decl caller_count(Target: Def, CallerFn: Def, Sites: int).
+caller_count(Target, CallerFn, Sites) :-
+  selected_target(Target),
+  caller_site(Target, CallerFn, _, _),
+  Sites = count(S : caller_site(Target, CallerFn, S, _)).
+
+.decl top_caller(Target: Def, CallerFn: Def, Sites: int).
+top_caller(Target, CallerFn, Sites) :-
+  selected_target(Target),
+  choose_topk("view.callers.top_fn", 8, Target, Score, Item :
+    caller_count(Target, Item, Score)
+  ),
+  CallerFn = Item,
+  Sites = Score.
+
+.decl top_caller_site(Target: Def, CallerFn: Def, Site: Span, Seq: int, Dispatch: DispatchKind).
+top_caller_site(Target, CallerFn, Site, Seq, Dispatch) :-
+  top_caller(Target, CallerFn, _),
+  caller_site(Target, CallerFn, Site, Dispatch),
+  span_key(Site, _, L0, C0, _, _),
+  Seq := L0 * 1000 + C0.
+
+% Summary metrics
+emit_count("Summary", "callers_total", N) :-
+  selected_target(Target),
+  N = count(S : caller_site(Target, _, S, _)).
+
+emit_count("Summary", "caller_functions_total", N) :-
+  selected_target(Target),
+  N = count(Fn : caller_count(Target, Fn, _)).
+
+emit_count("Summary", "caller_functions_shown", N) :-
+  selected_target(Target),
+  N = count(Fn : top_caller(Target, Fn, _)).
+
+emit_count("Summary", "callers_direct", N) :-
+  selected_target(Target),
+  N = count(S : caller_site(Target, _, S, DispatchKind::DIRECT)).
+
+emit_count("Summary", "callers_through_trait", N) :-
+  selected_target(Target),
+  N = count(S : caller_site(Target, _, S, DispatchKind::THROUGH_TRAIT)).
+
+emit_count("Summary", "callers_dyn", N) :-
+  selected_target(Target),
+  N = count(S : caller_site(Target, _, S, DispatchKind::DYN)).
+
+% Target definition
+out_def_frag("Definition", "", 100, 0, "TARGET", RenderMode::DOC_SIG, T, none, none) :-
+  selected_target(T).
+
+% Caller groups: one DOC_SIG per caller function
+out_def_frag("Callers", Group, 80, 0, "CALLER_FN", RenderMode::DOC_SIG, CallerFn, none, none) :-
+  top_caller(_, CallerFn, _),
+  handle(CallerFn, Group).
+
+% Caller callsites: one BLOCK fragment per call site, anchored on site span
+out_span_frag("Callers", Group, 70, Seq, "CALLSITE", RenderMode::BLOCK, Site, some(Site), none) :-
+  top_caller_site(_, CallerFn, Site, Seq, _),
+  handle(CallerFn, Group).
+
+% Attach dispatch annotation payload that a renderer could print inline.
+out_frag_kv("Callers", Group, 70, Seq, "CALLSITE", FragTarget::SPAN, "dispatch", Disp) :-
+  top_caller_site(_, CallerFn, _, Seq, Dispatch),
+  handle(CallerFn, Group),
+  dispatch_str(Dispatch, Disp).
+
+% Explicit note when we truncated caller groups.
+out_note("Callers", "truncated caller groups to top 8 by callsite count") :-
+  selected_target(Target),
+  Total = count(Fn : caller_count(Target, Fn, _)),
+  Shown = count(Fn : top_caller(Target, Fn, _)),
+  Total > Shown.
