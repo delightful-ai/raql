@@ -23,6 +23,8 @@ vfs.workspace = true
 paths.workspace = true
 intern.workspace = true
 base-db.workspace = true
+load-cargo.workspace = true
+project-model.workspace = true
 
 # utilities
 line-index.workspace = true

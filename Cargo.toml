@@ -44,18 +44,20 @@ text-size                = "1.1.1"
 thiserror                = "1.0.64"
 line-index               = "0.1.2"
 
-# rust-analyzer crates (published ra_ap_* family)
-ide                      = { package = "ra_ap_ide", version = "0.0.319" }
-hir                      = { package = "ra_ap_hir", version = "0.0.319" }
-hir-def                  = { package = "ra_ap_hir_def", version = "0.0.319" }
-hir-expand               = { package = "ra_ap_hir_expand", version = "0.0.319" }
-hir-ty                   = { package = "ra_ap_hir_ty", version = "0.0.319" }
-syntax                   = { package = "ra_ap_syntax", version = "0.0.319" }
-span                     = { package = "ra_ap_span", version = "0.0.319" }
-vfs                      = { package = "ra_ap_vfs", version = "0.0.319" }
-paths                    = { package = "ra_ap_paths", version = "0.0.319" }
-intern                   = { package = "ra_ap_intern", version = "0.0.319" }
-base-db                  = { package = "ra_ap_base_db", version = "0.0.319" }
+# rust-analyzer crates (upstream main workspace)
+ide                      = { package = "ide", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+hir                      = { package = "hir", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+hir-def                  = { package = "hir-def", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+hir-expand               = { package = "hir-expand", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+hir-ty                   = { package = "hir-ty", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+syntax                   = { package = "syntax", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+span                     = { package = "span", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+vfs                      = { package = "vfs", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+paths                    = { package = "paths", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+intern                   = { package = "intern", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+base-db                  = { package = "base-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+load-cargo               = { package = "load-cargo", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+project-model            = { package = "project-model", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 
 [dependencies]
 clap.workspace = true

@@ -52,7 +52,7 @@ struct LangCheckArgs {
 struct LangRunArgs {
     #[command(flatten)]
     common: LangCommonArgs,
-    /// Optional Rust source file used to seed the RA host runtime.
+    /// Optional Rust workspace root or Cargo manifest used to initialize the RA host runtime.
     #[arg(long = "rust-file")]
     rust_file: Option<PathBuf>,
     /// Restrict output to one or more relation names.
@@ -104,13 +104,17 @@ fn run_lang_run(args: LangRunArgs) -> Result<(), String> {
 
     let result = if let Some(rust_file) = args.rust_file {
         let runtime_path = into_utf8_pathbuf(rust_file, "--rust-file")?;
-        let mut runtime =
-            RaHostRuntime::from_file_path(runtime_path.as_std_path()).map_err(|err| {
-                format!(
-                    "failed to initialize rust-analyzer runtime from `{}`: {err}",
-                    runtime_path
-                )
-            })?;
+        let mut runtime = if runtime_path.file_name() == Some("Cargo.toml") {
+            RaHostRuntime::from_manifest_path(runtime_path.as_std_path())
+        } else {
+            RaHostRuntime::from_workspace_root(runtime_path.as_std_path())
+        }
+        .map_err(|err| {
+            format!(
+                "failed to initialize rust-analyzer runtime from `{}`: {err}",
+                runtime_path
+            )
+        })?;
         execute(&planned, &mut runtime)
     } else {
         let mut runtime = MockHostRuntime::new();

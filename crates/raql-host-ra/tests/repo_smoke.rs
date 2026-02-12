@@ -30,21 +30,49 @@ fn temp_dir(label: &str) -> Utf8PathBuf {
     Utf8PathBuf::from_path_buf(dir).expect("utf8 temp path")
 }
 
+fn write_package(root: &Utf8PathBuf, name: &str, lib_src: &str) {
+    let cargo_toml = root.join("Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(src.as_std_path()).expect("create src");
+    fs::write(
+        cargo_toml.as_std_path(),
+        format!(
+            r#"
+[package]
+name = "{name}"
+version = "0.0.0"
+edition = "2021"
+"#
+        ),
+    )
+    .expect("write Cargo.toml");
+    fs::write(src.join("lib.rs").as_std_path(), lib_src).expect("write lib.rs");
+}
+
 #[test]
 fn executes_raql_against_this_repository_snapshot() {
-    let repo = repo_root();
-    let target = repo.join("crates/raql-host-ra/src/lib.rs");
-    assert!(target.is_file(), "expected repo file at {target}");
+    let root = temp_dir("snapshot_smoke");
+    write_package(
+        &root,
+        "snapshot_smoke",
+        r#"
+pub fn extern_relation_rows_for_predicate() {}
 
-    let mut runtime = RaHostRuntime::from_file_path(target.as_std_path()).expect("runtime");
+pub fn caller() {
+    extern_relation_rows_for_predicate();
+}
+"#,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     assert!(runtime.analysis_status_ok());
     let stamp = HostRuntime::world_stamp(&runtime)
         .expect("world stamp")
         .as_str()
         .to_string();
     assert!(
-        stamp.contains("crates/raql-host-ra/src/lib.rs"),
-        "world stamp should encode the repository file path: {stamp}"
+        stamp.starts_with("ra-workspace:"),
+        "world stamp should encode workspace snapshot identity: {stamp}"
     );
 
     let src = r#"
@@ -85,8 +113,18 @@ stamp(S) :- world_stamp(S), contains(S, "raql").
 #[test]
 fn executes_stdlib_include_against_repository_snapshot() {
     let repo = repo_root();
-    let target = repo.join("crates/raql-host-ra/src/lib.rs");
-    assert!(target.is_file(), "expected repo file at {target}");
+    let workspace_root = temp_dir("stdlib_workspace");
+    write_package(
+        &workspace_root,
+        "stdlib_workspace",
+        r#"
+pub fn extern_relation_rows_for_predicate() {}
+
+pub fn caller() {
+    extern_relation_rows_for_predicate();
+}
+"#,
+    );
 
     let query_dir = temp_dir("stdlib_include");
     let query_path = query_dir.join("query.raql");
@@ -114,7 +152,8 @@ has_edge() :- call_edge(_, _, _, _).
     let typed = typecheck(resolved).expect("typecheck");
     let planned = plan(typed).expect("plan");
 
-    let mut runtime = RaHostRuntime::from_file_path(target.as_std_path()).expect("runtime");
+    let mut runtime =
+        RaHostRuntime::from_workspace_root(workspace_root.as_std_path()).expect("runtime");
     let result = execute(&planned, &mut runtime);
 
     if result.status != EvalStatus::Ok {
@@ -137,27 +176,42 @@ has_edge() :- call_edge(_, _, _, _).
 }
 
 #[test]
-fn seeds_cross_file_call_edges_from_source_tree() {
+fn derives_cross_file_call_edges_from_workspace_semantics() {
     let root = temp_dir("cross_file_edges");
-    let a = root.join("a.rs");
-    let b = root.join("b.rs");
+    let cargo_toml = root.join("Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(src.as_std_path()).expect("create src");
+    let lib = src.join("lib.rs");
+    let b = src.join("b.rs");
 
     fs::write(
-        a.as_std_path(),
+        cargo_toml.as_std_path(),
         r#"
+[package]
+name = "cross_file_edges"
+version = "0.0.0"
+edition = "2021"
+"#,
+    )
+    .expect("write Cargo.toml");
+    fs::write(
+        lib.as_std_path(),
+        r#"
+mod b;
+
 fn caller() {
-    callee();
+    b::callee();
 }
 "#,
     )
-    .expect("write a.rs");
+    .expect("write lib.rs");
     fs::write(
         b.as_std_path(),
         r#"
 fn callee() {}
 "#,
     )
-    .expect("write b.rs");
+    .expect("write src/b.rs");
 
     let src = r#"
 .type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE }.
@@ -180,7 +234,7 @@ hit() :-
     let typed = typecheck(resolved).expect("typecheck");
     let planned = plan(typed).expect("plan");
 
-    let mut runtime = RaHostRuntime::from_file_path(a.as_std_path()).expect("runtime");
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     let result = execute(&planned, &mut runtime);
 
     if result.status != EvalStatus::Ok {
@@ -198,11 +252,24 @@ hit() :-
 }
 
 #[test]
-fn seeds_module_scoped_defs_and_edges_from_source_tree() {
+fn derives_module_scoped_defs_and_edges_from_workspace_semantics() {
     let root = temp_dir("module_scoped_edges");
-    let lib = root.join("lib.rs");
-    let foo = root.join("foo.rs");
+    let cargo_toml = root.join("Cargo.toml");
+    let src = root.join("src");
+    fs::create_dir_all(src.as_std_path()).expect("create src");
+    let lib = src.join("lib.rs");
+    let foo = src.join("foo.rs");
 
+    fs::write(
+        cargo_toml.as_std_path(),
+        r#"
+[package]
+name = "module_scoped_edges"
+version = "0.0.0"
+edition = "2021"
+"#,
+    )
+    .expect("write Cargo.toml");
     fs::write(
         lib.as_std_path(),
         r#"
@@ -220,7 +287,7 @@ fn caller() {
 pub fn callee() {}
 "#,
     )
-    .expect("write foo.rs");
+    .expect("write src/foo.rs");
 
     let src = r#"
 .type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE }.
@@ -241,10 +308,20 @@ has_module_path() :-
   def_name(D, "callee"),
   def_path(D, "crate::foo::callee").
 
+has_module_path() :-
+  def(D),
+  def_name(D, "callee"),
+  def_path(D, "crate::callee").
+
 has_module_edge() :-
   call_edge(Caller, Callee, _, _),
   def_path(Caller, "crate::caller"),
   def_path(Callee, "crate::foo::callee").
+
+has_module_edge() :-
+  call_edge(Caller, Callee, _, _),
+  def_path(Caller, "crate::caller"),
+  def_path(Callee, "crate::callee").
 "#;
 
     let parsed = parse_program(src).expect("parse");
@@ -252,7 +329,7 @@ has_module_edge() :-
     let typed = typecheck(resolved).expect("typecheck");
     let planned = plan(typed).expect("plan");
 
-    let mut runtime = RaHostRuntime::from_file_path(lib.as_std_path()).expect("runtime");
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     let result = execute(&planned, &mut runtime);
 
     if result.status != EvalStatus::Ok {

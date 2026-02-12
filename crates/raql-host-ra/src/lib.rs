@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::{fs, path::PathBuf};
 
 use hir_def::{DefWithBodyId, ImplId as HirImplId, ModuleDefId};
 use hir_expand::MacroCallId;
@@ -19,7 +18,8 @@ use span::{EditionedFileId, TextRange};
 use syntax::{AstNode, Edition, SourceFile, SyntaxNodePtr};
 use thiserror::Error;
 
-mod seeding;
+mod workspace_loader;
+mod workspace_snapshot;
 
 pub use raql_host::{
     CallId, DefId, ImplId, NodeId, RefId, RuntimeScalarOptions, ScalarInputKey, SpanCoord, SpanId,
@@ -123,6 +123,18 @@ pub enum RaHostError {
         end: u32,
         len: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RaHostInitError {
+    #[error("workspace manifest not found for `{input_path}`")]
+    WorkspaceNotFound { input_path: String },
+    #[error("failed to load workspace `{manifest}`: {details}")]
+    WorkspaceLoad { manifest: String, details: String },
+    #[error("failed to build semantic workspace snapshot: {details}")]
+    SemanticBuild { details: String },
+    #[error("proc-macro server unavailable during workspace load")]
+    ProcMacroUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1617,46 +1629,48 @@ impl DeterministicRaHost {
 pub struct RaHostRuntime {
     analysis: Analysis,
     host: DeterministicRaHost,
+    _proc_macro_client: Option<Box<dyn workspace_loader::ProcMacroClientHandle>>,
 }
 
 impl RaHostRuntime {
-    pub fn new(analysis: Analysis, world_stamp: impl Into<WorldStamp>) -> Self {
+    pub(crate) fn new(analysis: Analysis, world_stamp: impl Into<WorldStamp>) -> Self {
         let mut host = DeterministicRaHost::new();
         host.set_world_stamp(world_stamp);
-        Self { analysis, host }
+        Self {
+            analysis,
+            host,
+            _proc_macro_client: None,
+        }
     }
 
-    pub fn from_analysis_host(host: &AnalysisHost, world_stamp: impl Into<WorldStamp>) -> Self {
-        Self::new(host.analysis(), world_stamp)
+    pub fn from_workspace_root(root: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
+        let loaded = workspace_loader::load_from_workspace_root(root.as_ref())?;
+        Self::from_loaded_workspace(loaded)
     }
 
-    pub fn from_single_file(text: impl Into<String>) -> Self {
-        let text = text.into();
-        let (analysis, file_id) = Analysis::from_single_file(text.clone());
+    pub fn from_manifest_path(manifest: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
+        let loaded = workspace_loader::load_from_manifest_path(manifest.as_ref())?;
+        Self::from_loaded_workspace(loaded)
+    }
+
+    fn from_loaded_workspace(
+        loaded: workspace_loader::LoadedWorkspace,
+    ) -> Result<Self, RaHostInitError> {
+        let workspace_loader::LoadedWorkspace {
+            workspace_root,
+            db,
+            vfs,
+            proc_macro_client,
+        } = loaded;
+        let host = workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
         let world_stamp =
-            WorldStamp::new(format!("ra-single-file:{}:{}", file_id.index(), text.len()));
+            HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
+                details: err.to_string(),
+            })?;
+        let analysis = AnalysisHost::with_database(db).analysis();
         let mut runtime = Self::new(analysis, world_stamp);
-        seeding::seed_host_from_source(
-            runtime.host_mut(),
-            "<memory>",
-            text.as_str(),
-            EditionedFileId::current_edition(file_id),
-        );
-        runtime
-    }
-
-    pub fn from_file_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let canonical = canonical_utf8ish(path.as_ref());
-        let text = fs::read_to_string(path.as_ref())?;
-        let (analysis, file_id) = Analysis::from_single_file(text.clone());
-        let world_stamp = WorldStamp::new(format!(
-            "ra-file:{}:{}:{}",
-            canonical,
-            file_id.index(),
-            text.len()
-        ));
-        let mut runtime = Self::new(analysis, world_stamp);
-        seeding::seed_host_from_source_tree(runtime.host_mut(), path.as_ref(), text.as_str());
+        runtime.host = host;
+        runtime._proc_macro_client = Some(proc_macro_client);
         Ok(runtime)
     }
 
@@ -1904,11 +1918,6 @@ fn deterministic_span_key(span: SpanId) -> SpanKey {
         ((raw >> 32) as u32) & 0x7f
     };
     SpanKey::new(rel_path, SpanCoord::new(l0, c0), SpanCoord::new(l1, c1))
-}
-
-fn canonical_utf8ish(path: &Path) -> String {
-    let canonical: PathBuf = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    canonical.to_string_lossy().into_owned()
 }
 
 fn deterministic_stable_id(namespace: &str, logical_name: &str) -> StableId {
@@ -2408,12 +2417,22 @@ fn coord_leq(a: SpanCoord, b: SpanCoord) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     use super::{DeterministicRaHost, RaHostError, RaHostRuntime};
     use raql_engine::{EngineHostView, HostValueKind, RuntimeValue};
     use raql_host::{HostRuntime, RuntimeScalarOptions, ScalarInputKey, WorldStamp};
     use raql_ir::{ScalarValue, StableId};
     use span::{TextRange, TextSize};
+
+    fn repo_root() -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf()
+    }
 
     fn injected_lookup_error() -> RaHostError {
         RaHostError::InvalidSpanRange {
@@ -2512,20 +2531,20 @@ mod tests {
 
     #[test]
     fn ra_runtime_exposes_analysis_snapshot() {
-        let runtime = RaHostRuntime::from_single_file("fn main() {}\n");
+        let runtime = RaHostRuntime::from_workspace_root(repo_root()).expect("runtime");
         assert!(
             runtime
                 .world_stamp()
                 .expect("stamp")
                 .as_str()
-                .starts_with("ra-single-file:")
+                .starts_with("ra-workspace:")
         );
         assert!(runtime.analysis_status_ok());
     }
 
     #[test]
     fn span_registration_uses_ra_span_text_range() {
-        let mut runtime = RaHostRuntime::from_single_file("fn main() {\n  let x = 1;\n}\n");
+        let mut runtime = RaHostRuntime::from_workspace_root(repo_root()).expect("runtime");
         let file = span::EditionedFileId::current_edition(vfs::FileId::from_raw(0));
         let range = TextRange::new(TextSize::from(0), TextSize::from(9));
         let span = runtime
@@ -2735,7 +2754,7 @@ mod tests {
 
     #[test]
     fn scalar_options_and_inputs_are_reported() {
-        let mut runtime = RaHostRuntime::from_single_file("fn main() {}");
+        let mut runtime = RaHostRuntime::from_workspace_root(repo_root()).expect("runtime");
         runtime.set_runtime_scalar_options(
             RuntimeScalarOptions::new()
                 .with_path_limit(7)

@@ -5,21 +5,40 @@ use raql_host::{DefId, NodeId, SpanCoord, SpanId, SpanKey, TypeRefId};
 use raql_host_ra::{GenericArg, NodeKind, RaHostRuntime, TypeShape};
 use raql_ir::StableId;
 use raql_syntax::parse_program;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-fn repo_root() -> Utf8PathBuf {
-    let manifest_dir = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("raql workspace root")
-        .to_path_buf()
+fn temp_workspace_root(label: &str) -> Utf8PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "raql_host_ra_extern_dispatch_{label}_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"
+[package]
+name = "extern_dispatch_{stamp}"
+version = "0.0.0"
+edition = "2021"
+"#
+        ),
+    )
+    .expect("write Cargo.toml");
+    fs::write(root.join("src/lib.rs"), "pub fn fixture_seed() {}\n").expect("write lib.rs");
+    Utf8PathBuf::from_path_buf(root).expect("utf8 path")
 }
 
 #[test]
 fn engine_dispatches_required_ra_extern_predicates() {
-    let repo = repo_root();
-    let target = repo.join("crates/raql-host-ra/src/lib.rs");
-    let mut runtime = RaHostRuntime::from_file_path(target.as_std_path()).expect("runtime");
+    let root = temp_workspace_root("extern_rows");
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
 
     let tr = TypeRefId::new(StableId::new(0x100));
     let arg = TypeRefId::new(StableId::new(0x101));
@@ -99,9 +118,8 @@ node_row(RelPath, Kind) :-
 }
 
 fn seeded_runtime_for_enclosing_control() -> RaHostRuntime {
-    let repo = repo_root();
-    let target = repo.join("crates/raql-host-ra/src/lib.rs");
-    let mut runtime = RaHostRuntime::from_file_path(target.as_std_path()).expect("runtime");
+    let root = temp_workspace_root("enclosing_control");
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
 
     let query_span = SpanId::new(StableId::new(0x500));
     let expr_span = SpanId::new(StableId::new(0x501));
