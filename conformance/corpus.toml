@@ -1,0 +1,42 @@
+version = 1
+
+[[case]]
+name = "hashbrown-no-std"
+kind = "no_std"
+repo = "https://github.com/rust-lang/hashbrown.git"
+rev = "d84a5526b24518033e9563d4ab4bebb1c6ba6c3c"
+workspace = "."
+init_mode = "resilient"
+expected_symbol = "HashMap"
+expected_path = "crate::HashMap"
+
+[[case]]
+name = "serde-proc-macro-heavy"
+kind = "proc_macro_heavy"
+repo = "https://github.com/serde-rs/serde.git"
+rev = "5fd91333c7dc942a2f54539b17982f0c5bbc0790"
+workspace = "."
+init_mode = "resilient"
+expected_symbol = "Serialize"
+expected_path = "crate::ser::Serialize"
+
+[[case]]
+name = "rust-analyzer-monorepo"
+kind = "huge_monorepo"
+repo = "https://github.com/rust-lang/rust-analyzer.git"
+rev = "797b1f61e5531f2b67dc9b45dcc51a4e36e3c445"
+workspace = "."
+local_path = "tmp/rust-analyzer"
+init_mode = "resilient"
+expected_symbol = "RootDatabase"
+expected_path = "crate::RootDatabase"
+
+[[case]]
+name = "tokio-feature-matrix"
+kind = "feature_matrix"
+repo = "https://github.com/tokio-rs/tokio.git"
+rev = "9e7e1ef7ad30ad84f54a047ecd65b78e5973a9c4"
+workspace = "."
+init_mode = "resilient"
+expected_symbol = "Runtime"
+expected_path = "crate::runtime::Runtime"

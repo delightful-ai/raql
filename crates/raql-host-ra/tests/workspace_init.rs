@@ -2,10 +2,13 @@ use camino::Utf8PathBuf;
 use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::{EngineHostView, EvalResult, EvalStatus, RuntimeValue, execute};
 use raql_host::HostRuntime;
-use raql_host_ra::{RaHostInitError, RaHostRuntime};
+use raql_host_ra::{
+    RaHostInitError, RaHostRuntime, RuntimeScalarOptions, ScalarInputKey, ScalarValue, StableId,
+    WorkspaceInitMode,
+};
 use raql_syntax::parse_program;
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(label: &str) -> Utf8PathBuf {
     let stamp = SystemTime::now()
@@ -91,6 +94,39 @@ hit() :- def(D), def_name(D, "via_manifest").
 }
 
 #[test]
+fn resilient_init_falls_back_when_build_scripts_fail() {
+    let root = temp_dir("resilient_init_fallback");
+    write_package(
+        &root,
+        "resilient_init_fallback",
+        "pub fn available_without_build_scripts() {}\n",
+    );
+    fs::write(
+        root.join("build.rs").as_std_path(),
+        r#"
+fn main() {
+    panic!("intentional build script failure for resilient init test");
+}
+"#,
+    )
+    .expect("write failing build.rs");
+
+    let strict = RaHostRuntime::from_workspace_root_with_mode(
+        root.as_std_path(),
+        WorkspaceInitMode::Strict,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    if strict.is_err() {
+        let notes = EngineHostView::take_runtime_notes(&mut runtime);
+        assert!(
+            notes.iter().any(|note| note.contains("resilient mode")),
+            "resilient init should surface fallback note when strict init fails, got: {notes:?}"
+        );
+    }
+}
+
+#[test]
 fn workspace_init_uses_load_cargo_full_fidelity() {
     let root = temp_dir("full_fidelity");
     write_package(
@@ -167,6 +203,42 @@ fn world_stamp_changes_when_local_file_content_changes() {
 }
 
 #[test]
+fn world_stamp_changes_when_manifest_configuration_changes() {
+    let root = temp_dir("world_stamp_manifest_cfg");
+    write_package(
+        &root,
+        "world_stamp_manifest_cfg",
+        "pub fn answer() -> i32 { 1 }\n",
+    );
+
+    let runtime_a = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime a");
+    let stamp_a = HostRuntime::world_stamp(&runtime_a)
+        .expect("world stamp a")
+        .as_str()
+        .to_string();
+
+    let manifest = root.join("Cargo.toml");
+    let mut manifest_text =
+        fs::read_to_string(manifest.as_std_path()).expect("read Cargo.toml before update");
+    manifest_text.push_str(
+        r#"
+[features]
+default = []
+extra = []
+"#,
+    );
+    fs::write(manifest.as_std_path(), manifest_text).expect("rewrite Cargo.toml with features");
+
+    let runtime_b = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime b");
+    let stamp_b = HostRuntime::world_stamp(&runtime_b)
+        .expect("world stamp b")
+        .as_str()
+        .to_string();
+
+    assert_ne!(stamp_a, stamp_b);
+}
+
+#[test]
 fn world_stamp_is_stable_when_workspace_is_unchanged() {
     let root = temp_dir("world_stamp_stable");
     write_package(
@@ -188,6 +260,186 @@ fn world_stamp_is_stable_when_workspace_is_unchanged() {
         .to_string();
 
     assert_eq!(stamp_a, stamp_b);
+}
+
+#[test]
+fn runtime_reload_now_refreshes_snapshot_after_file_change() {
+    let root = temp_dir("runtime_reload_now");
+    write_package(
+        &root,
+        "runtime_reload_now",
+        "pub fn before_reload() {}\n",
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let stamp_before = HostRuntime::world_stamp(&runtime)
+        .expect("world stamp before")
+        .as_str()
+        .to_string();
+
+    let query = r#"
+.decl hit().
+.decl def(D: Def) extern.
+.decl def_name(D: Def, Name: string) extern.
+
+hit() :- def(D), def_name(D, "after_reload").
+"#;
+    let before = run_query(query, &mut runtime);
+    assert_eq!(before.status, EvalStatus::Ok);
+    assert!(
+        before
+            .relations
+            .get("hit")
+            .is_none_or(|rows| rows.is_empty()),
+        "before reload, after_reload should not be visible"
+    );
+
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(
+        root.join("src/lib.rs").as_std_path(),
+        "pub fn before_reload() {}\npub fn after_reload() {}\n",
+    )
+    .expect("rewrite lib.rs");
+    runtime.reload_now().expect("reload runtime snapshot");
+
+    let stamp_after = HostRuntime::world_stamp(&runtime)
+        .expect("world stamp after")
+        .as_str()
+        .to_string();
+    assert_ne!(stamp_before, stamp_after);
+
+    let after = run_query(query, &mut runtime);
+    assert_eq!(after.status, EvalStatus::Ok);
+    assert!(
+        after
+            .relations
+            .get("hit")
+            .is_some_and(|rows| !rows.is_empty()),
+        "after reload, new function should be visible"
+    );
+}
+
+#[test]
+fn runtime_auto_reload_refreshes_on_query_boundary() {
+    let root = temp_dir("runtime_auto_reload");
+    write_package(
+        &root,
+        "runtime_auto_reload",
+        "pub fn before_auto_reload() {}\n",
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    runtime.set_hot_reload_poll_interval(Duration::from_millis(0));
+    runtime.set_hot_reload_enabled(true);
+
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(
+        root.join("src/lib.rs").as_std_path(),
+        "pub fn before_auto_reload() {}\npub fn auto_reloaded() {}\n",
+    )
+    .expect("rewrite lib.rs");
+
+    let result = run_query(
+        r#"
+.decl hit().
+.decl def(D: Def) extern.
+.decl def_name(D: Def, Name: string) extern.
+
+hit() :- def(D), def_name(D, "auto_reloaded").
+"#,
+        &mut runtime,
+    );
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("hit")
+            .is_some_and(|rows| !rows.is_empty()),
+        "auto reload should refresh snapshot before query execution"
+    );
+}
+
+#[test]
+fn runtime_reload_preserves_runtime_scalar_configuration() {
+    let root = temp_dir("runtime_reload_preserves_cfg");
+    write_package(
+        &root,
+        "runtime_reload_preserves_cfg",
+        "pub fn preserved() {}\n",
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let options = RuntimeScalarOptions::default()
+        .with_path_limit(17)
+        .with_path_max_depth(9)
+        .with_max_iters(321);
+    runtime.set_runtime_scalar_options(options);
+    let scalar_key = ScalarInputKey::new(StableId::new(7), "engine.path.limit");
+    runtime.insert_scalar_input(scalar_key.clone(), ScalarValue::I64(42));
+    let override_id = StableId::new(0xfeed_face);
+    runtime.insert_stable_id_override("cfg", "engine.path.limit", override_id);
+
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(
+        root.join("src/lib.rs").as_std_path(),
+        "pub fn preserved() {}\npub fn changed() {}\n",
+    )
+    .expect("rewrite lib.rs");
+    runtime.reload_now().expect("reload runtime");
+
+    let observed_options = HostRuntime::runtime_scalar_options(&runtime).expect("options");
+    assert_eq!(observed_options.path_limit(), Some(17));
+    assert_eq!(observed_options.path_max_depth(), Some(9));
+    assert_eq!(observed_options.max_iters(), Some(321));
+    assert_eq!(
+        HostRuntime::scalar_input(&runtime, &scalar_key).expect("scalar input"),
+        Some(ScalarValue::I64(42))
+    );
+    assert_eq!(
+        HostRuntime::stable_id(&runtime, "cfg", "engine.path.limit").expect("stable id override"),
+        override_id
+    );
+}
+
+#[test]
+fn re_enabling_hot_reload_applies_changes_made_while_disabled() {
+    let root = temp_dir("runtime_hot_reload_toggle");
+    write_package(
+        &root,
+        "runtime_hot_reload_toggle",
+        "pub fn before_toggle() {}\n",
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    runtime.set_hot_reload_poll_interval(Duration::from_millis(0));
+    runtime.set_hot_reload_enabled(false);
+
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(
+        root.join("src/lib.rs").as_std_path(),
+        "pub fn before_toggle() {}\npub fn added_while_disabled() {}\n",
+    )
+    .expect("rewrite lib.rs");
+
+    runtime.set_hot_reload_enabled(true);
+    let result = run_query(
+        r#"
+.decl hit().
+.decl def(D: Def) extern.
+.decl def_name(D: Def, Name: string) extern.
+
+hit() :- def(D), def_name(D, "added_while_disabled").
+"#,
+        &mut runtime,
+    );
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("hit")
+            .is_some_and(|rows| !rows.is_empty()),
+        "re-enabled hot reload should apply edits made while it was disabled"
+    );
 }
 
 #[test]
@@ -249,7 +501,7 @@ pub fn caller() {
     let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     let result = run_query(
         r#"
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE }.
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
 .decl member_defs().
 .decl member_edge().
 .decl def(D: Def) extern.
@@ -281,6 +533,86 @@ member_edge() :-
         result
             .relations
             .get("member_edge")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}
+
+#[test]
+fn dependency_library_source_roots_are_included_in_snapshot() {
+    let dep_root = temp_dir("dep_library_source");
+    write_package(
+        &dep_root,
+        "dep_library_source",
+        r#"
+pub fn helper() {
+    deep();
+}
+
+fn deep() {}
+"#,
+    );
+
+    let root = temp_dir("dep_library_app");
+    fs::create_dir_all(root.join("src").as_std_path()).expect("create app src");
+    fs::write(
+        root.join("Cargo.toml").as_std_path(),
+        format!(
+            r#"
+[package]
+name = "dep_library_app"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+dep_library_source = {{ path = "{}" }}
+"#,
+            dep_root.as_std_path().display()
+        ),
+    )
+    .expect("write app Cargo.toml");
+    fs::write(
+        root.join("src/lib.rs").as_std_path(),
+        r#"
+pub fn caller() {
+    dep_library_source::helper();
+}
+"#,
+    )
+    .expect("write app lib.rs");
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let result = run_query(
+        r#"
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl def_name(D: Def, Name: string) extern.
+.decl app_to_dep().
+.decl dep_internal().
+
+app_to_dep() :-
+  call_edge(Caller, Callee, _, _),
+  def_name(Caller, "caller"),
+  def_name(Callee, "helper").
+
+dep_internal() :-
+  call_edge(Caller, Callee, _, _),
+  def_name(Caller, "helper"),
+  def_name(Callee, "deep").
+"#,
+        &mut runtime,
+    );
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("app_to_dep")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("dep_internal")
             .is_some_and(|rows| !rows.is_empty())
     );
 }
@@ -354,6 +686,237 @@ fn all_predicate_names_still_resolve() {
 }
 
 #[test]
+fn error_flow_predicates_are_semantically_populated() {
+    let root = temp_dir("error_flow_semantics");
+    write_package(
+        &root,
+        "error_flow_semantics",
+        r#"
+#[derive(Debug, PartialEq)]
+pub enum InnerErr {
+    Bad,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum OuterErr {
+    Wrapped(InnerErr),
+}
+
+impl From<InnerErr> for OuterErr {
+    fn from(value: InnerErr) -> Self {
+        OuterErr::Wrapped(value)
+    }
+}
+
+fn produce_inner(flag: bool) -> Result<(), InnerErr> {
+    if flag {
+        Ok(())
+    } else {
+        Err(InnerErr::Bad)
+    }
+}
+
+pub fn demo(flag: bool) -> Result<(), OuterErr> {
+    let mut tracked = OuterErr::Wrapped(InnerErr::Bad);
+    tracked = OuterErr::Wrapped(InnerErr::Bad);
+    let _is_same = tracked == OuterErr::Wrapped(InnerErr::Bad);
+
+    match &tracked {
+        OuterErr::Wrapped(_) => {}
+    }
+
+    produce_inner(flag)?;
+    Ok(())
+}
+
+pub async fn async_demo(flag: bool) -> Result<(), OuterErr> {
+    produce_inner(flag)?;
+    Ok(())
+}
+"#,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let result = run_query(
+        r#"
+.decl constructs(ErrType: Def, Variant: string, Site: Span, Fn: Def) extern.
+.decl propagates(ErrType: Def, Site: Span, Fn: Def) extern.
+.decl converts(Src: Def, Dst: Def, Site: Span, Fn: Def) extern.
+.decl handles(ErrType: Def, Variant: option<string>, Site: Span, Fn: Def) extern.
+.decl compares(Subject: Def, Site: Span, Op: string, Fn: Def) extern.
+.decl writes(Subject: Def, Site: Span, Fn: Def) extern.
+.decl def_name(D: Def, Name: string) extern.
+
+.decl has_construct().
+.decl has_unit_construct().
+.decl has_propagate().
+.decl has_async_propagate().
+.decl has_convert().
+.decl has_handle().
+.decl has_compare().
+.decl has_write().
+
+has_construct() :-
+  constructs(_, "Wrapped", _, Fn),
+  def_name(Fn, "demo").
+
+has_unit_construct() :-
+  constructs(_, "Bad", _, Fn),
+  def_name(Fn, "produce_inner").
+
+has_propagate() :-
+  propagates(_, _, Fn),
+  def_name(Fn, "demo").
+
+has_async_propagate() :-
+  propagates(_, _, Fn),
+  def_name(Fn, "async_demo").
+
+has_convert() :-
+  converts(Src, Dst, _, Fn),
+  def_name(Fn, "demo"),
+  Src != Dst.
+
+has_handle() :-
+  handles(_, _, _, Fn),
+  def_name(Fn, "demo").
+
+has_compare() :-
+  compares(_, _, "==", Fn),
+  def_name(Fn, "demo").
+
+has_write() :-
+  writes(_, _, Fn),
+  def_name(Fn, "demo").
+"#,
+        &mut runtime,
+    );
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("has_construct")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("has_unit_construct")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("has_propagate")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("has_async_propagate")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("has_convert")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("has_handle")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("has_compare")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("has_write")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}
+
+#[test]
+fn fn_error_type_and_ty_arg_handle_result_aliases_and_generics() {
+    let root = temp_dir("result_alias_generics");
+    write_package(
+        &root,
+        "result_alias_generics",
+        r#"
+#[derive(Debug)]
+pub struct Payload<T>(pub T);
+
+#[derive(Debug)]
+pub enum OuterErr {
+    Boom,
+}
+
+pub type AppResult<T> = Result<T, OuterErr>;
+pub type NestedErr = OuterErr;
+
+pub fn via_alias() -> AppResult<()> {
+    Err(OuterErr::Boom)
+}
+
+pub fn via_nested_alias() -> Result<Payload<u8>, NestedErr> {
+    Err(OuterErr::Boom)
+}
+
+pub fn direct_result() -> Result<(), OuterErr> {
+    Err(OuterErr::Boom)
+}
+"#,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let result = run_query(
+        r#"
+.decl def(D: Def) extern.
+.decl def_name(D: Def, Name: string) extern.
+.decl fn_error_type(Fn: Def, Err: option<Def>) extern.
+.decl fn_return_type(Fn: Def, Ret: TypeRef) extern.
+.decl ty_arg(T: TypeRef, Ix: int, Arg: TypeRef) extern.
+
+.decl direct_error_ok().
+.decl return_arg_ok().
+
+direct_error_ok() :-
+  def(F),
+  def_name(F, "direct_result"),
+  fn_error_type(F, some(_)).
+
+return_arg_ok() :-
+  def(F),
+  def_name(F, "via_nested_alias"),
+  fn_return_type(F, Ret),
+  ty_arg(Ret, 1, _).
+"#,
+        &mut runtime,
+    );
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("direct_error_ok")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("return_arg_ok")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}
+
+#[test]
 fn call_edge_cross_file_semantic_resolution() {
     let root = temp_dir("cross_file_semantics");
     write_package(
@@ -377,7 +940,7 @@ fn caller() {
 
     let result = run_query(
         r#"
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE }.
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
 .decl hit().
 .decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
 .decl def_name(D: Def, Name: string) extern.
@@ -395,6 +958,94 @@ hit() :-
         result
             .relations
             .get("hit")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}
+
+#[test]
+fn call_edge_classifies_semantic_callable_dispatch_kinds() {
+    let root = temp_dir("call_dispatch_semantics");
+    write_package(
+        &root,
+        "call_dispatch_semantics",
+        r#"
+fn target() {}
+
+fn direct_caller() {
+    target();
+}
+
+fn fn_pointer_caller() {
+    let fp: fn() = target;
+    fp();
+}
+
+fn closure_immediate_caller() {
+    (|| target())();
+}
+
+fn closure_binding_caller() {
+    let bound = || target();
+    bound();
+}
+"#,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let result = run_query(
+        r#"
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl def_name(D: Def, Name: string) extern.
+
+.decl direct_edge().
+.decl fn_pointer_edge().
+.decl closure_immediate_edge().
+.decl closure_bound_edge().
+
+direct_edge() :-
+  call_edge(Caller, Callee, _, DIRECT),
+  def_name(Caller, "direct_caller"),
+  def_name(Callee, "target").
+
+fn_pointer_edge() :-
+  call_edge(Caller, _, _, FN_POINTER),
+  def_name(Caller, "fn_pointer_caller").
+
+closure_immediate_edge() :-
+  call_edge(Caller, _, _, CLOSURE),
+  def_name(Caller, "closure_immediate_caller").
+
+closure_bound_edge() :-
+  call_edge(Caller, _, _, THROUGH_TRAIT),
+  def_name(Caller, "closure_binding_caller").
+"#,
+        &mut runtime,
+    );
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("direct_edge")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("fn_pointer_edge")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("closure_immediate_edge")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("closure_bound_edge")
             .is_some_and(|rows| !rows.is_empty())
     );
 }

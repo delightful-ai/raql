@@ -32,7 +32,7 @@
   MACRO, OTHER
 }.
 
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE }.
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
 .type RefKind      = { READ, WRITE, COMPARE, PASS, MOVE, FIELD }.
 .type Mutability   = { IMM, MUT }.
 .type NodeKind     = { IF, MATCH, WHILE, FOR, LOOP, BLOCK, TRY, ARM, OTHER }.

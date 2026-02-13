@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use hir_def::{DefWithBodyId, ImplId as HirImplId, ModuleDefId};
 use hir_expand::MacroCallId;
@@ -60,6 +61,7 @@ pub enum DispatchKind {
     ThroughTrait,
     Dyn,
     Closure,
+    FnPointer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +137,13 @@ pub enum RaHostInitError {
     SemanticBuild { details: String },
     #[error("proc-macro server unavailable during workspace load")]
     ProcMacroUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceInitMode {
+    Strict,
+    #[default]
+    Resilient,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +379,17 @@ impl DeterministicRaHost {
         span: SpanId,
         path: impl Into<Box<str>>,
     ) {
+        let (method_owner, return_type, error_type) = self
+            .def_records
+            .get(&def)
+            .map(|existing| {
+                (
+                    existing.method_owner,
+                    existing.return_type,
+                    existing.error_type,
+                )
+            })
+            .unwrap_or((None, None, None));
         self.def_records.insert(
             def,
             DefRecord {
@@ -377,9 +397,9 @@ impl DeterministicRaHost {
                 kind,
                 span,
                 path: path.into(),
-                method_owner: None,
-                return_type: None,
-                error_type: None,
+                method_owner,
+                return_type,
+                error_type,
             },
         );
     }
@@ -1371,6 +1391,10 @@ impl DeterministicRaHost {
                     rv_dispatch_kind(DispatchKind::Closure),
                     RuntimeValue::String("closure".to_string()),
                 ],
+                vec![
+                    rv_dispatch_kind(DispatchKind::FnPointer),
+                    RuntimeValue::String("fn_pointer".to_string()),
+                ],
             ]),
             "ty_app" => {
                 let mut rows = Vec::new();
@@ -1623,13 +1647,38 @@ impl DeterministicRaHost {
     }
 }
 
-/// rust-analyzer-backed runtime adapter that exposes a frozen `Analysis`
-/// snapshot while delegating host-contract behavior to [`DeterministicRaHost`].
+/// rust-analyzer-backed runtime adapter with optional workspace hot reload,
+/// delegating host-contract behavior to [`DeterministicRaHost`].
 #[derive(Debug)]
 pub struct RaHostRuntime {
     analysis: Analysis,
     host: DeterministicRaHost,
     _proc_macro_client: Option<Box<dyn workspace_loader::ProcMacroClientHandle>>,
+    workspace_root: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    init_mode: WorkspaceInitMode,
+    hot_reload: HotReloadState,
+}
+
+#[derive(Debug, Clone)]
+struct HotReloadState {
+    enabled: bool,
+    poll_interval: Duration,
+    next_poll_after: Instant,
+    workspace_fingerprint: Option<u64>,
+    tracked_paths: Vec<PathBuf>,
+}
+
+impl HotReloadState {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            poll_interval: Duration::from_millis(750),
+            next_poll_after: Instant::now(),
+            workspace_fingerprint: None,
+            tracked_paths: Vec::new(),
+        }
+    }
 }
 
 impl RaHostRuntime {
@@ -1640,28 +1689,51 @@ impl RaHostRuntime {
             analysis,
             host,
             _proc_macro_client: None,
+            workspace_root: None,
+            manifest_path: None,
+            init_mode: WorkspaceInitMode::Resilient,
+            hot_reload: HotReloadState::disabled(),
         }
     }
 
     pub fn from_workspace_root(root: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_workspace_root(root.as_ref())?;
-        Self::from_loaded_workspace(loaded)
+        Self::from_workspace_root_with_mode(root, WorkspaceInitMode::Resilient)
+    }
+
+    pub fn from_workspace_root_with_mode(
+        root: impl AsRef<Path>,
+        mode: WorkspaceInitMode,
+    ) -> Result<Self, RaHostInitError> {
+        let loaded = workspace_loader::load_from_workspace_root(root.as_ref(), mode)?;
+        Self::from_loaded_workspace(loaded, mode)
     }
 
     pub fn from_manifest_path(manifest: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_manifest_path(manifest.as_ref())?;
-        Self::from_loaded_workspace(loaded)
+        Self::from_manifest_path_with_mode(manifest, WorkspaceInitMode::Resilient)
+    }
+
+    pub fn from_manifest_path_with_mode(
+        manifest: impl AsRef<Path>,
+        mode: WorkspaceInitMode,
+    ) -> Result<Self, RaHostInitError> {
+        let loaded = workspace_loader::load_from_manifest_path(manifest.as_ref(), mode)?;
+        Self::from_loaded_workspace(loaded, mode)
     }
 
     fn from_loaded_workspace(
         loaded: workspace_loader::LoadedWorkspace,
+        mode: WorkspaceInitMode,
     ) -> Result<Self, RaHostInitError> {
         let workspace_loader::LoadedWorkspace {
+            manifest_path,
             workspace_root,
             db,
             vfs,
+            init_notes,
             proc_macro_client,
         } = loaded;
+        let tracked_paths =
+            collect_reload_tracked_paths(&vfs, manifest_path.as_path(), workspace_root.as_path());
         let host = workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
         let world_stamp =
             HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
@@ -1670,7 +1742,23 @@ impl RaHostRuntime {
         let analysis = AnalysisHost::with_database(db).analysis();
         let mut runtime = Self::new(analysis, world_stamp);
         runtime.host = host;
-        runtime._proc_macro_client = Some(proc_macro_client);
+        runtime._proc_macro_client = proc_macro_client;
+        runtime.workspace_root = Some(workspace_root.clone());
+        runtime.manifest_path = Some(manifest_path);
+        runtime.init_mode = mode;
+        runtime.hot_reload = HotReloadState {
+            enabled: true,
+            poll_interval: Duration::from_millis(750),
+            next_poll_after: Instant::now() + Duration::from_millis(750),
+            workspace_fingerprint: Some(workspace_reload_fingerprint(
+                workspace_root.as_path(),
+                tracked_paths.as_slice(),
+            )),
+            tracked_paths,
+        };
+        for note in init_notes {
+            runtime.host.record_runtime_note(note);
+        }
         Ok(runtime)
     }
 
@@ -1688,6 +1776,135 @@ impl RaHostRuntime {
 
     pub fn analysis_status_ok(&self) -> bool {
         self.analysis().status(None).is_ok()
+    }
+
+    pub fn set_hot_reload_enabled(&mut self, enabled: bool) {
+        self.hot_reload.enabled = enabled;
+        self.hot_reload.next_poll_after = Instant::now();
+        if enabled && self.hot_reload.workspace_fingerprint.is_none() {
+            self.hot_reload.workspace_fingerprint = self
+                .workspace_root
+                .as_ref()
+                .map(|root| {
+                    workspace_reload_fingerprint(
+                        root.as_path(),
+                        self.hot_reload.tracked_paths.as_slice(),
+                    )
+                });
+        }
+    }
+
+    pub fn set_hot_reload_poll_interval(&mut self, interval: Duration) {
+        self.hot_reload.poll_interval = interval;
+        self.hot_reload.next_poll_after = Instant::now() + interval;
+    }
+
+    pub fn reload_now(&mut self) -> Result<(), RaHostInitError> {
+        let loaded = self.load_workspace_for_reload()?;
+        self.apply_loaded_workspace(loaded)?;
+        self.hot_reload.next_poll_after = Instant::now() + self.hot_reload.poll_interval;
+        Ok(())
+    }
+
+    pub fn maybe_reload(&mut self) -> Result<bool, RaHostInitError> {
+        if !self.hot_reload.enabled {
+            return Ok(false);
+        }
+        if Instant::now() < self.hot_reload.next_poll_after {
+            return Ok(false);
+        }
+
+        self.hot_reload.next_poll_after = Instant::now() + self.hot_reload.poll_interval;
+        let Some(workspace_root) = self.workspace_root.as_ref() else {
+            return Ok(false);
+        };
+        let fingerprint = workspace_reload_fingerprint(
+            workspace_root.as_path(),
+            self.hot_reload.tracked_paths.as_slice(),
+        );
+        if self.hot_reload.workspace_fingerprint == Some(fingerprint) {
+            return Ok(false);
+        }
+
+        self.reload_now()?;
+        self.hot_reload.workspace_fingerprint = Some(fingerprint);
+        Ok(true)
+    }
+
+    fn load_workspace_for_reload(&self) -> Result<workspace_loader::LoadedWorkspace, RaHostInitError> {
+        if let Some(manifest_path) = self.manifest_path.as_ref() {
+            return workspace_loader::load_from_manifest_path(manifest_path.as_path(), self.init_mode);
+        }
+        if let Some(workspace_root) = self.workspace_root.as_ref() {
+            return workspace_loader::load_from_workspace_root(workspace_root.as_path(), self.init_mode);
+        }
+        Err(RaHostInitError::SemanticBuild {
+            details: "runtime reload unavailable without workspace initialization context".to_string(),
+        })
+    }
+
+    fn apply_loaded_workspace(
+        &mut self,
+        loaded: workspace_loader::LoadedWorkspace,
+    ) -> Result<(), RaHostInitError> {
+        let runtime_scalar_options = self.host.runtime_scalar_options;
+        let scalar_inputs = self.host.scalar_inputs.clone();
+        let stable_overrides = self.host.stable_overrides.clone();
+        let control_max_depth = self.host.control_max_depth;
+        let runtime_notes = self.host.runtime_notes.clone();
+
+        let workspace_loader::LoadedWorkspace {
+            manifest_path,
+            workspace_root,
+            db,
+            vfs,
+            init_notes,
+            proc_macro_client,
+        } = loaded;
+        let tracked_paths =
+            collect_reload_tracked_paths(&vfs, manifest_path.as_path(), workspace_root.as_path());
+
+        let mut host = workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
+        let _ = HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
+            details: err.to_string(),
+        })?;
+        host.runtime_scalar_options = runtime_scalar_options;
+        host.scalar_inputs = scalar_inputs;
+        host.stable_overrides = stable_overrides;
+        host.control_max_depth = control_max_depth;
+        host.runtime_notes = runtime_notes;
+        for note in init_notes {
+            host.record_runtime_note(note);
+        }
+
+        self.analysis = AnalysisHost::with_database(db).analysis();
+        self.host = host;
+        self._proc_macro_client = proc_macro_client;
+        self.workspace_root = Some(workspace_root.clone());
+        self.manifest_path = Some(manifest_path);
+        self.hot_reload.tracked_paths = tracked_paths;
+        self.hot_reload.workspace_fingerprint = if self.hot_reload.enabled {
+            Some(workspace_reload_fingerprint(
+                workspace_root.as_path(),
+                self.hot_reload.tracked_paths.as_slice(),
+            ))
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    fn auto_reload_if_needed(&mut self) {
+        match self.maybe_reload() {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(err) => {
+                self.hot_reload.enabled = false;
+                self.host_mut().record_runtime_note(format!(
+                    "workspace hot reload disabled after failure: {err}"
+                ));
+            }
+        }
     }
 
     pub fn insert_handle(&mut self, def: DefId, handle: impl Into<StableHandle>) {
@@ -1869,6 +2086,7 @@ impl EngineHostView for DeterministicRaHost {
 
 impl EngineHostView for RaHostRuntime {
     fn world_stamp(&mut self) -> String {
+        self.auto_reload_if_needed();
         match HostRuntime::world_stamp(self) {
             Ok(stamp) => stamp.as_str().to_string(),
             Err(err) => format!("ra-host:error:{err}"),
@@ -1876,6 +2094,7 @@ impl EngineHostView for RaHostRuntime {
     }
 
     fn stable_key(&mut self, value: &RuntimeValue) -> String {
+        self.auto_reload_if_needed();
         let resolution = runtime_value_stable_key_with_runtime(self, value);
         for note in resolution.runtime_notes {
             self.host_mut().record_runtime_note(note);
@@ -1895,6 +2114,7 @@ impl EngineHostView for RaHostRuntime {
         &mut self,
         predicate: &str,
     ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
+        self.auto_reload_if_needed();
         self.host_mut()
             .extern_relation_rows_for_predicate_result(predicate)
             .map_err(|error| {
@@ -1926,6 +2146,86 @@ fn deterministic_stable_id(namespace: &str, logical_name: &str) -> StableId {
     0xff_u8.hash(&mut hasher);
     logical_name.hash(&mut hasher);
     StableId::new(hasher.finish())
+}
+
+fn collect_reload_tracked_paths(
+    vfs: &vfs::Vfs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> Vec<PathBuf> {
+    let mut tracked = BTreeSet::new();
+
+    tracked.insert(manifest_path.to_path_buf());
+    tracked.insert(workspace_root.join("Cargo.lock"));
+    tracked.insert(workspace_root.join("rust-toolchain"));
+    tracked.insert(workspace_root.join("rust-toolchain.toml"));
+
+    for (_, path) in vfs.iter() {
+        let Some(abs) = path.as_path() else {
+            continue;
+        };
+        let as_path = Path::new(abs.as_str());
+        if !as_path.starts_with(workspace_root) || !should_track_reload_file(as_path) {
+            continue;
+        }
+        tracked.insert(as_path.to_path_buf());
+    }
+
+    tracked.into_iter().collect()
+}
+
+fn workspace_reload_fingerprint(workspace_root: &Path, tracked_paths: &[PathBuf]) -> u64 {
+    let mut hasher = FxHasher::default();
+    for path in tracked_paths {
+        hash_reload_path_metadata(&mut hasher, workspace_root, path.as_path());
+    }
+    tracked_paths.len().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn should_track_reload_file(path: &Path) -> bool {
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    if file_name.is_some_and(|name| {
+        matches!(
+            name,
+            "Cargo.toml" | "Cargo.lock" | "build.rs" | "rust-toolchain" | "rust-toolchain.toml"
+        )
+    }) {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "rs" | "toml"))
+}
+
+fn hash_reload_path_metadata(
+    hasher: &mut FxHasher,
+    workspace_root: &Path,
+    path: &Path,
+) {
+    let rel_path = path
+        .strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    rel_path.hash(hasher);
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            metadata.len().hash(hasher);
+            if let Ok(modified) = metadata.modified()
+                && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+            {
+                duration.as_secs().hash(hasher);
+                duration.subsec_nanos().hash(hasher);
+            }
+        }
+        Err(err) => {
+            "metadata_unavailable".hash(hasher);
+            err.kind().hash(hasher);
+        }
+    }
 }
 
 fn rv_def(def: DefId) -> RuntimeValue {
@@ -2079,6 +2379,7 @@ fn rv_dispatch_kind(dispatch: DispatchKind) -> RuntimeValue {
         DispatchKind::ThroughTrait => "THROUGH_TRAIT",
         DispatchKind::Dyn => "DYN",
         DispatchKind::Closure => "CLOSURE",
+        DispatchKind::FnPointer => "FN_POINTER",
     };
     RuntimeValue::Enum {
         name: "DispatchKind".to_string(),
@@ -2417,7 +2718,9 @@ fn coord_leq(a: SpanCoord, b: SpanCoord) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{DeterministicRaHost, RaHostError, RaHostRuntime};
     use raql_engine::{EngineHostView, HostValueKind, RuntimeValue};
@@ -2425,13 +2728,29 @@ mod tests {
     use raql_ir::{ScalarValue, StableId};
     use span::{TextRange, TextSize};
 
-    fn repo_root() -> PathBuf {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root")
-            .to_path_buf()
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_workspace(package_name: &str, lib_rs: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "raql-host-ra-lib-test-{package_name}-{}-{:#x}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create temp workspace src dir");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "{package_name}"
+version = "0.0.0"
+edition = "2021"
+"#
+            ),
+        )
+        .expect("write temp Cargo.toml");
+        fs::write(root.join("src/lib.rs"), lib_rs).expect("write temp src/lib.rs");
+        root
     }
 
     fn injected_lookup_error() -> RaHostError {
@@ -2531,7 +2850,8 @@ mod tests {
 
     #[test]
     fn ra_runtime_exposes_analysis_snapshot() {
-        let runtime = RaHostRuntime::from_workspace_root(repo_root()).expect("runtime");
+        let root = temp_workspace("runtime_snapshot", "pub fn marker() -> i32 { 1 }\n");
+        let runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
         assert!(
             runtime
                 .world_stamp()
@@ -2544,7 +2864,8 @@ mod tests {
 
     #[test]
     fn span_registration_uses_ra_span_text_range() {
-        let mut runtime = RaHostRuntime::from_workspace_root(repo_root()).expect("runtime");
+        let root = temp_workspace("span_registration", "pub fn marker() {}\n");
+        let mut runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
         let file = span::EditionedFileId::current_edition(vfs::FileId::from_raw(0));
         let range = TextRange::new(TextSize::from(0), TextSize::from(9));
         let span = runtime
@@ -2754,7 +3075,8 @@ mod tests {
 
     #[test]
     fn scalar_options_and_inputs_are_reported() {
-        let mut runtime = RaHostRuntime::from_workspace_root(repo_root()).expect("runtime");
+        let root = temp_workspace("scalar_options", "pub fn marker() {}\n");
+        let mut runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
         runtime.set_runtime_scalar_options(
             RuntimeScalarOptions::new()
                 .with_path_limit(7)

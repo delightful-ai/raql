@@ -214,7 +214,7 @@ fn callee() {}
     .expect("write src/b.rs");
 
     let src = r#"
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE }.
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
 .decl def(D: Def) extern.
 .mode def(-Def).
 .decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
@@ -290,7 +290,7 @@ pub fn callee() {}
     .expect("write src/foo.rs");
 
     let src = r#"
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE }.
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
 .decl def(D: Def) extern.
 .mode def(-Def).
 .decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.

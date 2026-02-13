@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::process::Command;
 
 use base_db::{EditionedFileId, SourceDatabase};
 use hir::{
@@ -15,8 +16,8 @@ use syntax::{AstNode, Edition, SourceFile, SyntaxNode};
 use vfs::FileId;
 
 use crate::{
-    DefId, DefKind, DeterministicRaHost, DispatchKind, Mutability, NodeKind, RaHostInitError,
-    TypeRefId, TypeShape, WorldStamp,
+    DefId, DefKind, DeterministicRaHost, DispatchKind, GenericArg, Mutability, NodeKind,
+    RaHostInitError, TypeRefId, TypeShape, WorldStamp,
 };
 
 #[derive(Debug, Clone)]
@@ -40,9 +41,14 @@ pub(crate) fn build_host_snapshot(
 ) -> Result<DeterministicRaHost, RaHostInitError> {
     let sema = Semantics::new(db);
     let files = collect_local_files(db, vfs, workspace_root, &sema)?;
+    let semantic_identity = compute_semantic_identity(db, workspace_root);
 
     let mut host = DeterministicRaHost::new();
-    host.set_world_stamp(compute_world_stamp(workspace_root, &files));
+    host.set_world_stamp(compute_world_stamp(
+        workspace_root,
+        &files,
+        semantic_identity.as_str(),
+    ));
 
     let mut builder = SnapshotBuilder {
         db,
@@ -243,10 +249,21 @@ impl<'db> SnapshotBuilder<'db> {
     }
 
     fn process_function(&mut self, function: Function, function_def: DefId) {
-        let ret = function.ret_type(self.db);
-        let ret_ref = self.intern_type_ref(ret.clone(), Some(function_def));
+        let ret_ref = self
+            .safe_function_ret_type(function)
+            .map(|ret| self.intern_type_ref(ret, Some(function_def)))
+            .unwrap_or_else(|| {
+                self.unknown_type_ref(
+                    format!(
+                        "fn_ret_ty:{}",
+                        format!("{:#018x}", function_def.stable_id().as_u64())
+                    )
+                    .as_str(),
+                )
+            });
         self.host.set_fn_return_type(function_def, Some(ret_ref));
-        if let Some(error_def) = self.best_effort_result_error_def(function, ret) {
+        self.host.set_fn_error_type(function_def, None);
+        if let Some(error_def) = self.function_error_def_for_function(function) {
             self.host.set_fn_error_type(function_def, Some(error_def));
         }
     }
@@ -420,10 +437,13 @@ impl<'db> SnapshotBuilder<'db> {
         self.def_path_by_id.insert(impl_record, impl_path);
         self.host.mark_in_test(impl_record, in_test);
 
-        let self_ty = impl_def.self_ty(self.db);
-        let self_ty_def = self.def_from_type_head(self_ty, Some(impl_record));
+        let self_ty_def = self
+            .safe_impl_self_ty(impl_def)
+            .map(|self_ty| self.def_from_type_head(self_ty, Some(impl_record)));
 
-        if let Some(trait_def_hir) = impl_def.trait_(self.db) {
+        if let (Some(self_ty_def), Some(trait_def_hir)) =
+            (self_ty_def, self.safe_impl_trait(impl_def))
+        {
             if let Some(trait_def) =
                 self.register_module_def(ModuleDef::Trait(trait_def_hir), in_test)
             {
@@ -433,12 +453,8 @@ impl<'db> SnapshotBuilder<'db> {
                     .to_string()
                     == "From"
                 {
-                    impl_def
-                        .trait_ref(self.db)
-                        .and_then(|trait_ref| trait_ref.get_type_argument(1))
-                        .map(|src_ty| {
-                            self.def_from_type_head(src_ty.to_type(self.db), Some(impl_record))
-                        })
+                    self.safe_impl_trait_type_argument(impl_def, 1)
+                        .map(|src_ty| self.def_from_type_head(src_ty, Some(impl_record)))
                 } else {
                     None
                 };
@@ -451,7 +467,7 @@ impl<'db> SnapshotBuilder<'db> {
             }
         }
 
-        for assoc in impl_def.items(self.db) {
+        for assoc in self.safe_impl_items(impl_def) {
             match assoc {
                 AssocItem::Function(function) => {
                     let Some(method_def) =
@@ -460,7 +476,9 @@ impl<'db> SnapshotBuilder<'db> {
                         continue;
                     };
                     self.process_function(function, method_def);
-                    self.host.insert_method(self_ty_def, method_def);
+                    if let Some(self_ty_def) = self_ty_def {
+                        self.host.insert_method(self_ty_def, method_def);
+                    }
                 }
                 AssocItem::Const(const_) => {
                     let _ = self.register_module_def(ModuleDef::Const(const_), in_test);
@@ -548,6 +566,7 @@ impl<'db> SnapshotBuilder<'db> {
             let source = self.sema.parse(editioned);
             self.extract_nodes_for_file(file_id, &source);
             self.extract_calls_for_file(file_id, &source);
+            self.extract_error_flow_for_file(file_id, &source);
         }
     }
 
@@ -615,19 +634,17 @@ impl<'db> SnapshotBuilder<'db> {
             };
 
             let (callee, dispatch) = if let Some(expr) = call.expr() {
-                if let Some(callee) = self.resolve_call_expr_target(&expr) {
-                    (callee, DispatchKind::Direct)
-                } else if matches!(expr, ast::Expr::ClosureExpr(_)) {
-                    (
-                        self.synthetic_def("callable_closure", call.syntax().text_range()),
-                        DispatchKind::Closure,
-                    )
-                } else {
-                    (
-                        self.synthetic_def("callable_dyn", call.syntax().text_range()),
-                        DispatchKind::Dyn,
-                    )
-                }
+                self.resolve_call_expr_target(&expr)
+                    .unwrap_or_else(|| match expr {
+                        ast::Expr::ClosureExpr(_) => (
+                            self.synthetic_def("callable_closure", call.syntax().text_range()),
+                            DispatchKind::Closure,
+                        ),
+                        _ => (
+                            self.synthetic_def("callable_dyn", call.syntax().text_range()),
+                            DispatchKind::Dyn,
+                        ),
+                    })
             } else {
                 (
                     self.synthetic_def("callable_dyn", call.syntax().text_range()),
@@ -682,11 +699,463 @@ impl<'db> SnapshotBuilder<'db> {
         }
     }
 
-    fn resolve_call_expr_target(&self, expr: &ast::Expr) -> Option<DefId> {
+    fn extract_error_flow_for_file(&mut self, file_id: FileId, source: &SourceFile) {
+        let Some(local) = self.files.get(&file_id).cloned() else {
+            return;
+        };
+
+        for call in source
+            .syntax()
+            .descendants()
+            .filter_map(ast::CallExpr::cast)
+        {
+            let Some((_, caller_def, Some(function_error))) =
+                self.function_context_for_node(call.syntax())
+            else {
+                continue;
+            };
+            let Some(expr) = call.expr() else {
+                continue;
+            };
+            let Some(callable) = self.sema.resolve_expr_as_callable(&expr) else {
+                continue;
+            };
+            let CallableKind::TupleEnumVariant(variant) = callable.kind() else {
+                continue;
+            };
+            let error_enum = self.register_error_enum_def(variant.parent_enum(self.db));
+            if error_enum != function_error {
+                continue;
+            }
+            let Some(site) = self.span_for_range(&local, call.syntax().text_range()) else {
+                continue;
+            };
+            let variant_name = variant
+                .name(self.db)
+                .display(self.db, Edition::CURRENT)
+                .to_string();
+            self.host
+                .insert_construct(function_error, variant_name.as_str(), site, caller_def);
+        }
+
+        for record in source
+            .syntax()
+            .descendants()
+            .filter_map(ast::RecordExpr::cast)
+        {
+            let record_range = record.syntax().text_range();
+            let Some((_, caller_def, Some(function_error))) =
+                self.function_context_for_node(record.syntax())
+            else {
+                continue;
+            };
+            let Some(hir::VariantDef::Variant(variant)) = self.sema.resolve_variant(record) else {
+                continue;
+            };
+            let error_enum = self.register_error_enum_def(variant.parent_enum(self.db));
+            if error_enum != function_error {
+                continue;
+            }
+            let Some(site) = self.span_for_range(&local, record_range) else {
+                continue;
+            };
+            let variant_name = variant
+                .name(self.db)
+                .display(self.db, Edition::CURRENT)
+                .to_string();
+            self.host
+                .insert_construct(function_error, variant_name.as_str(), site, caller_def);
+        }
+
+        for path_expr in source
+            .syntax()
+            .descendants()
+            .filter_map(ast::PathExpr::cast)
+        {
+            let Some((_, caller_def, Some(function_error))) =
+                self.function_context_for_node(path_expr.syntax())
+            else {
+                continue;
+            };
+            let Some(path) = path_expr.path() else {
+                continue;
+            };
+            let Some(hir::PathResolution::Def(ModuleDef::Variant(variant))) =
+                self.sema.resolve_path(&path)
+            else {
+                continue;
+            };
+            if !matches!(variant.kind(self.db), hir::StructKind::Unit) {
+                continue;
+            }
+            let error_enum = self.register_error_enum_def(variant.parent_enum(self.db));
+            if error_enum != function_error {
+                continue;
+            }
+            let Some(site) = self.span_for_range(&local, path_expr.syntax().text_range()) else {
+                continue;
+            };
+            let variant_name = variant
+                .name(self.db)
+                .display(self.db, Edition::CURRENT)
+                .to_string();
+            self.host
+                .insert_construct(function_error, variant_name.as_str(), site, caller_def);
+        }
+
+        for try_expr in source.syntax().descendants().filter_map(ast::TryExpr::cast) {
+            let Some(question_mark) = try_expr.question_mark_token() else {
+                continue;
+            };
+            let Some((caller_hir, caller_def, Some(function_error))) =
+                self.function_context_for_node(try_expr.syntax())
+            else {
+                continue;
+            };
+            let Some(site) = self.span_for_range(&local, question_mark.text_range()) else {
+                continue;
+            };
+            self.host.insert_propagate(function_error, site, caller_def);
+
+            let Some(operand) = try_expr.expr() else {
+                continue;
+            };
+            let Some(operand_type) = self.sema.type_of_expr(&operand).map(|info| info.adjusted())
+            else {
+                continue;
+            };
+            let Some(source_error) = self.best_effort_result_error_def(caller_hir, operand_type)
+            else {
+                continue;
+            };
+            if source_error != function_error {
+                self.host
+                    .insert_convert(source_error, function_error, site, caller_def);
+            }
+        }
+
+        for arm in source
+            .syntax()
+            .descendants()
+            .filter_map(ast::MatchArm::cast)
+        {
+            let Some((_, caller_def, Some(function_error))) =
+                self.function_context_for_node(arm.syntax())
+            else {
+                continue;
+            };
+            let Some(pat) = arm.pat() else {
+                continue;
+            };
+
+            for path in pat.syntax().descendants().filter_map(ast::Path::cast) {
+                let Some(hir::PathResolution::Def(ModuleDef::Variant(variant))) =
+                    self.sema.resolve_path(&path)
+                else {
+                    continue;
+                };
+                let error_enum = self.register_error_enum_def(variant.parent_enum(self.db));
+                if error_enum != function_error {
+                    continue;
+                }
+                let Some(site) = self.span_for_range(&local, arm.syntax().text_range()) else {
+                    continue;
+                };
+                let variant_name = variant
+                    .name(self.db)
+                    .display(self.db, Edition::CURRENT)
+                    .to_string();
+                self.host.insert_handle_error(
+                    function_error,
+                    Some(variant_name.into()),
+                    site,
+                    caller_def,
+                );
+                break;
+            }
+        }
+
+        for bin in source.syntax().descendants().filter_map(ast::BinExpr::cast) {
+            let Some((caller_hir, caller_def, Some(function_error))) =
+                self.function_context_for_node(bin.syntax())
+            else {
+                continue;
+            };
+            let Some(op) = bin.op_kind() else {
+                continue;
+            };
+            let Some(site) = self.span_for_range(&local, bin.syntax().text_range()) else {
+                continue;
+            };
+
+            match op {
+                ast::BinaryOp::CmpOp(cmp) => {
+                    let lhs_matches = bin.lhs().is_some_and(|lhs| {
+                        self.matches_function_error_type(&lhs, caller_hir, function_error)
+                    });
+                    let rhs_matches = bin.rhs().is_some_and(|rhs| {
+                        self.matches_function_error_type(&rhs, caller_hir, function_error)
+                    });
+                    if lhs_matches || rhs_matches {
+                        self.host
+                            .insert_compare(function_error, site, cmp.to_string(), caller_def);
+                    }
+                }
+                ast::BinaryOp::Assignment { .. } => {
+                    let Some(lhs) = bin.lhs() else {
+                        continue;
+                    };
+                    if self.matches_function_error_type(&lhs, caller_hir, function_error) {
+                        self.host.insert_write(function_error, site, caller_def);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn function_context_for_node(
+        &mut self,
+        node: &SyntaxNode,
+    ) -> Option<(Function, DefId, Option<DefId>)> {
+        let caller_fn = enclosing_fn(node)?;
+        let caller_hir = self.sema.to_fn_def(&caller_fn)?;
+        let caller_def = self.register_module_def(ModuleDef::Function(caller_hir), false)?;
+        let function_error = self.function_error_def_for_function(caller_hir);
+        Some((caller_hir, caller_def, function_error))
+    }
+
+    fn span_for_range(&mut self, local: &LocalFile, range: TextRange) -> Option<crate::SpanId> {
+        self.host
+            .intern_span_from_text(
+                local.editioned_file_id.editioned_file_id(self.db),
+                local.rel_path.as_str(),
+                local.text.as_str(),
+                range,
+            )
+            .ok()
+    }
+
+    fn register_error_enum_def(&mut self, enum_def: hir::Enum) -> DefId {
+        self.register_module_def(ModuleDef::Adt(Adt::Enum(enum_def)), false)
+            .unwrap_or_else(|| {
+                let module_def = ModuleDef::Adt(Adt::Enum(enum_def));
+                let path = module_def
+                    .canonical_path(self.db, Edition::CURRENT)
+                    .map(normalize_canonical_path)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "crate::{}",
+                            enum_def.name(self.db).display(self.db, Edition::CURRENT)
+                        )
+                    });
+                self.host
+                    .intern_def_from_token(format!("error_enum:{path}").as_str())
+            })
+    }
+
+    fn function_error_def_for_function(&mut self, function: Function) -> Option<DefId> {
+        self.safe_function_ret_type(function)
+            .and_then(|direct| self.best_effort_result_error_def(function, direct))
+            .or_else(|| {
+                self.safe_function_async_ret_type(function)
+                    .and_then(|ret| self.best_effort_result_error_def(function, ret))
+            })
+            .or_else(|| {
+                let source = function.source(self.db)?;
+                let ret_text = source.value.ret_type()?.syntax().text().to_string();
+                if ret_text.contains("Result") {
+                    return Some(
+                        self.host.intern_def_from_token(
+                            format!("result_error_text:{ret_text}").as_str(),
+                        ),
+                    );
+                }
+                None
+            })
+    }
+
+    fn result_error_type_argument(&self, ty: Type<'db>) -> Option<Type<'db>> {
+        let stripped = ty.strip_references();
+        let adt = stripped.as_adt()?;
+        if !self.is_result_head(adt) {
+            return None;
+        }
+        self.safe_nth_type_argument(&stripped, 1)
+    }
+
+    fn is_result_head(&self, adt: Adt) -> bool {
+        let module_def = ModuleDef::Adt(adt);
+        if let Some(path) = module_def.canonical_path(self.db, Edition::CURRENT) {
+            return path.ends_with("::Result");
+        }
+        adt.name(self.db)
+            .display(self.db, Edition::CURRENT)
+            .to_string()
+            == "Result"
+    }
+
+    fn synthetic_type_head_from_module_def(
+        &mut self,
+        def: ModuleDef,
+        owner: Option<DefId>,
+        label: &str,
+    ) -> DefId {
+        let owner_key = owner
+            .map(|d| format!("{:#018x}", d.stable_id().as_u64()))
+            .unwrap_or_else(|| "none".to_string());
+        let path = def
+            .canonical_path(self.db, Edition::CURRENT)
+            .or_else(|| {
+                def.name(self.db)
+                    .map(|name| format!("crate::{}", name.display(self.db, Edition::CURRENT)))
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        self.host
+            .intern_def_from_token(format!("{label}:{path}:{owner_key}").as_str())
+    }
+
+    fn safe_type_arguments(&self, ty: &Type<'db>) -> Vec<Type<'db>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ty.type_arguments().collect::<Vec<_>>()
+        }))
+        .unwrap_or_default()
+    }
+
+    fn safe_function_ret_type(&self, function: Function) -> Option<Type<'db>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| function.ret_type(self.db))).ok()
+    }
+
+    fn safe_function_async_ret_type(&self, function: Function) -> Option<Type<'db>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            function.async_ret_type(self.db)
+        }))
+        .ok()
+        .flatten()
+    }
+
+    fn safe_impl_self_ty(&self, impl_def: Impl) -> Option<Type<'db>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| impl_def.self_ty(self.db))).ok()
+    }
+
+    fn safe_impl_trait(&self, impl_def: Impl) -> Option<hir::Trait> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| impl_def.trait_(self.db)))
+            .ok()
+            .flatten()
+    }
+
+    fn safe_impl_trait_type_argument(&self, impl_def: Impl, index: usize) -> Option<Type<'db>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            impl_def
+                .trait_ref(self.db)
+                .and_then(|trait_ref| trait_ref.get_type_argument(index))
+                .map(|arg| arg.to_type(self.db))
+        }))
+        .ok()
+        .flatten()
+    }
+
+    fn safe_impl_items(&self, impl_def: Impl) -> Vec<AssocItem> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| impl_def.items(self.db)))
+            .unwrap_or_default()
+    }
+
+    fn safe_nth_type_argument(&self, ty: &Type<'db>, index: usize) -> Option<Type<'db>> {
+        self.safe_type_arguments(ty).into_iter().nth(index)
+    }
+
+    fn safe_type_and_const_arguments(&self, function: Function, ty: &Type<'db>) -> Vec<String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ty.type_and_const_arguments(self.db, function.krate(self.db).to_display_target(self.db))
+                .map(|arg| arg.to_string())
+                .collect::<Vec<_>>()
+        }))
+        .unwrap_or_default()
+    }
+
+    fn return_type_from_semantic_source(&self, function: Function) -> Option<ast::Type> {
+        let source = function.source(self.db)?;
+        let editioned = source.file_id.original_file(self.db);
+        let parsed = self.sema.parse(editioned);
+        let fn_range = source.value.syntax().text_range();
+        parsed
+            .syntax()
+            .descendants()
+            .filter_map(ast::Fn::cast)
+            .find(|item| item.syntax().text_range() == fn_range)
+            .and_then(|item| item.ret_type())
+            .and_then(|ret| ret.ty())
+    }
+
+    fn error_def_from_return_type_alias_paths(&mut self, ret_type: &ast::Type) -> Option<DefId> {
+        for path in ret_type.syntax().descendants().filter_map(ast::Path::cast) {
+            let Some(hir::PathResolution::Def(ModuleDef::TypeAlias(alias))) =
+                self.sema.resolve_path(&path)
+            else {
+                continue;
+            };
+            let alias_ty = alias.ty(self.db);
+            if let Some(error_ty) = self.result_error_type_argument(alias_ty.clone()) {
+                return Some(self.def_from_type_head(error_ty, None));
+            }
+            if alias_ty.as_adt().is_some() || alias_ty.as_dyn_trait().is_some() {
+                return Some(self.def_from_type_head(alias_ty, None));
+            }
+        }
+        None
+    }
+
+    fn matches_function_error_type(
+        &mut self,
+        expr: &ast::Expr,
+        function: Function,
+        function_error: DefId,
+    ) -> bool {
+        let Some(type_info) = self.sema.type_of_expr(expr) else {
+            return false;
+        };
+        if self.matches_error_type(type_info.original, function, function_error) {
+            return true;
+        }
+        type_info
+            .adjusted
+            .is_some_and(|adjusted| self.matches_error_type(adjusted, function, function_error))
+    }
+
+    fn matches_error_type(
+        &mut self,
+        ty: Type<'db>,
+        function: Function,
+        function_error: DefId,
+    ) -> bool {
+        if let Some(err) = self.best_effort_result_error_def(function, ty.clone()) {
+            return err == function_error;
+        }
+
+        if let Some((inner, _)) = ty.as_reference() {
+            return self.matches_error_type(inner, function, function_error);
+        }
+        if ty.is_raw_ptr()
+            && let Some(inner) = ty.remove_raw_ptr()
+        {
+            return self.matches_error_type(inner, function, function_error);
+        }
+
+        self.def_from_type_head(ty, None) == function_error
+    }
+
+    fn resolve_call_expr_target(&mut self, expr: &ast::Expr) -> Option<(DefId, DispatchKind)> {
+        if let Some(callable) = self.sema.resolve_expr_as_callable(expr) {
+            return Some(
+                self.resolve_callable_kind_target(callable.kind(), expr.syntax().text_range()),
+            );
+        }
+
         match expr {
             ast::Expr::PathExpr(path_expr) => {
                 let path = path_expr.path()?;
                 self.resolve_def_from_call_path(&path)
+                    .map(|callee| (callee, DispatchKind::Direct))
             }
             _ => None,
         }
@@ -707,7 +1176,6 @@ impl<'db> SnapshotBuilder<'db> {
         method_call: &ast::MethodCallExpr,
     ) -> Option<(DefId, DispatchKind)> {
         let resolved = self.sema.resolve_method_call(method_call)?;
-
         let callee = self
             .register_module_def(ModuleDef::Function(resolved), false)
             .unwrap_or_else(|| {
@@ -720,14 +1188,49 @@ impl<'db> SnapshotBuilder<'db> {
             .map(|kind| match kind {
                 CallableKind::FnImpl(_) => DispatchKind::ThroughTrait,
                 CallableKind::Closure(_) => DispatchKind::Closure,
+                CallableKind::FnPtr => DispatchKind::FnPointer,
                 CallableKind::Function(_)
                 | CallableKind::TupleStruct(_)
-                | CallableKind::TupleEnumVariant(_)
-                | CallableKind::FnPtr => DispatchKind::Direct,
+                | CallableKind::TupleEnumVariant(_) => DispatchKind::Direct,
             })
             .unwrap_or(DispatchKind::Direct);
-
         Some((callee, dispatch))
+    }
+
+    fn resolve_callable_kind_target(
+        &mut self,
+        kind: CallableKind<'db>,
+        site: TextRange,
+    ) -> (DefId, DispatchKind) {
+        match kind {
+            CallableKind::Function(function) => (
+                self.register_module_def(ModuleDef::Function(function), false)
+                    .unwrap_or_else(|| self.synthetic_def("callable_function", site)),
+                DispatchKind::Direct,
+            ),
+            CallableKind::TupleStruct(strukt) => (
+                self.register_module_def(ModuleDef::Adt(Adt::Struct(strukt)), false)
+                    .unwrap_or_else(|| self.synthetic_def("callable_tuple_struct", site)),
+                DispatchKind::Direct,
+            ),
+            CallableKind::TupleEnumVariant(variant) => (
+                self.register_module_def(ModuleDef::Variant(variant), false)
+                    .unwrap_or_else(|| self.synthetic_def("callable_tuple_variant", site)),
+                DispatchKind::Direct,
+            ),
+            CallableKind::Closure(_) => (
+                self.synthetic_def("callable_closure", site),
+                DispatchKind::Closure,
+            ),
+            CallableKind::FnPtr => (
+                self.synthetic_def("callable_fn_ptr", site),
+                DispatchKind::FnPointer,
+            ),
+            CallableKind::FnImpl(_) => (
+                self.synthetic_def("callable_fn_impl", site),
+                DispatchKind::ThroughTrait,
+            ),
+        }
     }
 
     fn resolve_def_from_call_path(&self, path: &ast::Path) -> Option<DefId> {
@@ -887,21 +1390,43 @@ impl<'db> SnapshotBuilder<'db> {
             return TypeShape::Param(def);
         }
 
-        if let Some(head_adt) = ty.as_adt()
-            && let Some(def) = self.register_module_def(ModuleDef::Adt(head_adt), false)
-        {
+        if let Some(head_adt) = ty.as_adt() {
+            let def = self
+                .register_module_def(ModuleDef::Adt(head_adt), false)
+                .unwrap_or_else(|| {
+                    self.synthetic_type_head_from_module_def(
+                        ModuleDef::Adt(head_adt),
+                        owner,
+                        "type_head:adt",
+                    )
+                });
             return TypeShape::App {
                 head: def,
-                args: Vec::new(),
+                args: self
+                    .safe_type_arguments(&ty)
+                    .into_iter()
+                    .map(|arg| GenericArg::Type(self.intern_type_ref(arg, owner)))
+                    .collect(),
             };
         }
 
-        if let Some(head_trait) = ty.as_dyn_trait()
-            && let Some(def) = self.register_module_def(ModuleDef::Trait(head_trait), false)
-        {
+        if let Some(head_trait) = ty.as_dyn_trait() {
+            let def = self
+                .register_module_def(ModuleDef::Trait(head_trait), false)
+                .unwrap_or_else(|| {
+                    self.synthetic_type_head_from_module_def(
+                        ModuleDef::Trait(head_trait),
+                        owner,
+                        "type_head:dyn_trait",
+                    )
+                });
             return TypeShape::App {
                 head: def,
-                args: Vec::new(),
+                args: self
+                    .safe_type_arguments(&ty)
+                    .into_iter()
+                    .map(|arg| GenericArg::Type(self.intern_type_ref(arg, owner)))
+                    .collect(),
             };
         }
 
@@ -917,48 +1442,97 @@ impl<'db> SnapshotBuilder<'db> {
         function: Function,
         ret_ty: Type<'db>,
     ) -> Option<DefId> {
-        let adt = ret_ty.as_adt()?;
-        if adt
-            .name(self.db)
-            .display(self.db, Edition::CURRENT)
-            .to_string()
-            != "Result"
-        {
+        if let Some(error_ty) = self.result_error_type_argument(ret_ty.clone()) {
+            return Some(self.def_from_type_head(error_ty, None));
+        }
+        self.textual_result_error_fallback(function, ret_ty)
+    }
+
+    fn textual_result_error_fallback(
+        &mut self,
+        function: Function,
+        ret_ty: Type<'db>,
+    ) -> Option<DefId> {
+        let ret_type_syntax = self.return_type_from_semantic_source(function);
+        let ret_text = ret_type_syntax
+            .as_ref()
+            .map(|ret| ret.syntax().text().to_string());
+        let result_like_by_syntax = ret_text
+            .as_ref()
+            .is_some_and(|text| text.contains("Result"));
+        let result_like_by_type = ret_ty.as_adt().is_some_and(|adt| self.is_result_head(adt));
+        if !result_like_by_syntax && !result_like_by_type {
             return None;
         }
-
-        let args = ret_ty
-            .type_and_const_arguments(self.db, function.krate(self.db).to_display_target(self.db))
-            .collect::<Vec<_>>();
-        let error_name = args.get(1)?.to_string();
-
-        if let Some(def) = self.defs_by_path.get(error_name.as_str()) {
-            return Some(*def);
-        }
-
-        if let Some(candidates) = self.defs_by_name.get(error_name.as_str())
-            && candidates.len() == 1
+        if let Some(ret_type) = ret_type_syntax.as_ref()
+            && let Some(error_def) = self.error_def_from_return_type_alias_paths(ret_type)
         {
-            return candidates.iter().next().copied();
+            return Some(error_def);
         }
 
-        Some(
-            self.host
-                .intern_def_from_token(format!("result_error:{error_name}").as_str()),
-        )
+        let args = self.safe_type_and_const_arguments(function, &ret_ty);
+        if let Some(error_name) = args.get(1).map(ToString::to_string) {
+            if let Some(def) = self.resolve_def_from_type_path(error_name.as_str()) {
+                return Some(def);
+            }
+            if let Some(candidates) = self.defs_by_name.get(error_name.as_str())
+                && candidates.len() == 1
+            {
+                return candidates.iter().next().copied();
+            }
+            return Some(
+                self.host
+                    .intern_def_from_token(format!("result_error:{error_name}").as_str()),
+            );
+        }
+
+        if let Some(ret_text) = ret_text.as_ref()
+            && let Some(error_name) = extract_result_error_name_from_text(ret_text.as_str())
+        {
+            if let Some(def) = self.resolve_def_from_type_path(error_name.as_str()) {
+                return Some(def);
+            }
+            if let Some(candidates) = self.defs_by_name.get(error_name.as_str())
+                && candidates.len() == 1
+            {
+                return candidates.iter().next().copied();
+            }
+            return Some(
+                self.host
+                    .intern_def_from_token(format!("result_error:{error_name}").as_str()),
+            );
+        }
+        if result_like_by_syntax {
+            let ret_text = ret_text.unwrap_or_else(|| "Result<?>".to_string());
+            return Some(
+                self.host
+                    .intern_def_from_token(format!("result_error_text:{ret_text}").as_str()),
+            );
+        }
+        None
     }
 
     fn def_from_type_head(&mut self, ty: Type<'db>, owner: Option<DefId>) -> DefId {
-        if let Some(adt) = ty.as_adt()
-            && let Some(def) = self.register_module_def(ModuleDef::Adt(adt), false)
-        {
-            return def;
+        if let Some(adt) = ty.as_adt() {
+            if let Some(def) = self.register_module_def(ModuleDef::Adt(adt), false) {
+                return def;
+            }
+            return self.synthetic_type_head_from_module_def(
+                ModuleDef::Adt(adt),
+                owner,
+                "type_head:adt",
+            );
         }
 
-        if let Some(trait_) = ty.as_dyn_trait()
-            && let Some(def) = self.register_module_def(ModuleDef::Trait(trait_), false)
-        {
-            return def;
+        if let Some(trait_) = ty.as_dyn_trait() {
+            if let Some(def) = self.register_module_def(ModuleDef::Trait(trait_), false) {
+                return def;
+            }
+            return self.synthetic_type_head_from_module_def(
+                ModuleDef::Trait(trait_),
+                owner,
+                "type_head:dyn_trait",
+            );
         }
 
         if let Some(param) = ty.as_type_param(self.db) {
@@ -1067,7 +1641,7 @@ impl<'db> SnapshotBuilder<'db> {
                 .into_iter()
                 .map(|item| self.type_fingerprint(item, owner))
                 .collect::<Vec<_>>();
-            return format!("tuple:{}", items.join(","));
+            return format!("tuple:{}", encode_fingerprint_parts(items));
         }
 
         if let Some(inner) = ty.as_slice() {
@@ -1091,7 +1665,16 @@ impl<'db> SnapshotBuilder<'db> {
                         head_adt.name(self.db).display(self.db, Edition::CURRENT)
                     )
                 });
-            return format!("app:{path}");
+            let args = self
+                .safe_type_arguments(&ty)
+                .into_iter()
+                .map(|arg| self.type_fingerprint(arg, owner))
+                .collect::<Vec<_>>();
+            return if args.is_empty() {
+                format!("app:{path}")
+            } else {
+                format!("app:{path}<{}>", encode_fingerprint_parts(args))
+            };
         }
 
         if let Some(head_trait) = ty.as_dyn_trait() {
@@ -1104,7 +1687,16 @@ impl<'db> SnapshotBuilder<'db> {
                         head_trait.name(self.db).display(self.db, Edition::CURRENT)
                     )
                 });
-            return format!("dyn:{path}");
+            let args = self
+                .safe_type_arguments(&ty)
+                .into_iter()
+                .map(|arg| self.type_fingerprint(arg, owner))
+                .collect::<Vec<_>>();
+            return if args.is_empty() {
+                format!("dyn:{path}")
+            } else {
+                format!("dyn:{path}<{}>", encode_fingerprint_parts(args))
+            };
         }
 
         if let Some(builtin) = ty.as_builtin() {
@@ -1120,7 +1712,11 @@ impl<'db> SnapshotBuilder<'db> {
     }
 }
 
-fn compute_world_stamp(workspace_root: &Path, files: &BTreeMap<FileId, LocalFile>) -> WorldStamp {
+fn compute_world_stamp(
+    workspace_root: &Path,
+    files: &BTreeMap<FileId, LocalFile>,
+    semantic_identity: &str,
+) -> WorldStamp {
     let mut pairs = files
         .values()
         .map(|file| (file.rel_path.clone(), file.text.as_bytes().to_vec()))
@@ -1134,6 +1730,8 @@ fn compute_world_stamp(workspace_root: &Path, files: &BTreeMap<FileId, LocalFile
         text.hash(&mut hasher);
         0xfe_u8.hash(&mut hasher);
     }
+    semantic_identity.hash(&mut hasher);
+    0xfd_u8.hash(&mut hasher);
 
     WorldStamp::new(format!(
         "ra-workspace:{}:{:016x}",
@@ -1142,31 +1740,265 @@ fn compute_world_stamp(workspace_root: &Path, files: &BTreeMap<FileId, LocalFile
     ))
 }
 
+fn compute_semantic_identity(db: &RootDatabase, workspace_root: &Path) -> String {
+    let mut crate_signatures = Crate::all(db)
+        .into_iter()
+        .map(|krate| {
+            let display_name = krate
+                .display_name(db)
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| "<anon>".to_string());
+            let version = krate.version(db).unwrap_or_default();
+            let edition = format!("{:?}", krate.edition(db));
+            let cfg = format!("{:?}", krate.cfg(db));
+            let mut deps = krate
+                .dependencies(db)
+                .into_iter()
+                .map(|dep| {
+                    let dep_name = dep
+                        .krate
+                        .display_name(db)
+                        .map(|name| name.to_string())
+                        .unwrap_or_else(|| "<anon>".to_string());
+                    format!("{:?}->{dep_name}", dep.name)
+                })
+                .collect::<Vec<_>>();
+            deps.sort();
+            format!(
+                "crate:{display_name}:{version}:{edition}:{cfg}:deps=[{}]",
+                deps.join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    crate_signatures.sort();
+
+    let mut env_axes = [
+        "RUSTUP_TOOLCHAIN",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_TARGET",
+        "CARGO_CFG_TARGET_ARCH",
+        "CARGO_CFG_TARGET_OS",
+        "CARGO_CFG_TARGET_ENV",
+    ]
+    .into_iter()
+    .map(|name| (name, std::env::var(name).unwrap_or_default()))
+    .collect::<Vec<_>>();
+    env_axes.sort_by(|a, b| a.0.cmp(b.0));
+
+    let toolchain_facts = [
+        command_output(workspace_root, "rustc", ["-vV"]),
+        command_output(workspace_root, "cargo", ["-V"]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let config_files = collect_workspace_config_file_hashes(workspace_root);
+
+    format!(
+        "semantic:crates=[{}];env=[{}];tools=[{}];configs=[{}]",
+        crate_signatures.join("|"),
+        env_axes
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("|"),
+        toolchain_facts.join("|"),
+        config_files.join("|"),
+    )
+}
+
+fn command_output<const N: usize>(
+    workspace_root: &Path,
+    bin: &str,
+    args: [&str; N],
+) -> Option<String> {
+    let output = Command::new(bin)
+        .current_dir(workspace_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(format!("{bin}:{}", stdout.trim()))
+}
+
+fn collect_workspace_config_file_hashes(workspace_root: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_workspace_config_files_recursive(workspace_root, workspace_root, &mut files);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+        .into_iter()
+        .map(|(rel_path, bytes)| {
+            let mut hasher = FxHasher::default();
+            bytes.hash(&mut hasher);
+            format!("{rel_path}:{:016x}", hasher.finish())
+        })
+        .collect()
+}
+
+fn collect_workspace_config_files_recursive(
+    workspace_root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, Vec<u8>)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    paths.sort_by_key(|entry| entry.path());
+
+    for entry in paths {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() {
+            let dir_name = entry.file_name();
+            let dir_name = dir_name.to_string_lossy();
+            if dir_name == "target" || dir_name == ".git" || dir_name == ".jj" {
+                continue;
+            }
+            collect_workspace_config_files_recursive(workspace_root, path.as_path(), out);
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(file_name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        let tracked = matches!(
+            file_name.as_str(),
+            "Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" | "config.toml"
+        ) || path.ends_with(".cargo/config.toml");
+        if !tracked {
+            continue;
+        }
+
+        let Ok(mut bytes) = std::fs::read(path.as_path()) else {
+            continue;
+        };
+        if file_name == "Cargo.lock"
+            && let Ok(text) = String::from_utf8(bytes.clone())
+        {
+            bytes = normalize_cargo_lock_sources(text.as_str(), workspace_root).into_bytes();
+        }
+        let rel_path = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push((rel_path, bytes));
+    }
+}
+
+fn normalize_cargo_lock_sources(lock_text: &str, workspace_root: &Path) -> String {
+    lock_text
+        .lines()
+        .map(|line| {
+            let prefix = "source = \"path+file://";
+            let Some(start) = line.find(prefix) else {
+                return line.to_string();
+            };
+            let path_start = start + prefix.len();
+            let Some(path_end_rel) = line[path_start..].find('"') else {
+                return line.to_string();
+            };
+            let path_end = path_start + path_end_rel;
+            let raw_path = &line[path_start..path_end];
+            let normalized = normalize_lock_source_path(raw_path, workspace_root);
+            format!("{}{}{}", &line[..path_start], normalized, &line[path_end..])
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_lock_source_path(raw_path: &str, workspace_root: &Path) -> String {
+    let candidate = Path::new(raw_path);
+    if let Ok(rel) = candidate.strip_prefix(workspace_root) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        return format!("<workspace>/{rel}");
+    }
+    "<external-path>".to_string()
+}
+
 fn collect_local_files(
     db: &RootDatabase,
     vfs: &vfs::Vfs,
     workspace_root: &Path,
     sema: &Semantics<'_, RootDatabase>,
 ) -> Result<BTreeMap<FileId, LocalFile>, RaHostInitError> {
-    let mut files = BTreeMap::new();
+    #[derive(Debug)]
+    struct FileCandidate {
+        file_id: FileId,
+        source_root_id: base_db::SourceRootId,
+        is_library: bool,
+        abs_path: String,
+    }
 
+    let selected_source_roots = selected_source_root_ids(db, vfs, workspace_root);
+    let mut candidates = Vec::new();
     for (file_id, path) in vfs.iter() {
         let source_root_id = db.file_source_root(file_id).source_root_id(db);
-        let source_root = db.source_root(source_root_id).source_root(db);
-        if source_root.is_library {
+        if !selected_source_roots.contains(&source_root_id) {
             continue;
         }
-
+        let source_root = db.source_root(source_root_id).source_root(db);
         let Some(abs_path) = path.as_path() else {
             continue;
         };
+        candidates.push(FileCandidate {
+            file_id,
+            source_root_id,
+            is_library: source_root.is_library,
+            abs_path: abs_path.as_str().to_string(),
+        });
+    }
+    candidates.sort_by(|a, b| {
+        a.abs_path
+            .cmp(&b.abs_path)
+            .then_with(|| a.is_library.cmp(&b.is_library))
+            .then_with(|| a.source_root_id.0.cmp(&b.source_root_id.0))
+    });
 
-        let rel_path = normalize_rel_path(workspace_root, abs_path.as_ref());
-        let text = db.file_text(file_id).text(db).to_string();
-        let editioned = sema.attach_first_edition(file_id);
+    let mut files = BTreeMap::new();
+    let mut library_files = 0_usize;
+    let mut library_files_per_root: HashMap<base_db::SourceRootId, usize> = HashMap::new();
+    const MAX_LIBRARY_FILES: usize = 25_000;
+    const MAX_LIBRARY_FILES_PER_ROOT: usize = 5_000;
+
+    for candidate in candidates {
+        if candidate.is_library {
+            if library_files >= MAX_LIBRARY_FILES {
+                continue;
+            }
+            let root_count = library_files_per_root
+                .entry(candidate.source_root_id)
+                .or_default();
+            if *root_count >= MAX_LIBRARY_FILES_PER_ROOT {
+                continue;
+            }
+            library_files += 1;
+            *root_count += 1;
+        }
+
+        let abs_path = Path::new(candidate.abs_path.as_str());
+
+        let rel_path = normalize_snapshot_path(workspace_root, abs_path, candidate.is_library);
+        let text = db.file_text(candidate.file_id).text(db).to_string();
+        let editioned = sema.attach_first_edition(candidate.file_id);
 
         files.insert(
-            file_id,
+            candidate.file_id,
             LocalFile {
                 rel_path,
                 text,
@@ -1177,11 +2009,52 @@ fn collect_local_files(
 
     if files.is_empty() {
         return Err(RaHostInitError::SemanticBuild {
-            details: "workspace snapshot has no local source files".to_string(),
+            details: "workspace snapshot has no source files".to_string(),
         });
     }
 
     Ok(files)
+}
+
+fn selected_source_root_ids(
+    db: &RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+) -> HashSet<base_db::SourceRootId> {
+    let mut selected_crates = HashSet::new();
+    let mut queue = VecDeque::new();
+
+    for krate in Crate::all(db) {
+        let root_path = vfs.file_path(krate.root_file(db));
+        let in_workspace = root_path
+            .as_path()
+            .is_some_and(|path| Path::new(path.as_str()).starts_with(workspace_root));
+        if krate.origin(db).is_local() || in_workspace {
+            if selected_crates.insert(krate) {
+                queue.push_back(krate);
+            }
+        }
+    }
+
+    while let Some(krate) = queue.pop_front() {
+        for dep in krate.dependencies(db) {
+            if dep.krate.origin(db).is_lang() {
+                continue;
+            }
+            if selected_crates.insert(dep.krate) {
+                queue.push_back(dep.krate);
+            }
+        }
+    }
+
+    if selected_crates.is_empty() {
+        selected_crates.extend(Crate::all(db).into_iter().filter(|krate| !krate.origin(db).is_lang()));
+    }
+
+    selected_crates
+        .into_iter()
+        .map(|krate| db.file_source_root(krate.root_file(db)).source_root_id(db))
+        .collect()
 }
 
 fn normalize_rel_path(workspace_root: &Path, file_path: &Path) -> String {
@@ -1192,6 +2065,52 @@ fn normalize_rel_path(workspace_root: &Path, file_path: &Path) -> String {
     } else {
         path
     }
+}
+
+fn normalize_snapshot_path(workspace_root: &Path, file_path: &Path, is_library: bool) -> String {
+    if !is_library {
+        return normalize_rel_path(workspace_root, file_path);
+    }
+
+    if let Ok(rel) = file_path.strip_prefix(workspace_root) {
+        return format!("workspace-dep/{}", rel.to_string_lossy().replace('\\', "/"));
+    }
+
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        let cargo_home = Path::new(cargo_home.as_os_str());
+        if let Ok(rel) = file_path.strip_prefix(cargo_home) {
+            return format!("<cargo-home>/{}", rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME") {
+        let rustup_home = Path::new(rustup_home.as_os_str());
+        if let Ok(rel) = file_path.strip_prefix(rustup_home) {
+            return format!("<rustup-home>/{}", rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+
+    let normalized = file_path.to_string_lossy().replace('\\', "/");
+    if let Some((_, tail)) = normalized.split_once("/registry/src/") {
+        return format!("<cargo-registry>/{tail}");
+    }
+    if let Some((_, tail)) = normalized.split_once("/git/checkouts/") {
+        return format!("<cargo-git>/{tail}");
+    }
+
+    format!(
+        "<external>/{}/{}",
+        short_path_hash(file_path),
+        file_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+fn short_path_hash(path: &Path) -> String {
+    let mut hasher = FxHasher::default();
+    path.to_string_lossy().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn normalize_canonical_path(path: String) -> String {
@@ -1219,6 +2138,47 @@ fn path_to_string(path: &ast::Path) -> Option<String> {
     } else {
         Some(segments.join("::"))
     }
+}
+
+fn extract_result_error_name_from_text(ret_text: &str) -> Option<String> {
+    let marker = ret_text.find("Result<")?;
+    let start = marker + "Result<".len();
+    let generic_text = &ret_text[start..];
+
+    let mut depth = 0_u32;
+    let mut comma = None;
+    let mut end = None;
+    for (idx, ch) in generic_text.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                if depth == 0 {
+                    end = Some(idx);
+                    break;
+                }
+                depth -= 1;
+            }
+            ',' if depth == 0 && comma.is_none() => comma = Some(idx),
+            _ => {}
+        }
+    }
+
+    let comma = comma?;
+    let end = end?;
+    let error_name = generic_text[comma + 1..end].trim();
+    if error_name.is_empty() {
+        None
+    } else {
+        Some(error_name.to_string())
+    }
+}
+
+fn encode_fingerprint_parts(parts: Vec<String>) -> String {
+    parts
+        .into_iter()
+        .map(|part| format!("{}#{}", part.len(), part))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 fn map_mutability(mutability: hir::Mutability) -> Mutability {
