@@ -208,7 +208,7 @@ fn caller() {
     fs::write(
         b.as_std_path(),
         r#"
-fn callee() {}
+pub(crate) fn callee() {}
 "#,
     )
     .expect("write src/b.rs");

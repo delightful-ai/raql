@@ -1,17 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 
 use base_db::{EditionedFileId, SourceDatabase};
 use hir::{
-    Adt, AssocItem, CallableKind, Crate, Function, HasCrate, HasSource, HasVisibility, Impl,
-    Module, ModuleDef, Type,
+    Adt, AssocItem, CallableKind, Crate, Function, HasCrate, HasSource, HasVisibility, Impl, Module,
+    ModuleDef, Trait, Type,
 };
-use ide::{RootDatabase, Semantics};
+use ide::{Analysis, AnalysisHost, CallHierarchyConfig, FilePosition, RootDatabase, Semantics};
+use ide_db::MiniCore;
 use rustc_hash::FxHasher;
 use span::TextRange;
 use syntax::ast;
+use syntax::ast::HasName;
 use syntax::{AstNode, Edition, SourceFile, SyntaxNode};
 use vfs::FileId;
 
@@ -40,6 +42,7 @@ pub(crate) fn build_host_snapshot(
     workspace_root: &Path,
 ) -> Result<DeterministicRaHost, RaHostInitError> {
     let sema = Semantics::new(db);
+    let analysis = AnalysisHost::with_database(db.clone()).analysis();
     let files = collect_local_files(db, vfs, workspace_root, &sema)?;
     let semantic_identity = compute_semantic_identity(db, workspace_root);
 
@@ -53,11 +56,15 @@ pub(crate) fn build_host_snapshot(
     let mut builder = SnapshotBuilder {
         db,
         sema,
+        analysis,
         files,
         host,
-        defs_by_path: BTreeMap::new(),
-        defs_by_name: BTreeMap::new(),
         def_path_by_id: BTreeMap::new(),
+        def_ranges_by_file: BTreeMap::new(),
+        function_by_def: BTreeMap::new(),
+        local_adts: HashSet::new(),
+        local_traits: HashSet::new(),
+        processed_impls: HashSet::new(),
         typeref_by_key: BTreeMap::new(),
     };
 
@@ -183,11 +190,15 @@ mod strict_mode_tests {
 struct SnapshotBuilder<'db> {
     db: &'db RootDatabase,
     sema: Semantics<'db, RootDatabase>,
+    analysis: Analysis,
     files: BTreeMap<FileId, LocalFile>,
     host: DeterministicRaHost,
-    defs_by_path: BTreeMap<String, DefId>,
-    defs_by_name: BTreeMap<String, BTreeSet<DefId>>,
     def_path_by_id: BTreeMap<DefId, String>,
+    def_ranges_by_file: BTreeMap<FileId, Vec<(TextRange, DefId)>>,
+    function_by_def: BTreeMap<DefId, Function>,
+    local_adts: HashSet<Adt>,
+    local_traits: HashSet<Trait>,
+    processed_impls: HashSet<Impl>,
     typeref_by_key: BTreeMap<String, TypeRefId>,
 }
 
@@ -199,6 +210,7 @@ impl<'db> SnapshotBuilder<'db> {
             }
             self.visit_module(krate.root_module(self.db), false);
         }
+        self.extract_impls();
     }
 
     fn visit_module(&mut self, module: Module, inherited_test: bool) {
@@ -243,24 +255,10 @@ impl<'db> SnapshotBuilder<'db> {
             }
         }
 
-        for impl_def in module.impl_defs(self.db) {
-            self.process_impl(impl_def, module_test);
-        }
     }
 
     fn process_function(&mut self, function: Function, function_def: DefId) {
-        let ret_ref = self
-            .safe_function_ret_type(function)
-            .map(|ret| self.intern_type_ref(ret, Some(function_def)))
-            .unwrap_or_else(|| {
-                self.unknown_type_ref(
-                    format!(
-                        "fn_ret_ty:{}",
-                        format!("{:#018x}", function_def.stable_id().as_u64())
-                    )
-                    .as_str(),
-                )
-            });
+        let ret_ref = self.intern_type_ref(function.ret_type(self.db), Some(function_def));
         self.host.set_fn_return_type(function_def, Some(ret_ref));
         self.host.set_fn_error_type(function_def, None);
         if let Some(error_def) = self.function_error_def_for_function(function) {
@@ -269,6 +267,7 @@ impl<'db> SnapshotBuilder<'db> {
     }
 
     fn process_adt(&mut self, adt: Adt, owner_def: DefId, in_test: bool) {
+        self.local_adts.insert(adt);
         let owner_path = self
             .def_path_by_id
             .get(&owner_def)
@@ -308,14 +307,9 @@ impl<'db> SnapshotBuilder<'db> {
                         field_path.as_str(),
                     );
                     self.def_path_by_id.insert(field_def, field_path.clone());
-                    self.defs_by_name
-                        .entry(field_name.clone())
-                        .or_default()
-                        .insert(field_def);
 
-                    let field_ty = self.unknown_type_ref(
-                        format!("field_ty:{}:{}", owner_path, field_name).as_str(),
-                    );
+                    let field_ty =
+                        self.intern_type_ref(field.ty(self.db).to_type(self.db), Some(owner_def));
                     self.host
                         .insert_field(owner_def, field_name.as_str(), field_ty);
 
@@ -357,14 +351,9 @@ impl<'db> SnapshotBuilder<'db> {
                         field_path.as_str(),
                     );
                     self.def_path_by_id.insert(field_def, field_path.clone());
-                    self.defs_by_name
-                        .entry(field_name.clone())
-                        .or_default()
-                        .insert(field_def);
 
-                    let field_ty = self.unknown_type_ref(
-                        format!("field_ty:{}:{}", owner_path, field_name).as_str(),
-                    );
+                    let field_ty =
+                        self.intern_type_ref(field.ty(self.db).to_type(self.db), Some(owner_def));
                     self.host
                         .insert_field(owner_def, field_name.as_str(), field_ty);
 
@@ -393,14 +382,44 @@ impl<'db> SnapshotBuilder<'db> {
                             .name(self.db)
                             .display(self.db, Edition::CURRENT)
                             .to_string();
-                        let field_ty = self.unknown_type_ref(
-                            format!("variant_field_ty:{}:{}", variant_name, field_name).as_str(),
-                        );
+                        let field_ty =
+                            self.intern_type_ref(field.ty(self.db).to_type(self.db), Some(variant_def));
                         self.host
                             .insert_field(variant_def, field_name.as_str(), field_ty);
                     }
                 }
             }
+        }
+    }
+
+    fn extract_impls(&mut self) {
+        let mut impls = Vec::new();
+        for adt in self.local_adts.iter().copied() {
+            let ty = match adt {
+                Adt::Struct(strukt) => strukt.ty(self.db),
+                Adt::Union(union) => union.ty(self.db),
+                Adt::Enum(enum_) => enum_.ty(self.db),
+            };
+            for impl_def in Impl::all_for_type(self.db, ty) {
+                if self.source_loc_for_impl(impl_def).is_some() {
+                    impls.push(impl_def);
+                }
+            }
+        }
+        for trait_ in self.local_traits.iter().copied() {
+            for impl_def in Impl::all_for_trait(self.db, trait_) {
+                if self.source_loc_for_impl(impl_def).is_some() {
+                    impls.push(impl_def);
+                }
+            }
+        }
+
+        for impl_def in impls {
+            if !self.processed_impls.insert(impl_def) {
+                continue;
+            }
+            let in_test = self.module_is_test(impl_def.module(self.db));
+            self.process_impl(impl_def, in_test);
         }
     }
 
@@ -437,12 +456,9 @@ impl<'db> SnapshotBuilder<'db> {
         self.def_path_by_id.insert(impl_record, impl_path);
         self.host.mark_in_test(impl_record, in_test);
 
-        let self_ty_def = self
-            .safe_impl_self_ty(impl_def)
-            .map(|self_ty| self.def_from_type_head(self_ty, Some(impl_record)));
+        let self_ty_def = Some(self.def_from_type_head(impl_def.self_ty(self.db), Some(impl_record)));
 
-        if let (Some(self_ty_def), Some(trait_def_hir)) =
-            (self_ty_def, self.safe_impl_trait(impl_def))
+        if let (Some(self_ty_def), Some(trait_def_hir)) = (self_ty_def, impl_def.trait_(self.db))
         {
             if let Some(trait_def) =
                 self.register_module_def(ModuleDef::Trait(trait_def_hir), in_test)
@@ -453,7 +469,10 @@ impl<'db> SnapshotBuilder<'db> {
                     .to_string()
                     == "From"
                 {
-                    self.safe_impl_trait_type_argument(impl_def, 1)
+                    impl_def
+                        .trait_ref(self.db)
+                        .and_then(|trait_ref| trait_ref.get_type_argument(1))
+                        .map(|arg| arg.to_type(self.db))
                         .map(|src_ty| self.def_from_type_head(src_ty, Some(impl_record)))
                 } else {
                     None
@@ -467,7 +486,7 @@ impl<'db> SnapshotBuilder<'db> {
             }
         }
 
-        for assoc in self.safe_impl_items(impl_def) {
+        for assoc in impl_def.items(self.db) {
             match assoc {
                 AssocItem::Function(function) => {
                     let Some(method_def) =
@@ -513,12 +532,17 @@ impl<'db> SnapshotBuilder<'db> {
         self.host
             .insert_def(def_id, name.as_str(), kind, span, path.as_str());
 
-        self.defs_by_path.insert(path.clone(), def_id);
-        self.defs_by_name
-            .entry(name.clone())
-            .or_default()
-            .insert(def_id);
         self.def_path_by_id.insert(def_id, path.clone());
+        self.def_ranges_by_file
+            .entry(loc.file_id.file_id(self.db))
+            .or_default()
+            .push((loc.range, def_id));
+        if let ModuleDef::Function(function) = def {
+            self.function_by_def.insert(def_id, function);
+        }
+        if let ModuleDef::Trait(trait_) = def {
+            self.local_traits.insert(trait_);
+        }
 
         let is_public = match def {
             ModuleDef::Module(module) => module.visibility(self.db) == hir::Visibility::Public,
@@ -565,9 +589,10 @@ impl<'db> SnapshotBuilder<'db> {
         for (file_id, editioned) in files {
             let source = self.sema.parse(editioned);
             self.extract_nodes_for_file(file_id, &source);
-            self.extract_calls_for_file(file_id, &source);
+            self.extract_calls_from_semantic_ast(file_id, &source);
             self.extract_error_flow_for_file(file_id, &source);
         }
+        self.extract_calls_via_call_hierarchy();
     }
 
     fn extract_nodes_for_file(&mut self, file_id: FileId, source: &SourceFile) {
@@ -603,99 +628,288 @@ impl<'db> SnapshotBuilder<'db> {
         }
     }
 
-    fn extract_calls_for_file(&mut self, file_id: FileId, source: &SourceFile) {
+    fn extract_calls_via_call_hierarchy(&mut self) {
+        let config = CallHierarchyConfig {
+            exclude_tests: false,
+            minicore: MiniCore::default(),
+        };
+        let functions = self
+            .function_by_def
+            .iter()
+            .map(|(def, function)| (*def, *function))
+            .collect::<Vec<_>>();
+
+        for (caller_def, function) in functions {
+            let Some(source) = function.source(self.db) else {
+                continue;
+            };
+            let Some(name) = source.value.name() else {
+                continue;
+            };
+            let file_id = source.file_id.original_file(self.db).file_id(self.db);
+            if !self.files.contains_key(&file_id) {
+                continue;
+            }
+            let position = FilePosition {
+                file_id,
+                offset: name.syntax().text_range().start(),
+            };
+            let Ok(Some(outgoing)) = self.analysis.outgoing_calls(&config, position) else {
+                continue;
+            };
+
+            for call in outgoing {
+                let target_range = call.target.focus_or_full_range();
+                let Some(callee) =
+                    self.resolve_def_from_semantic_range(call.target.file_id, target_range)
+                else {
+                    continue;
+                };
+                for site_range in call.ranges {
+                    let Some(local) = self.files.get(&site_range.file_id).cloned() else {
+                        continue;
+                    };
+                    let Some(site) = self.span_for_range(&local, site_range.range) else {
+                        continue;
+                    };
+                    let dispatch = self.dispatch_kind_for_call_site(site_range.file_id, site_range.range);
+                    self.host.insert_call_edge(caller_def, callee, site, dispatch);
+                }
+            }
+        }
+    }
+
+    fn extract_calls_from_semantic_ast(&mut self, file_id: FileId, source: &SourceFile) {
         let Some(local) = self.files.get(&file_id).cloned() else {
             return;
         };
 
-        for call in source
-            .syntax()
-            .descendants()
-            .filter_map(ast::CallExpr::cast)
-        {
+        for call in source.syntax().descendants().filter_map(ast::CallExpr::cast) {
             let Some(caller_fn) = enclosing_fn(call.syntax()) else {
                 continue;
             };
             let Some(caller_hir) = self.sema.to_fn_def(&caller_fn) else {
                 continue;
             };
-            let Some(caller_def) = self.register_module_def(ModuleDef::Function(caller_hir), false)
-            else {
+            let Some(caller_def) = self.register_module_def(ModuleDef::Function(caller_hir), false) else {
                 continue;
             };
 
-            let Ok(site) = self.host.intern_span_from_text(
-                local.editioned_file_id.editioned_file_id(self.db),
-                local.rel_path.as_str(),
-                local.text.as_str(),
-                call.syntax().text_range(),
-            ) else {
+            let Some(site) = self.span_for_range(&local, call.syntax().text_range()) else {
                 continue;
             };
 
             let (callee, dispatch) = if let Some(expr) = call.expr() {
-                self.resolve_call_expr_target(&expr)
-                    .unwrap_or_else(|| match expr {
+                if let Some(callable) = self.sema.resolve_expr_as_callable(&expr) {
+                    self.resolve_semantic_callable_target(callable.kind(), call.syntax().text_range())
+                } else if let ast::Expr::PathExpr(path_expr) = &expr {
+                    path_expr
+                        .path()
+                        .and_then(|path| {
+                            self.resolve_call_target_from_semantic_path(
+                                path,
+                                call.syntax().text_range(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                        (
+                            self.synthetic_call_def("callable_dyn", call.syntax().text_range()),
+                            DispatchKind::Dyn,
+                        )
+                    })
+                } else {
+                    match expr {
                         ast::Expr::ClosureExpr(_) => (
-                            self.synthetic_def("callable_closure", call.syntax().text_range()),
+                            self.synthetic_call_def("callable_closure", call.syntax().text_range()),
                             DispatchKind::Closure,
                         ),
                         _ => (
-                            self.synthetic_def("callable_dyn", call.syntax().text_range()),
+                            self.synthetic_call_def("callable_dyn", call.syntax().text_range()),
                             DispatchKind::Dyn,
                         ),
-                    })
+                    }
+                }
             } else {
                 (
-                    self.synthetic_def("callable_dyn", call.syntax().text_range()),
+                    self.synthetic_call_def("callable_dyn", call.syntax().text_range()),
                     DispatchKind::Dyn,
                 )
             };
 
-            self.host
-                .insert_call_edge(caller_def, callee, site, dispatch);
+            self.host.insert_call_edge(caller_def, callee, site, dispatch);
         }
 
-        for method_call in source
-            .syntax()
-            .descendants()
-            .filter_map(ast::MethodCallExpr::cast)
-        {
+        for method_call in source.syntax().descendants().filter_map(ast::MethodCallExpr::cast) {
             let Some(caller_fn) = enclosing_fn(method_call.syntax()) else {
                 continue;
             };
             let Some(caller_hir) = self.sema.to_fn_def(&caller_fn) else {
                 continue;
             };
-            let Some(caller_def) = self.register_module_def(ModuleDef::Function(caller_hir), false)
-            else {
+            let Some(caller_def) = self.register_module_def(ModuleDef::Function(caller_hir), false) else {
                 continue;
             };
 
-            let Ok(site) = self.host.intern_span_from_text(
-                local.editioned_file_id.editioned_file_id(self.db),
-                local.rel_path.as_str(),
-                local.text.as_str(),
-                method_call.syntax().text_range(),
-            ) else {
+            let Some(site) = self.span_for_range(&local, method_call.syntax().text_range()) else {
                 continue;
             };
 
-            let (callee, dispatch) = self
-                .resolve_method_call_target_semantic(&method_call)
-                .or_else(|| {
-                    self.resolve_method_call_target(&method_call)
-                        .map(|callee| (callee, DispatchKind::Direct))
-                })
-                .unwrap_or_else(|| {
-                    (
-                        self.synthetic_def("method_dyn", method_call.syntax().text_range()),
-                        DispatchKind::Dyn,
-                    )
-                });
+            let (callee, dispatch) = if let Some(resolved) = self.sema.resolve_method_call(&method_call) {
+                let callee = self
+                    .register_module_def(ModuleDef::Function(resolved), false)
+                    .unwrap_or_else(|| {
+                        self.synthetic_call_def("method_semantic", method_call.syntax().text_range())
+                    });
+                let dispatch = self
+                    .sema
+                    .resolve_method_call_as_callable(&method_call)
+                    .map(|callable| Self::dispatch_from_callable_kind(callable.kind()))
+                    .unwrap_or(DispatchKind::Direct);
+                (callee, dispatch)
+            } else {
+                (
+                    self.synthetic_call_def("method_dyn", method_call.syntax().text_range()),
+                    DispatchKind::Dyn,
+                )
+            };
 
-            self.host
-                .insert_call_edge(caller_def, callee, site, dispatch);
+            self.host.insert_call_edge(caller_def, callee, site, dispatch);
+        }
+    }
+
+    fn resolve_call_target_from_semantic_path(
+        &mut self,
+        path: ast::Path,
+        site: TextRange,
+    ) -> Option<(DefId, DispatchKind)> {
+        let per_ns = self.sema.resolve_path_per_ns(&path)?;
+        let resolution = per_ns.value_ns.or(per_ns.type_ns)?;
+        match resolution {
+            hir::PathResolution::Def(ModuleDef::Function(function)) => Some((
+                self.register_module_def(ModuleDef::Function(function), false)
+                    .unwrap_or_else(|| self.synthetic_call_def("path_function", site)),
+                DispatchKind::Direct,
+            )),
+            hir::PathResolution::Def(ModuleDef::Variant(variant)) => Some((
+                self.register_module_def(ModuleDef::Variant(variant), false)
+                    .unwrap_or_else(|| self.synthetic_call_def("path_variant", site)),
+                DispatchKind::Direct,
+            )),
+            hir::PathResolution::Def(ModuleDef::Adt(adt)) => Some((
+                self.register_module_def(ModuleDef::Adt(adt), false)
+                    .unwrap_or_else(|| self.synthetic_call_def("path_adt", site)),
+                DispatchKind::Direct,
+            )),
+            _ => None,
+        }
+    }
+
+    fn resolve_semantic_callable_target(
+        &mut self,
+        kind: CallableKind<'db>,
+        site: TextRange,
+    ) -> (DefId, DispatchKind) {
+        match kind {
+            CallableKind::Function(function) => (
+                self.register_module_def(ModuleDef::Function(function), false)
+                    .unwrap_or_else(|| self.synthetic_call_def("callable_function", site)),
+                DispatchKind::Direct,
+            ),
+            CallableKind::TupleStruct(strukt) => (
+                self.register_module_def(ModuleDef::Adt(Adt::Struct(strukt)), false)
+                    .unwrap_or_else(|| self.synthetic_call_def("callable_tuple_struct", site)),
+                DispatchKind::Direct,
+            ),
+            CallableKind::TupleEnumVariant(variant) => (
+                self.register_module_def(ModuleDef::Variant(variant), false)
+                    .unwrap_or_else(|| self.synthetic_call_def("callable_tuple_variant", site)),
+                DispatchKind::Direct,
+            ),
+            CallableKind::Closure(_) => (
+                self.synthetic_call_def("callable_closure", site),
+                DispatchKind::Closure,
+            ),
+            CallableKind::FnPtr => (
+                self.synthetic_call_def("callable_fn_ptr", site),
+                DispatchKind::FnPointer,
+            ),
+            CallableKind::FnImpl(_) => (
+                self.synthetic_call_def("callable_fn_impl", site),
+                DispatchKind::ThroughTrait,
+            ),
+        }
+    }
+
+    fn synthetic_call_def(&mut self, label: &str, range: TextRange) -> DefId {
+        self.host.intern_def_from_token(
+            format!(
+                "{label}:{}..{}",
+                u32::from(range.start()),
+                u32::from(range.end())
+            )
+            .as_str(),
+        )
+    }
+
+    fn resolve_def_from_semantic_range(&self, file_id: FileId, range: TextRange) -> Option<DefId> {
+        let candidates = self.def_ranges_by_file.get(&file_id)?;
+        candidates
+            .iter()
+            .filter(|(candidate_range, _)| {
+                candidate_range.start() <= range.start() && range.end() <= candidate_range.end()
+            })
+            .min_by_key(|(candidate_range, _)| {
+                u32::from(candidate_range.end()) - u32::from(candidate_range.start())
+            })
+            .map(|(_, def_id)| *def_id)
+    }
+
+    fn dispatch_kind_for_call_site(&self, file_id: FileId, range: TextRange) -> DispatchKind {
+        let Some(local) = self.files.get(&file_id) else {
+            return DispatchKind::Dyn;
+        };
+        let source = self.sema.parse(local.editioned_file_id);
+
+        for method_call in source.syntax().descendants().filter_map(ast::MethodCallExpr::cast) {
+            let Some(name_ref) = method_call.name_ref() else {
+                continue;
+            };
+            if name_ref.syntax().text_range() != range {
+                continue;
+            }
+            if let Some(callable) = self.sema.resolve_method_call_as_callable(&method_call) {
+                return Self::dispatch_from_callable_kind(callable.kind());
+            }
+            return DispatchKind::Dyn;
+        }
+
+        for call_expr in source.syntax().descendants().filter_map(ast::CallExpr::cast) {
+            let Some(expr) = call_expr.expr() else {
+                continue;
+            };
+            if expr.syntax().text_range() != range {
+                continue;
+            }
+            if let Some(callable) = self.sema.resolve_expr_as_callable(&expr) {
+                return Self::dispatch_from_callable_kind(callable.kind());
+            }
+            return match expr {
+                ast::Expr::ClosureExpr(_) => DispatchKind::Closure,
+                _ => DispatchKind::Dyn,
+            };
+        }
+
+        DispatchKind::Dyn
+    }
+
+    fn dispatch_from_callable_kind(kind: CallableKind<'db>) -> DispatchKind {
+        match kind {
+            CallableKind::FnImpl(_) => DispatchKind::ThroughTrait,
+            CallableKind::Closure(_) => DispatchKind::Closure,
+            CallableKind::FnPtr => DispatchKind::FnPointer,
+            CallableKind::Function(_)
+            | CallableKind::TupleStruct(_)
+            | CallableKind::TupleEnumVariant(_) => DispatchKind::Direct,
         }
     }
 
@@ -955,23 +1169,11 @@ impl<'db> SnapshotBuilder<'db> {
     }
 
     fn function_error_def_for_function(&mut self, function: Function) -> Option<DefId> {
-        self.safe_function_ret_type(function)
-            .and_then(|direct| self.best_effort_result_error_def(function, direct))
+        self.best_effort_result_error_def(function, function.ret_type(self.db))
             .or_else(|| {
-                self.safe_function_async_ret_type(function)
+                function
+                    .async_ret_type(self.db)
                     .and_then(|ret| self.best_effort_result_error_def(function, ret))
-            })
-            .or_else(|| {
-                let source = function.source(self.db)?;
-                let ret_text = source.value.ret_type()?.syntax().text().to_string();
-                if ret_text.contains("Result") {
-                    return Some(
-                        self.host.intern_def_from_token(
-                            format!("result_error_text:{ret_text}").as_str(),
-                        ),
-                    );
-                }
-                None
             })
     }
 
@@ -981,18 +1183,19 @@ impl<'db> SnapshotBuilder<'db> {
         if !self.is_result_head(adt) {
             return None;
         }
-        self.safe_nth_type_argument(&stripped, 1)
+        stripped.type_arguments().nth(1)
     }
 
     fn is_result_head(&self, adt: Adt) -> bool {
-        let module_def = ModuleDef::Adt(adt);
-        if let Some(path) = module_def.canonical_path(self.db, Edition::CURRENT) {
-            return path.ends_with("::Result");
-        }
-        adt.name(self.db)
-            .display(self.db, Edition::CURRENT)
-            .to_string()
-            == "Result"
+        let Adt::Enum(enum_def) = adt else {
+            return false;
+        };
+        let lang_items = hir_def::lang_item::lang_items(self.db, enum_def.krate(self.db).base());
+        let Some(result_err_variant) = lang_items.ResultErr else {
+            return false;
+        };
+        let result_enum = hir::Variant::from(result_err_variant).parent_enum(self.db);
+        enum_def == result_enum
     }
 
     fn synthetic_type_head_from_module_def(
@@ -1013,96 +1216,6 @@ impl<'db> SnapshotBuilder<'db> {
             .unwrap_or_else(|| "unknown".to_string());
         self.host
             .intern_def_from_token(format!("{label}:{path}:{owner_key}").as_str())
-    }
-
-    fn safe_type_arguments(&self, ty: &Type<'db>) -> Vec<Type<'db>> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ty.type_arguments().collect::<Vec<_>>()
-        }))
-        .unwrap_or_default()
-    }
-
-    fn safe_function_ret_type(&self, function: Function) -> Option<Type<'db>> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| function.ret_type(self.db))).ok()
-    }
-
-    fn safe_function_async_ret_type(&self, function: Function) -> Option<Type<'db>> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            function.async_ret_type(self.db)
-        }))
-        .ok()
-        .flatten()
-    }
-
-    fn safe_impl_self_ty(&self, impl_def: Impl) -> Option<Type<'db>> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| impl_def.self_ty(self.db))).ok()
-    }
-
-    fn safe_impl_trait(&self, impl_def: Impl) -> Option<hir::Trait> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| impl_def.trait_(self.db)))
-            .ok()
-            .flatten()
-    }
-
-    fn safe_impl_trait_type_argument(&self, impl_def: Impl, index: usize) -> Option<Type<'db>> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            impl_def
-                .trait_ref(self.db)
-                .and_then(|trait_ref| trait_ref.get_type_argument(index))
-                .map(|arg| arg.to_type(self.db))
-        }))
-        .ok()
-        .flatten()
-    }
-
-    fn safe_impl_items(&self, impl_def: Impl) -> Vec<AssocItem> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| impl_def.items(self.db)))
-            .unwrap_or_default()
-    }
-
-    fn safe_nth_type_argument(&self, ty: &Type<'db>, index: usize) -> Option<Type<'db>> {
-        self.safe_type_arguments(ty).into_iter().nth(index)
-    }
-
-    fn safe_type_and_const_arguments(&self, function: Function, ty: &Type<'db>) -> Vec<String> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ty.type_and_const_arguments(self.db, function.krate(self.db).to_display_target(self.db))
-                .map(|arg| arg.to_string())
-                .collect::<Vec<_>>()
-        }))
-        .unwrap_or_default()
-    }
-
-    fn return_type_from_semantic_source(&self, function: Function) -> Option<ast::Type> {
-        let source = function.source(self.db)?;
-        let editioned = source.file_id.original_file(self.db);
-        let parsed = self.sema.parse(editioned);
-        let fn_range = source.value.syntax().text_range();
-        parsed
-            .syntax()
-            .descendants()
-            .filter_map(ast::Fn::cast)
-            .find(|item| item.syntax().text_range() == fn_range)
-            .and_then(|item| item.ret_type())
-            .and_then(|ret| ret.ty())
-    }
-
-    fn error_def_from_return_type_alias_paths(&mut self, ret_type: &ast::Type) -> Option<DefId> {
-        for path in ret_type.syntax().descendants().filter_map(ast::Path::cast) {
-            let Some(hir::PathResolution::Def(ModuleDef::TypeAlias(alias))) =
-                self.sema.resolve_path(&path)
-            else {
-                continue;
-            };
-            let alias_ty = alias.ty(self.db);
-            if let Some(error_ty) = self.result_error_type_argument(alias_ty.clone()) {
-                return Some(self.def_from_type_head(error_ty, None));
-            }
-            if alias_ty.as_adt().is_some() || alias_ty.as_dyn_trait().is_some() {
-                return Some(self.def_from_type_head(alias_ty, None));
-            }
-        }
-        None
     }
 
     fn matches_function_error_type(
@@ -1142,100 +1255,6 @@ impl<'db> SnapshotBuilder<'db> {
         }
 
         self.def_from_type_head(ty, None) == function_error
-    }
-
-    fn resolve_call_expr_target(&mut self, expr: &ast::Expr) -> Option<(DefId, DispatchKind)> {
-        if let Some(callable) = self.sema.resolve_expr_as_callable(expr) {
-            return Some(
-                self.resolve_callable_kind_target(callable.kind(), expr.syntax().text_range()),
-            );
-        }
-
-        match expr {
-            ast::Expr::PathExpr(path_expr) => {
-                let path = path_expr.path()?;
-                self.resolve_def_from_call_path(&path)
-                    .map(|callee| (callee, DispatchKind::Direct))
-            }
-            _ => None,
-        }
-    }
-
-    fn resolve_method_call_target(&self, method_call: &ast::MethodCallExpr) -> Option<DefId> {
-        let name = method_call.name_ref()?.syntax().text().to_string();
-        let candidates = self.defs_by_name.get(name.as_str())?;
-        if candidates.len() == 1 {
-            candidates.iter().next().copied()
-        } else {
-            None
-        }
-    }
-
-    fn resolve_method_call_target_semantic(
-        &mut self,
-        method_call: &ast::MethodCallExpr,
-    ) -> Option<(DefId, DispatchKind)> {
-        let resolved = self.sema.resolve_method_call(method_call)?;
-        let callee = self
-            .register_module_def(ModuleDef::Function(resolved), false)
-            .unwrap_or_else(|| {
-                self.synthetic_def("method_semantic", method_call.syntax().text_range())
-            });
-        let dispatch = self
-            .sema
-            .resolve_method_call_as_callable(method_call)
-            .map(|callable| callable.kind())
-            .map(|kind| match kind {
-                CallableKind::FnImpl(_) => DispatchKind::ThroughTrait,
-                CallableKind::Closure(_) => DispatchKind::Closure,
-                CallableKind::FnPtr => DispatchKind::FnPointer,
-                CallableKind::Function(_)
-                | CallableKind::TupleStruct(_)
-                | CallableKind::TupleEnumVariant(_) => DispatchKind::Direct,
-            })
-            .unwrap_or(DispatchKind::Direct);
-        Some((callee, dispatch))
-    }
-
-    fn resolve_callable_kind_target(
-        &mut self,
-        kind: CallableKind<'db>,
-        site: TextRange,
-    ) -> (DefId, DispatchKind) {
-        match kind {
-            CallableKind::Function(function) => (
-                self.register_module_def(ModuleDef::Function(function), false)
-                    .unwrap_or_else(|| self.synthetic_def("callable_function", site)),
-                DispatchKind::Direct,
-            ),
-            CallableKind::TupleStruct(strukt) => (
-                self.register_module_def(ModuleDef::Adt(Adt::Struct(strukt)), false)
-                    .unwrap_or_else(|| self.synthetic_def("callable_tuple_struct", site)),
-                DispatchKind::Direct,
-            ),
-            CallableKind::TupleEnumVariant(variant) => (
-                self.register_module_def(ModuleDef::Variant(variant), false)
-                    .unwrap_or_else(|| self.synthetic_def("callable_tuple_variant", site)),
-                DispatchKind::Direct,
-            ),
-            CallableKind::Closure(_) => (
-                self.synthetic_def("callable_closure", site),
-                DispatchKind::Closure,
-            ),
-            CallableKind::FnPtr => (
-                self.synthetic_def("callable_fn_ptr", site),
-                DispatchKind::FnPointer,
-            ),
-            CallableKind::FnImpl(_) => (
-                self.synthetic_def("callable_fn_impl", site),
-                DispatchKind::ThroughTrait,
-            ),
-        }
-    }
-
-    fn resolve_def_from_call_path(&self, path: &ast::Path) -> Option<DefId> {
-        let path_text = path_to_string(path)?;
-        self.resolve_def_from_type_path(path_text.as_str())
     }
 
     fn source_loc_for_module_def(&self, def: ModuleDef) -> Option<SourceLoc> {
@@ -1402,8 +1421,8 @@ impl<'db> SnapshotBuilder<'db> {
                 });
             return TypeShape::App {
                 head: def,
-                args: self
-                    .safe_type_arguments(&ty)
+                args: ty
+                    .type_arguments()
                     .into_iter()
                     .map(|arg| GenericArg::Type(self.intern_type_ref(arg, owner)))
                     .collect(),
@@ -1422,8 +1441,8 @@ impl<'db> SnapshotBuilder<'db> {
                 });
             return TypeShape::App {
                 head: def,
-                args: self
-                    .safe_type_arguments(&ty)
+                args: ty
+                    .type_arguments()
                     .into_iter()
                     .map(|arg| GenericArg::Type(self.intern_type_ref(arg, owner)))
                     .collect(),
@@ -1437,77 +1456,9 @@ impl<'db> SnapshotBuilder<'db> {
         TypeShape::Unknown
     }
 
-    fn best_effort_result_error_def(
-        &mut self,
-        function: Function,
-        ret_ty: Type<'db>,
-    ) -> Option<DefId> {
+    fn best_effort_result_error_def(&mut self, _function: Function, ret_ty: Type<'db>) -> Option<DefId> {
         if let Some(error_ty) = self.result_error_type_argument(ret_ty.clone()) {
             return Some(self.def_from_type_head(error_ty, None));
-        }
-        self.textual_result_error_fallback(function, ret_ty)
-    }
-
-    fn textual_result_error_fallback(
-        &mut self,
-        function: Function,
-        ret_ty: Type<'db>,
-    ) -> Option<DefId> {
-        let ret_type_syntax = self.return_type_from_semantic_source(function);
-        let ret_text = ret_type_syntax
-            .as_ref()
-            .map(|ret| ret.syntax().text().to_string());
-        let result_like_by_syntax = ret_text
-            .as_ref()
-            .is_some_and(|text| text.contains("Result"));
-        let result_like_by_type = ret_ty.as_adt().is_some_and(|adt| self.is_result_head(adt));
-        if !result_like_by_syntax && !result_like_by_type {
-            return None;
-        }
-        if let Some(ret_type) = ret_type_syntax.as_ref()
-            && let Some(error_def) = self.error_def_from_return_type_alias_paths(ret_type)
-        {
-            return Some(error_def);
-        }
-
-        let args = self.safe_type_and_const_arguments(function, &ret_ty);
-        if let Some(error_name) = args.get(1).map(ToString::to_string) {
-            if let Some(def) = self.resolve_def_from_type_path(error_name.as_str()) {
-                return Some(def);
-            }
-            if let Some(candidates) = self.defs_by_name.get(error_name.as_str())
-                && candidates.len() == 1
-            {
-                return candidates.iter().next().copied();
-            }
-            return Some(
-                self.host
-                    .intern_def_from_token(format!("result_error:{error_name}").as_str()),
-            );
-        }
-
-        if let Some(ret_text) = ret_text.as_ref()
-            && let Some(error_name) = extract_result_error_name_from_text(ret_text.as_str())
-        {
-            if let Some(def) = self.resolve_def_from_type_path(error_name.as_str()) {
-                return Some(def);
-            }
-            if let Some(candidates) = self.defs_by_name.get(error_name.as_str())
-                && candidates.len() == 1
-            {
-                return candidates.iter().next().copied();
-            }
-            return Some(
-                self.host
-                    .intern_def_from_token(format!("result_error:{error_name}").as_str()),
-            );
-        }
-        if result_like_by_syntax {
-            let ret_text = ret_text.unwrap_or_else(|| "Result<?>".to_string());
-            return Some(
-                self.host
-                    .intern_def_from_token(format!("result_error_text:{ret_text}").as_str()),
-            );
         }
         None
     }
@@ -1559,63 +1510,6 @@ impl<'db> SnapshotBuilder<'db> {
         )
     }
 
-    fn resolve_def_from_type_path(&self, path: &str) -> Option<DefId> {
-        let mut candidates = Vec::new();
-        let trimmed = path.trim().trim_start_matches("::");
-        if trimmed.is_empty() {
-            return None;
-        }
-
-        candidates.push(trimmed.to_string());
-        if let Some(stripped) = trimmed.strip_prefix("crate::") {
-            candidates.push(stripped.to_string());
-        } else {
-            candidates.push(format!("crate::{trimmed}"));
-        }
-        if let Some(stripped) = trimmed.strip_prefix("self::") {
-            candidates.push(format!("crate::{stripped}"));
-        }
-        if let Some(stripped) = trimmed.strip_prefix("super::") {
-            candidates.push(format!("crate::{stripped}"));
-        }
-
-        for candidate in candidates {
-            if let Some(def) = self.defs_by_path.get(candidate.as_str()) {
-                return Some(*def);
-            }
-        }
-
-        let tail = trimmed.rsplit("::").next().unwrap_or(trimmed);
-        if let Some(candidates) = self.defs_by_name.get(tail)
-            && candidates.len() == 1
-        {
-            return candidates.iter().next().copied();
-        }
-
-        None
-    }
-
-    fn synthetic_def(&mut self, label: &str, range: TextRange) -> DefId {
-        self.host.intern_def_from_token(
-            format!(
-                "{label}:{}..{}",
-                u32::from(range.start()),
-                u32::from(range.end())
-            )
-            .as_str(),
-        )
-    }
-
-    fn unknown_type_ref(&mut self, token: &str) -> TypeRefId {
-        if let Some(existing) = self.typeref_by_key.get(token) {
-            return *existing;
-        }
-        let type_ref = self.host.intern_typeref_from_token(&token);
-        self.host.insert_type(type_ref, TypeShape::Unknown);
-        self.typeref_by_key.insert(token.to_string(), type_ref);
-        type_ref
-    }
-
     fn type_fingerprint(&mut self, ty: Type<'db>, owner: Option<DefId>) -> String {
         if ty.is_unknown() {
             return "unknown".to_string();
@@ -1665,8 +1559,8 @@ impl<'db> SnapshotBuilder<'db> {
                         head_adt.name(self.db).display(self.db, Edition::CURRENT)
                     )
                 });
-            let args = self
-                .safe_type_arguments(&ty)
+            let args = ty
+                .type_arguments()
                 .into_iter()
                 .map(|arg| self.type_fingerprint(arg, owner))
                 .collect::<Vec<_>>();
@@ -1687,8 +1581,8 @@ impl<'db> SnapshotBuilder<'db> {
                         head_trait.name(self.db).display(self.db, Edition::CURRENT)
                     )
                 });
-            let args = self
-                .safe_type_arguments(&ty)
+            let args = ty
+                .type_arguments()
                 .into_iter()
                 .map(|arg| self.type_fingerprint(arg, owner))
                 .collect::<Vec<_>>();
@@ -1971,24 +1865,9 @@ fn collect_local_files(
     });
 
     let mut files = BTreeMap::new();
-    let mut library_files = 0_usize;
-    let mut library_files_per_root: HashMap<base_db::SourceRootId, usize> = HashMap::new();
-    const MAX_LIBRARY_FILES: usize = 25_000;
-    const MAX_LIBRARY_FILES_PER_ROOT: usize = 5_000;
-
     for candidate in candidates {
         if candidate.is_library {
-            if library_files >= MAX_LIBRARY_FILES {
-                continue;
-            }
-            let root_count = library_files_per_root
-                .entry(candidate.source_root_id)
-                .or_default();
-            if *root_count >= MAX_LIBRARY_FILES_PER_ROOT {
-                continue;
-            }
-            library_files += 1;
-            *root_count += 1;
+            continue;
         }
 
         let abs_path = Path::new(candidate.abs_path.as_str());
@@ -2121,55 +2000,6 @@ fn normalize_canonical_path(path: String) -> String {
         format!("crate::{tail}")
     } else {
         format!("crate::{path}")
-    }
-}
-
-fn path_to_string(path: &ast::Path) -> Option<String> {
-    let segments = path
-        .segments()
-        .filter_map(|segment| {
-            segment
-                .name_ref()
-                .map(|name| name.syntax().text().to_string())
-        })
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
-        None
-    } else {
-        Some(segments.join("::"))
-    }
-}
-
-fn extract_result_error_name_from_text(ret_text: &str) -> Option<String> {
-    let marker = ret_text.find("Result<")?;
-    let start = marker + "Result<".len();
-    let generic_text = &ret_text[start..];
-
-    let mut depth = 0_u32;
-    let mut comma = None;
-    let mut end = None;
-    for (idx, ch) in generic_text.char_indices() {
-        match ch {
-            '<' => depth += 1,
-            '>' => {
-                if depth == 0 {
-                    end = Some(idx);
-                    break;
-                }
-                depth -= 1;
-            }
-            ',' if depth == 0 && comma.is_none() => comma = Some(idx),
-            _ => {}
-        }
-    }
-
-    let comma = comma?;
-    let end = end?;
-    let error_name = generic_text[comma + 1..end].trim();
-    if error_name.is_empty() {
-        None
-    } else {
-        Some(error_name.to_string())
     }
 }
 

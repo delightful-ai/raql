@@ -1820,6 +1820,7 @@ dependencies = [
  "hir-expand",
  "hir-ty",
  "ide",
+ "ide-db",
  "intern",
  "line-index",
  "load-cargo",

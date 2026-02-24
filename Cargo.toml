@@ -46,6 +46,7 @@ line-index               = "0.1.2"
 
 # rust-analyzer crates (upstream main workspace)
 ide                      = { package = "ide", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+ide-db                   = { package = "ide-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 hir                      = { package = "hir", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 hir-def                  = { package = "hir-def", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 hir-expand               = { package = "hir-expand", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }

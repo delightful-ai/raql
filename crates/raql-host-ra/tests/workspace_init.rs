@@ -782,12 +782,27 @@ pub fn direct_result() -> Result<(), OuterErr> {
 .decl ty_arg(T: TypeRef, Ix: int, Arg: TypeRef) extern.
 
 .decl direct_error_ok().
+.decl alias_error_ok().
+.decl nested_error_ok().
 .decl return_arg_ok().
 
 direct_error_ok() :-
   def(F),
   def_name(F, "direct_result"),
-  fn_error_type(F, some(_)).
+  fn_error_type(F, some(E)),
+  def_name(E, "OuterErr").
+
+alias_error_ok() :-
+  def(F),
+  def_name(F, "via_alias"),
+  fn_error_type(F, some(E)),
+  def_name(E, "OuterErr").
+
+nested_error_ok() :-
+  def(F),
+  def_name(F, "via_nested_alias"),
+  fn_error_type(F, some(E)),
+  def_name(E, "OuterErr").
 
 return_arg_ok() :-
   def(F),
@@ -808,7 +823,75 @@ return_arg_ok() :-
     assert!(
         result
             .relations
+            .get("alias_error_ok")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("nested_error_ok")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
             .get("return_arg_ok")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}
+
+#[test]
+fn field_types_are_semantically_populated() {
+    let root = temp_dir("field_types_semantic");
+    write_package(
+        &root,
+        "field_types_semantic",
+        r#"
+pub struct Record {
+    pub count: u32,
+    pub enabled: bool,
+}
+"#,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+
+    let result = run_query(
+        r#"
+.decl def(D: Def) extern.
+.decl def_name(D: Def, Name: string) extern.
+.decl field(Owner: Def, Name: string, Ty: TypeRef) extern.
+.decl ty_prim(T: TypeRef, Name: string) extern.
+
+.decl count_field_typed().
+.decl enabled_field_typed().
+
+count_field_typed() :-
+  def(Owner),
+  def_name(Owner, "Record"),
+  field(Owner, "count", Ty),
+  ty_prim(Ty, "u32").
+
+enabled_field_typed() :-
+  def(Owner),
+  def_name(Owner, "Record"),
+  field(Owner, "enabled", Ty),
+  ty_prim(Ty, "bool").
+"#,
+        &mut runtime,
+    );
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("count_field_typed")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("enabled_field_typed")
             .is_some_and(|rows| !rows.is_empty())
     );
 }

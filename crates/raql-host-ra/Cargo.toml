@@ -13,6 +13,7 @@ raql-engine = { path = "../raql-engine" }
 
 # rust-analyzer crates
 ide.workspace = true
+ide-db.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
