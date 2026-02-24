@@ -6,7 +6,7 @@ use std::process::Command;
 use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::{EngineHostView, EvalStatus, execute};
 use raql_host::HostRuntime;
-use raql_host_ra::{RaHostRuntime, WorkspaceInitMode};
+use raql_host_ra::RaHostRuntime;
 use raql_syntax::parse_program;
 use serde::Deserialize;
 
@@ -24,7 +24,6 @@ struct CorpusCase {
     rev: String,
     workspace: String,
     local_path: Option<String>,
-    init_mode: CaseInitMode,
     expected_symbol: String,
     expected_path: String,
 }
@@ -36,22 +35,6 @@ enum CorpusKind {
     ProcMacroHeavy,
     HugeMonorepo,
     FeatureMatrix,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-enum CaseInitMode {
-    Strict,
-    Resilient,
-}
-
-impl From<CaseInitMode> for WorkspaceInitMode {
-    fn from(value: CaseInitMode) -> Self {
-        match value {
-            CaseInitMode::Strict => WorkspaceInitMode::Strict,
-            CaseInitMode::Resilient => WorkspaceInitMode::Resilient,
-        }
-    }
 }
 
 #[test]
@@ -121,11 +104,7 @@ fn conformance_corpus_runtime_gate() {
 
     for case in &manifest.case {
         let workspace = resolve_case_workspace(case, &repo_root, &cache_root);
-        let mut runtime = RaHostRuntime::from_workspace_root_with_mode(
-            workspace.as_path(),
-            case.init_mode.into(),
-        )
-        .unwrap_or_else(|err| {
+        let mut runtime = RaHostRuntime::from_workspace_root(workspace.as_path()).unwrap_or_else(|err| {
             panic!(
                 "failed to initialize conformance case `{}` at `{}`: {err}",
                 case.name,

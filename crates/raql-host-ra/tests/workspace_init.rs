@@ -4,7 +4,6 @@ use raql_engine::{EngineHostView, EvalResult, EvalStatus, RuntimeValue, execute}
 use raql_host::HostRuntime;
 use raql_host_ra::{
     RaHostInitError, RaHostRuntime, RuntimeScalarOptions, ScalarInputKey, ScalarValue, StableId,
-    WorkspaceInitMode,
 };
 use raql_syntax::parse_program;
 use std::fs;
@@ -91,39 +90,6 @@ hit() :- def(D), def_name(D, "via_manifest").
             .get("hit")
             .is_some_and(|rows| !rows.is_empty())
     );
-}
-
-#[test]
-fn resilient_init_falls_back_when_build_scripts_fail() {
-    let root = temp_dir("resilient_init_fallback");
-    write_package(
-        &root,
-        "resilient_init_fallback",
-        "pub fn available_without_build_scripts() {}\n",
-    );
-    fs::write(
-        root.join("build.rs").as_std_path(),
-        r#"
-fn main() {
-    panic!("intentional build script failure for resilient init test");
-}
-"#,
-    )
-    .expect("write failing build.rs");
-
-    let strict = RaHostRuntime::from_workspace_root_with_mode(
-        root.as_std_path(),
-        WorkspaceInitMode::Strict,
-    );
-
-    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
-    if strict.is_err() {
-        let notes = EngineHostView::take_runtime_notes(&mut runtime);
-        assert!(
-            notes.iter().any(|note| note.contains("resilient mode")),
-            "resilient init should surface fallback note when strict init fails, got: {notes:?}"
-        );
-    }
 }
 
 #[test]
@@ -320,43 +286,15 @@ hit() :- def(D), def_name(D, "after_reload").
 }
 
 #[test]
-fn runtime_auto_reload_refreshes_on_query_boundary() {
-    let root = temp_dir("runtime_auto_reload");
-    write_package(
-        &root,
-        "runtime_auto_reload",
-        "pub fn before_auto_reload() {}\n",
-    );
+fn reload_now_propagates_workspace_load_errors() {
+    let root = temp_dir("runtime_reload_error");
+    write_package(&root, "runtime_reload_error", "pub fn marker() {}\n");
 
     let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
-    runtime.set_hot_reload_poll_interval(Duration::from_millis(0));
-    runtime.set_hot_reload_enabled(true);
+    fs::remove_file(root.join("Cargo.toml").as_std_path()).expect("remove manifest");
 
-    std::thread::sleep(Duration::from_millis(20));
-    fs::write(
-        root.join("src/lib.rs").as_std_path(),
-        "pub fn before_auto_reload() {}\npub fn auto_reloaded() {}\n",
-    )
-    .expect("rewrite lib.rs");
-
-    let result = run_query(
-        r#"
-.decl hit().
-.decl def(D: Def) extern.
-.decl def_name(D: Def, Name: string) extern.
-
-hit() :- def(D), def_name(D, "auto_reloaded").
-"#,
-        &mut runtime,
-    );
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("hit")
-            .is_some_and(|rows| !rows.is_empty()),
-        "auto reload should refresh snapshot before query execution"
-    );
+    let err = runtime.reload_now().expect_err("reload should fail");
+    assert!(matches!(err, RaHostInitError::WorkspaceNotFound { .. }));
 }
 
 #[test]
@@ -398,47 +336,6 @@ fn runtime_reload_preserves_runtime_scalar_configuration() {
     assert_eq!(
         HostRuntime::stable_id(&runtime, "cfg", "engine.path.limit").expect("stable id override"),
         override_id
-    );
-}
-
-#[test]
-fn re_enabling_hot_reload_applies_changes_made_while_disabled() {
-    let root = temp_dir("runtime_hot_reload_toggle");
-    write_package(
-        &root,
-        "runtime_hot_reload_toggle",
-        "pub fn before_toggle() {}\n",
-    );
-
-    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
-    runtime.set_hot_reload_poll_interval(Duration::from_millis(0));
-    runtime.set_hot_reload_enabled(false);
-
-    std::thread::sleep(Duration::from_millis(20));
-    fs::write(
-        root.join("src/lib.rs").as_std_path(),
-        "pub fn before_toggle() {}\npub fn added_while_disabled() {}\n",
-    )
-    .expect("rewrite lib.rs");
-
-    runtime.set_hot_reload_enabled(true);
-    let result = run_query(
-        r#"
-.decl hit().
-.decl def(D: Def) extern.
-.decl def_name(D: Def, Name: string) extern.
-
-hit() :- def(D), def_name(D, "added_while_disabled").
-"#,
-        &mut runtime,
-    );
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("hit")
-            .is_some_and(|rows| !rows.is_empty()),
-        "re-enabled hot reload should apply edits made while it was disabled"
     );
 }
 

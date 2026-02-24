@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use hir_def::{DefWithBodyId, ImplId as HirImplId, ModuleDefId};
 use hir_expand::MacroCallId;
@@ -137,13 +136,6 @@ pub enum RaHostInitError {
     SemanticBuild { details: String },
     #[error("proc-macro server unavailable during workspace load")]
     ProcMacroUnavailable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WorkspaceInitMode {
-    Strict,
-    #[default]
-    Resilient,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1647,7 +1639,7 @@ impl DeterministicRaHost {
     }
 }
 
-/// rust-analyzer-backed runtime adapter with optional workspace hot reload,
+/// rust-analyzer-backed runtime adapter with explicit workspace reload,
 /// delegating host-contract behavior to [`DeterministicRaHost`].
 #[derive(Debug)]
 pub struct RaHostRuntime {
@@ -1656,29 +1648,6 @@ pub struct RaHostRuntime {
     _proc_macro_client: Option<Box<dyn workspace_loader::ProcMacroClientHandle>>,
     workspace_root: Option<PathBuf>,
     manifest_path: Option<PathBuf>,
-    init_mode: WorkspaceInitMode,
-    hot_reload: HotReloadState,
-}
-
-#[derive(Debug, Clone)]
-struct HotReloadState {
-    enabled: bool,
-    poll_interval: Duration,
-    next_poll_after: Instant,
-    workspace_fingerprint: Option<u64>,
-    tracked_paths: Vec<PathBuf>,
-}
-
-impl HotReloadState {
-    fn disabled() -> Self {
-        Self {
-            enabled: false,
-            poll_interval: Duration::from_millis(750),
-            next_poll_after: Instant::now(),
-            workspace_fingerprint: None,
-            tracked_paths: Vec::new(),
-        }
-    }
 }
 
 impl RaHostRuntime {
@@ -1691,39 +1660,20 @@ impl RaHostRuntime {
             _proc_macro_client: None,
             workspace_root: None,
             manifest_path: None,
-            init_mode: WorkspaceInitMode::Resilient,
-            hot_reload: HotReloadState::disabled(),
         }
     }
 
     pub fn from_workspace_root(root: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
-        Self::from_workspace_root_with_mode(root, WorkspaceInitMode::Resilient)
-    }
-
-    pub fn from_workspace_root_with_mode(
-        root: impl AsRef<Path>,
-        mode: WorkspaceInitMode,
-    ) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_workspace_root(root.as_ref(), mode)?;
-        Self::from_loaded_workspace(loaded, mode)
+        let loaded = workspace_loader::load_from_workspace_root(root.as_ref())?;
+        Self::from_loaded_workspace(loaded)
     }
 
     pub fn from_manifest_path(manifest: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
-        Self::from_manifest_path_with_mode(manifest, WorkspaceInitMode::Resilient)
+        let loaded = workspace_loader::load_from_manifest_path(manifest.as_ref())?;
+        Self::from_loaded_workspace(loaded)
     }
 
-    pub fn from_manifest_path_with_mode(
-        manifest: impl AsRef<Path>,
-        mode: WorkspaceInitMode,
-    ) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_manifest_path(manifest.as_ref(), mode)?;
-        Self::from_loaded_workspace(loaded, mode)
-    }
-
-    fn from_loaded_workspace(
-        loaded: workspace_loader::LoadedWorkspace,
-        mode: WorkspaceInitMode,
-    ) -> Result<Self, RaHostInitError> {
+    fn from_loaded_workspace(loaded: workspace_loader::LoadedWorkspace) -> Result<Self, RaHostInitError> {
         let workspace_loader::LoadedWorkspace {
             manifest_path,
             workspace_root,
@@ -1732,8 +1682,6 @@ impl RaHostRuntime {
             init_notes,
             proc_macro_client,
         } = loaded;
-        let tracked_paths =
-            collect_reload_tracked_paths(&vfs, manifest_path.as_path(), workspace_root.as_path());
         let host = workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
         let world_stamp =
             HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
@@ -1745,17 +1693,6 @@ impl RaHostRuntime {
         runtime._proc_macro_client = proc_macro_client;
         runtime.workspace_root = Some(workspace_root.clone());
         runtime.manifest_path = Some(manifest_path);
-        runtime.init_mode = mode;
-        runtime.hot_reload = HotReloadState {
-            enabled: true,
-            poll_interval: Duration::from_millis(750),
-            next_poll_after: Instant::now() + Duration::from_millis(750),
-            workspace_fingerprint: Some(workspace_reload_fingerprint(
-                workspace_root.as_path(),
-                tracked_paths.as_slice(),
-            )),
-            tracked_paths,
-        };
         for note in init_notes {
             runtime.host.record_runtime_note(note);
         }
@@ -1778,65 +1715,18 @@ impl RaHostRuntime {
         self.analysis().status(None).is_ok()
     }
 
-    pub fn set_hot_reload_enabled(&mut self, enabled: bool) {
-        self.hot_reload.enabled = enabled;
-        self.hot_reload.next_poll_after = Instant::now();
-        if enabled && self.hot_reload.workspace_fingerprint.is_none() {
-            self.hot_reload.workspace_fingerprint = self
-                .workspace_root
-                .as_ref()
-                .map(|root| {
-                    workspace_reload_fingerprint(
-                        root.as_path(),
-                        self.hot_reload.tracked_paths.as_slice(),
-                    )
-                });
-        }
-    }
-
-    pub fn set_hot_reload_poll_interval(&mut self, interval: Duration) {
-        self.hot_reload.poll_interval = interval;
-        self.hot_reload.next_poll_after = Instant::now() + interval;
-    }
-
     pub fn reload_now(&mut self) -> Result<(), RaHostInitError> {
         let loaded = self.load_workspace_for_reload()?;
         self.apply_loaded_workspace(loaded)?;
-        self.hot_reload.next_poll_after = Instant::now() + self.hot_reload.poll_interval;
         Ok(())
-    }
-
-    pub fn maybe_reload(&mut self) -> Result<bool, RaHostInitError> {
-        if !self.hot_reload.enabled {
-            return Ok(false);
-        }
-        if Instant::now() < self.hot_reload.next_poll_after {
-            return Ok(false);
-        }
-
-        self.hot_reload.next_poll_after = Instant::now() + self.hot_reload.poll_interval;
-        let Some(workspace_root) = self.workspace_root.as_ref() else {
-            return Ok(false);
-        };
-        let fingerprint = workspace_reload_fingerprint(
-            workspace_root.as_path(),
-            self.hot_reload.tracked_paths.as_slice(),
-        );
-        if self.hot_reload.workspace_fingerprint == Some(fingerprint) {
-            return Ok(false);
-        }
-
-        self.reload_now()?;
-        self.hot_reload.workspace_fingerprint = Some(fingerprint);
-        Ok(true)
     }
 
     fn load_workspace_for_reload(&self) -> Result<workspace_loader::LoadedWorkspace, RaHostInitError> {
         if let Some(manifest_path) = self.manifest_path.as_ref() {
-            return workspace_loader::load_from_manifest_path(manifest_path.as_path(), self.init_mode);
+            return workspace_loader::load_from_manifest_path(manifest_path.as_path());
         }
         if let Some(workspace_root) = self.workspace_root.as_ref() {
-            return workspace_loader::load_from_workspace_root(workspace_root.as_path(), self.init_mode);
+            return workspace_loader::load_from_workspace_root(workspace_root.as_path());
         }
         Err(RaHostInitError::SemanticBuild {
             details: "runtime reload unavailable without workspace initialization context".to_string(),
@@ -1861,8 +1751,6 @@ impl RaHostRuntime {
             init_notes,
             proc_macro_client,
         } = loaded;
-        let tracked_paths =
-            collect_reload_tracked_paths(&vfs, manifest_path.as_path(), workspace_root.as_path());
 
         let mut host = workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
         let _ = HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
@@ -1882,29 +1770,7 @@ impl RaHostRuntime {
         self._proc_macro_client = proc_macro_client;
         self.workspace_root = Some(workspace_root.clone());
         self.manifest_path = Some(manifest_path);
-        self.hot_reload.tracked_paths = tracked_paths;
-        self.hot_reload.workspace_fingerprint = if self.hot_reload.enabled {
-            Some(workspace_reload_fingerprint(
-                workspace_root.as_path(),
-                self.hot_reload.tracked_paths.as_slice(),
-            ))
-        } else {
-            None
-        };
         Ok(())
-    }
-
-    fn auto_reload_if_needed(&mut self) {
-        match self.maybe_reload() {
-            Ok(true) => {}
-            Ok(false) => {}
-            Err(err) => {
-                self.hot_reload.enabled = false;
-                self.host_mut().record_runtime_note(format!(
-                    "workspace hot reload disabled after failure: {err}"
-                ));
-            }
-        }
     }
 
     pub fn insert_handle(&mut self, def: DefId, handle: impl Into<StableHandle>) {
@@ -2086,7 +1952,6 @@ impl EngineHostView for DeterministicRaHost {
 
 impl EngineHostView for RaHostRuntime {
     fn world_stamp(&mut self) -> String {
-        self.auto_reload_if_needed();
         match HostRuntime::world_stamp(self) {
             Ok(stamp) => stamp.as_str().to_string(),
             Err(err) => format!("ra-host:error:{err}"),
@@ -2094,7 +1959,6 @@ impl EngineHostView for RaHostRuntime {
     }
 
     fn stable_key(&mut self, value: &RuntimeValue) -> String {
-        self.auto_reload_if_needed();
         let resolution = runtime_value_stable_key_with_runtime(self, value);
         for note in resolution.runtime_notes {
             self.host_mut().record_runtime_note(note);
@@ -2114,7 +1978,6 @@ impl EngineHostView for RaHostRuntime {
         &mut self,
         predicate: &str,
     ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
-        self.auto_reload_if_needed();
         self.host_mut()
             .extern_relation_rows_for_predicate_result(predicate)
             .map_err(|error| {
@@ -2146,86 +2009,6 @@ fn deterministic_stable_id(namespace: &str, logical_name: &str) -> StableId {
     0xff_u8.hash(&mut hasher);
     logical_name.hash(&mut hasher);
     StableId::new(hasher.finish())
-}
-
-fn collect_reload_tracked_paths(
-    vfs: &vfs::Vfs,
-    manifest_path: &Path,
-    workspace_root: &Path,
-) -> Vec<PathBuf> {
-    let mut tracked = BTreeSet::new();
-
-    tracked.insert(manifest_path.to_path_buf());
-    tracked.insert(workspace_root.join("Cargo.lock"));
-    tracked.insert(workspace_root.join("rust-toolchain"));
-    tracked.insert(workspace_root.join("rust-toolchain.toml"));
-
-    for (_, path) in vfs.iter() {
-        let Some(abs) = path.as_path() else {
-            continue;
-        };
-        let as_path = Path::new(abs.as_str());
-        if !as_path.starts_with(workspace_root) || !should_track_reload_file(as_path) {
-            continue;
-        }
-        tracked.insert(as_path.to_path_buf());
-    }
-
-    tracked.into_iter().collect()
-}
-
-fn workspace_reload_fingerprint(workspace_root: &Path, tracked_paths: &[PathBuf]) -> u64 {
-    let mut hasher = FxHasher::default();
-    for path in tracked_paths {
-        hash_reload_path_metadata(&mut hasher, workspace_root, path.as_path());
-    }
-    tracked_paths.len().hash(&mut hasher);
-    hasher.finish()
-}
-
-fn should_track_reload_file(path: &Path) -> bool {
-    let file_name = path.file_name().and_then(|name| name.to_str());
-    if file_name.is_some_and(|name| {
-        matches!(
-            name,
-            "Cargo.toml" | "Cargo.lock" | "build.rs" | "rust-toolchain" | "rust-toolchain.toml"
-        )
-    }) {
-        return true;
-    }
-
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext, "rs" | "toml"))
-}
-
-fn hash_reload_path_metadata(
-    hasher: &mut FxHasher,
-    workspace_root: &Path,
-    path: &Path,
-) {
-    let rel_path = path
-        .strip_prefix(workspace_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    rel_path.hash(hasher);
-
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            metadata.len().hash(hasher);
-            if let Ok(modified) = metadata.modified()
-                && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
-            {
-                duration.as_secs().hash(hasher);
-                duration.subsec_nanos().hash(hasher);
-            }
-        }
-        Err(err) => {
-            "metadata_unavailable".hash(hasher);
-            err.kind().hash(hasher);
-        }
-    }
 }
 
 fn rv_def(def: DefId) -> RuntimeValue {
@@ -3098,5 +2881,17 @@ edition = "2021"
             Some(ScalarValue::I64(7))
         );
         assert_eq!(runtime.world_stamp().expect("stamp").as_str(), "cfg:test");
+    }
+
+    #[test]
+    fn reload_now_fails_without_workspace_initialization_context() {
+        let root = temp_workspace("reload_missing_context", "pub fn marker() {}\n");
+        let mut runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
+        runtime.workspace_root = None;
+        runtime.manifest_path = None;
+
+        let err = runtime.reload_now().expect_err("reload should fail without context");
+        assert!(matches!(err, super::RaHostInitError::SemanticBuild { .. }));
+        assert!(err.to_string().contains("reload unavailable"));
     }
 }
