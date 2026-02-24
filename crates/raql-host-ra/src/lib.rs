@@ -231,6 +231,13 @@ struct WriteRecord {
     function: DefId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct SearchRecord {
+    key: Box<str>,
+    def: DefId,
+    score: i64,
+}
+
 /// Deterministic host model used for section-16 compliance tests and as a
 /// reusable substrate for rust-analyzer-backed runtime wiring.
 #[derive(Debug, Clone)]
@@ -260,6 +267,7 @@ pub struct DeterministicRaHost {
     handle_records: BTreeSet<HandleRecord>,
     compare_records: BTreeSet<CompareRecord>,
     write_records: BTreeSet<WriteRecord>,
+    search_records: BTreeSet<SearchRecord>,
     public_defs: BTreeSet<DefId>,
     test_defs: BTreeSet<DefId>,
     allowed_spans: Option<BTreeSet<SpanId>>,
@@ -305,6 +313,7 @@ impl DeterministicRaHost {
             handle_records: BTreeSet::new(),
             compare_records: BTreeSet::new(),
             write_records: BTreeSet::new(),
+            search_records: BTreeSet::new(),
             public_defs: BTreeSet::new(),
             test_defs: BTreeSet::new(),
             allowed_spans: None,
@@ -554,6 +563,14 @@ impl DeterministicRaHost {
             site,
             function,
         });
+    }
+
+    pub fn insert_search_record(&mut self, key: impl Into<Box<str>>, def: DefId, score: i64) {
+        let key = key.into();
+        if key.is_empty() {
+            return;
+        }
+        self.search_records.insert(SearchRecord { key, def, score });
     }
 
     #[cfg(test)]
@@ -1047,7 +1064,10 @@ impl DeterministicRaHost {
     }
 
     fn search_rows(&self) -> Vec<Vec<RuntimeValue>> {
-        let mut rows = Vec::new();
+        let mut rows = BTreeSet::new();
+        for record in &self.search_records {
+            rows.insert((record.key.to_string(), record.def, record.score));
+        }
         for def in self.known_defs() {
             let name = self.def_name_for(def);
             let path = self.def_path_for(def);
@@ -1070,14 +1090,14 @@ impl DeterministicRaHost {
                 } else {
                     70
                 };
-                rows.push(vec![
-                    RuntimeValue::String(key),
-                    rv_def(def),
-                    RuntimeValue::Int(score),
-                ]);
+                rows.insert((key, def, score));
             }
         }
-        rows
+        rows.into_iter()
+            .map(|(key, def, score)| {
+                vec![RuntimeValue::String(key), rv_def(def), RuntimeValue::Int(score)]
+            })
+            .collect()
     }
 }
 

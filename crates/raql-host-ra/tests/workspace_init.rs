@@ -943,6 +943,85 @@ hit() :-
 }
 
 #[test]
+fn usages_populate_ref_ids_and_search_hits() {
+    let root = temp_dir("usage_refs_and_search");
+    write_package(
+        &root,
+        "usage_refs_and_search",
+        r#"
+fn callee() {}
+
+fn caller() {
+    callee();
+}
+"#,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let ref_rows = EngineHostView::extern_relation_rows(&mut runtime, "ref_id")
+        .expect("ref_id rows")
+        .expect("ref_id predicate");
+    assert!(
+        !ref_rows.is_empty(),
+        "usages pass should populate reference IDs"
+    );
+
+    let search_rows = EngineHostView::extern_relation_rows(&mut runtime, "search")
+        .expect("search rows")
+        .expect("search predicate");
+    assert!(
+        search_rows.iter().any(|row| {
+            matches!(
+                row.as_slice(),
+                [RuntimeValue::String(key), _, RuntimeValue::Int(score)]
+                    if key == "callee" && *score == 115
+            )
+        }),
+        "search rows should include usage-backed hit with usage score"
+    );
+}
+
+#[test]
+fn unresolved_calls_are_omitted_in_strict_mode() {
+    let root = temp_dir("unresolved_call_omitted");
+    write_package(
+        &root,
+        "unresolved_call_omitted",
+        r#"
+mod b;
+
+fn caller() {
+    b::callee();
+}
+"#,
+    );
+    fs::write(root.join("src/b.rs").as_std_path(), "fn callee() {}\n").expect("write b.rs");
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let result = run_query(
+        r#"
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl def_name(D: Def, Name: string) extern.
+.decl unresolved_edge().
+
+unresolved_edge() :-
+  call_edge(Caller, _, _, _),
+  def_name(Caller, "caller").
+"#,
+        &mut runtime,
+    );
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("unresolved_edge")
+            .map_or(true, |rows| rows.is_empty())
+    );
+}
+
+#[test]
 fn call_edge_classifies_semantic_callable_dispatch_kinds() {
     let root = temp_dir("call_dispatch_semantics");
     write_package(
