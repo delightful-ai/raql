@@ -7,8 +7,6 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use hir_def::{DefWithBodyId, ImplId as HirImplId, ModuleDefId};
-use hir_expand::MacroCallId;
 use ide::{Analysis, AnalysisHost};
 use line_index::LineIndex;
 use raql_engine::{EngineHostError, EngineHostView, HostValueKind, RuntimeValue};
@@ -128,14 +126,12 @@ pub enum RaHostError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RaHostInitError {
-    #[error("workspace manifest not found for `{input_path}`")]
-    WorkspaceNotFound { input_path: String },
+    #[error("workspace manifest not found for `{input_path}`: {details}")]
+    WorkspaceNotFound { input_path: String, details: String },
     #[error("failed to load workspace `{manifest}`: {details}")]
     WorkspaceLoad { manifest: String, details: String },
     #[error("failed to build semantic workspace snapshot: {details}")]
     SemanticBuild { details: String },
-    #[error("proc-macro server unavailable during workspace load")]
-    ProcMacroUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -927,30 +923,12 @@ impl DeterministicRaHost {
         id
     }
 
-    pub fn intern_call_from_macro_call(&mut self, call: MacroCallId) -> CallId {
-        let token = format!("{call:?}");
-        let id = CallId::new(deterministic_stable_id("call", token.as_str()));
-        self.call_keys
-            .entry(id)
-            .or_insert_with(|| StableHandle::new(format!("call:{token}")));
-        id
-    }
-
     pub fn intern_ref_from_token<T: fmt::Debug>(&mut self, token: &T) -> RefId {
         let token = format!("{token:?}");
         let id = RefId::new(deterministic_stable_id("ref", token.as_str()));
         self.ref_keys
             .entry(id)
             .or_insert_with(|| StableHandle::new(format!("ref:{token}")));
-        id
-    }
-
-    pub fn intern_impl_from_hir_impl(&mut self, impl_id: HirImplId) -> ImplId {
-        let token = format!("{impl_id:?}");
-        let id = ImplId::new(deterministic_stable_id("impl", token.as_str()));
-        self.impl_keys
-            .entry(id)
-            .or_insert_with(|| StableHandle::new(format!("impl:{token}")));
         id
     }
 
@@ -1095,7 +1073,11 @@ impl DeterministicRaHost {
         }
         rows.into_iter()
             .map(|(key, def, score)| {
-                vec![RuntimeValue::String(key), rv_def(def), RuntimeValue::Int(score)]
+                vec![
+                    RuntimeValue::String(key),
+                    rv_def(def),
+                    RuntimeValue::Int(score),
+                ]
             })
             .collect()
     }
@@ -1693,7 +1675,9 @@ impl RaHostRuntime {
         Self::from_loaded_workspace(loaded)
     }
 
-    fn from_loaded_workspace(loaded: workspace_loader::LoadedWorkspace) -> Result<Self, RaHostInitError> {
+    fn from_loaded_workspace(
+        loaded: workspace_loader::LoadedWorkspace,
+    ) -> Result<Self, RaHostInitError> {
         let workspace_loader::LoadedWorkspace {
             manifest_path,
             workspace_root,
@@ -1741,7 +1725,9 @@ impl RaHostRuntime {
         Ok(())
     }
 
-    fn load_workspace_for_reload(&self) -> Result<workspace_loader::LoadedWorkspace, RaHostInitError> {
+    fn load_workspace_for_reload(
+        &self,
+    ) -> Result<workspace_loader::LoadedWorkspace, RaHostInitError> {
         if let Some(manifest_path) = self.manifest_path.as_ref() {
             return workspace_loader::load_from_manifest_path(manifest_path.as_path());
         }
@@ -1749,7 +1735,8 @@ impl RaHostRuntime {
             return workspace_loader::load_from_workspace_root(workspace_root.as_path());
         }
         Err(RaHostInitError::SemanticBuild {
-            details: "runtime reload unavailable without workspace initialization context".to_string(),
+            details: "runtime reload unavailable without workspace initialization context"
+                .to_string(),
         })
     }
 
@@ -1772,7 +1759,8 @@ impl RaHostRuntime {
             proc_macro_client,
         } = loaded;
 
-        let mut host = workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
+        let mut host =
+            workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
         let _ = HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
             details: err.to_string(),
         })?;
@@ -1837,16 +1825,6 @@ impl RaHostRuntime {
             .insert_stable_id_override(namespace, logical_name, id);
     }
 
-    pub fn intern_def_from_module_def(&mut self, def: ModuleDefId) -> DefId {
-        let token = format!("{def:?}");
-        self.host_mut().intern_def_from_token(token.as_str())
-    }
-
-    pub fn intern_def_from_body_def(&mut self, def: DefWithBodyId) -> DefId {
-        let token = format!("{def:?}");
-        self.host_mut().intern_def_from_token(token.as_str())
-    }
-
     pub fn intern_typeref_from_token<T: fmt::Debug>(&mut self, token: &T) -> TypeRefId {
         self.host_mut().intern_typeref_from_token(token)
     }
@@ -1855,16 +1833,8 @@ impl RaHostRuntime {
         self.host_mut().intern_node_from_syntax_ptr(node)
     }
 
-    pub fn intern_call_from_macro_call(&mut self, call: MacroCallId) -> CallId {
-        self.host_mut().intern_call_from_macro_call(call)
-    }
-
     pub fn intern_ref_from_token<T: fmt::Debug>(&mut self, token: &T) -> RefId {
         self.host_mut().intern_ref_from_token(token)
-    }
-
-    pub fn intern_impl_from_hir_impl(&mut self, impl_id: HirImplId) -> ImplId {
-        self.host_mut().intern_impl_from_hir_impl(impl_id)
     }
 
     pub fn intern_span_from_text(
@@ -2910,7 +2880,9 @@ edition = "2021"
         runtime.workspace_root = None;
         runtime.manifest_path = None;
 
-        let err = runtime.reload_now().expect_err("reload should fail without context");
+        let err = runtime
+            .reload_now()
+            .expect_err("reload should fail without context");
         assert!(matches!(err, super::RaHostInitError::SemanticBuild { .. }));
         assert!(err.to_string().contains("reload unavailable"));
     }

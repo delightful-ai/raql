@@ -7,6 +7,8 @@ use vfs::AbsPathBuf;
 
 use crate::RaHostInitError;
 
+const PROC_MACRO_UNAVAILABLE_NOTE: &str = "proc-macro server unavailable during workspace load; continuing with degraded macro expansion fidelity";
+
 pub(crate) trait ProcMacroClientHandle: std::any::Any + std::fmt::Debug {}
 impl<T> ProcMacroClientHandle for T where T: std::any::Any + std::fmt::Debug {}
 
@@ -20,17 +22,17 @@ pub(crate) struct LoadedWorkspace {
     pub(crate) proc_macro_client: Option<Box<dyn ProcMacroClientHandle>>,
 }
 
-pub(crate) fn load_from_workspace_root(
-    root: &Path,
-) -> Result<LoadedWorkspace, RaHostInitError> {
+pub(crate) fn load_from_workspace_root(root: &Path) -> Result<LoadedWorkspace, RaHostInitError> {
     let input_path = root.to_string_lossy().to_string();
-    let abs_root = canonical_abs(root).ok_or_else(|| RaHostInitError::WorkspaceNotFound {
+    let abs_root = canonical_abs(root).map_err(|details| RaHostInitError::WorkspaceNotFound {
         input_path: input_path.clone(),
+        details,
     })?;
 
-    let manifest = ProjectManifest::discover_single(abs_root.as_ref()).map_err(|_| {
+    let manifest = ProjectManifest::discover_single(abs_root.as_ref()).map_err(|err| {
         RaHostInitError::WorkspaceNotFound {
             input_path: input_path.clone(),
+            details: err.to_string(),
         }
     })?;
 
@@ -42,13 +44,15 @@ pub(crate) fn load_from_manifest_path(
 ) -> Result<LoadedWorkspace, RaHostInitError> {
     let input_path = manifest_path.to_string_lossy().to_string();
     let abs_manifest =
-        canonical_abs(manifest_path).ok_or_else(|| RaHostInitError::WorkspaceNotFound {
+        canonical_abs(manifest_path).map_err(|details| RaHostInitError::WorkspaceNotFound {
             input_path: input_path.clone(),
+            details,
         })?;
 
-    let manifest = ProjectManifest::from_manifest_file(abs_manifest).map_err(|_| {
+    let manifest = ProjectManifest::from_manifest_file(abs_manifest).map_err(|err| {
         RaHostInitError::WorkspaceNotFound {
             input_path: input_path.clone(),
+            details: err.to_string(),
         }
     })?;
 
@@ -76,24 +80,24 @@ fn load_from_manifest(manifest: ProjectManifest) -> Result<LoadedWorkspace, RaHo
         &cargo_config,
         &load_config,
     )?;
-    let proc_macro_client = require_proc_macro_client(proc_macro_client)?;
+    let init_notes = init_notes_for_proc_macro_client(&proc_macro_client);
     Ok(LoadedWorkspace {
         manifest_path,
         workspace_root,
         db,
         vfs,
-        init_notes: Vec::new(),
+        init_notes,
         proc_macro_client,
     })
 }
 
-fn require_proc_macro_client(
-    proc_macro_client: Option<Box<dyn ProcMacroClientHandle>>,
-) -> Result<Option<Box<dyn ProcMacroClientHandle>>, RaHostInitError> {
+fn init_notes_for_proc_macro_client(
+    proc_macro_client: &Option<Box<dyn ProcMacroClientHandle>>,
+) -> Vec<String> {
     if proc_macro_client.is_none() {
-        return Err(RaHostInitError::ProcMacroUnavailable);
+        return vec![PROC_MACRO_UNAVAILABLE_NOTE.to_string()];
     }
-    Ok(proc_macro_client)
+    Vec::new()
 }
 
 fn load_workspace_with_config(
@@ -123,20 +127,28 @@ fn load_workspace_with_config(
     ))
 }
 
-fn canonical_abs(path: &Path) -> Option<AbsPathBuf> {
+fn canonical_abs(path: &Path) -> Result<AbsPathBuf, String> {
     std::fs::canonicalize(path)
-        .ok()
         .map(AbsPathBuf::assert_utf8)
+        .map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::require_proc_macro_client;
-    use crate::RaHostInitError;
+    use super::{
+        PROC_MACRO_UNAVAILABLE_NOTE, ProcMacroClientHandle, init_notes_for_proc_macro_client,
+    };
 
     #[test]
-    fn strict_loader_requires_proc_macro_client() {
-        let err = require_proc_macro_client(None).expect_err("missing proc-macro client");
-        assert!(matches!(err, RaHostInitError::ProcMacroUnavailable));
+    fn missing_proc_macro_client_emits_degraded_mode_note() {
+        let notes = init_notes_for_proc_macro_client(&None);
+        assert_eq!(notes, vec![PROC_MACRO_UNAVAILABLE_NOTE.to_string()]);
+    }
+
+    #[test]
+    fn present_proc_macro_client_emits_no_degraded_mode_note() {
+        let client = Some(Box::new("present".to_string()) as Box<dyn ProcMacroClientHandle>);
+        let notes = init_notes_for_proc_macro_client(&client);
+        assert!(notes.is_empty());
     }
 }

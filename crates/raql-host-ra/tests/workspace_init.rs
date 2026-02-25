@@ -56,7 +56,13 @@ fn init_fails_without_workspace_manifest() {
     fs::write(root.join("standalone.rs").as_std_path(), "fn main() {}\n").expect("write rs");
 
     let err = RaHostRuntime::from_workspace_root(root.as_std_path()).expect_err("must fail");
-    assert!(matches!(err, RaHostInitError::WorkspaceNotFound { .. }));
+    let RaHostInitError::WorkspaceNotFound { details, .. } = err else {
+        panic!("expected workspace-not-found error");
+    };
+    assert!(
+        !details.trim().is_empty(),
+        "workspace-not-found error should include cause details"
+    );
 }
 
 #[test]
@@ -231,11 +237,7 @@ fn world_stamp_is_stable_when_workspace_is_unchanged() {
 #[test]
 fn runtime_reload_now_refreshes_snapshot_after_file_change() {
     let root = temp_dir("runtime_reload_now");
-    write_package(
-        &root,
-        "runtime_reload_now",
-        "pub fn before_reload() {}\n",
-    );
+    write_package(&root, "runtime_reload_now", "pub fn before_reload() {}\n");
 
     let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     let stamp_before = HostRuntime::world_stamp(&runtime)
@@ -294,7 +296,13 @@ fn reload_now_propagates_workspace_load_errors() {
     fs::remove_file(root.join("Cargo.toml").as_std_path()).expect("remove manifest");
 
     let err = runtime.reload_now().expect_err("reload should fail");
-    assert!(matches!(err, RaHostInitError::WorkspaceNotFound { .. }));
+    let RaHostInitError::WorkspaceNotFound { details, .. } = err else {
+        panic!("expected workspace-not-found error");
+    };
+    assert!(
+        !details.trim().is_empty(),
+        "workspace-not-found reload error should include cause details"
+    );
 }
 
 #[test]
@@ -940,6 +948,59 @@ hit() :-
             .get("hit")
             .is_some_and(|rows| !rows.is_empty())
     );
+}
+
+#[test]
+fn call_edge_direct_rows_are_not_duplicated() {
+    let root = temp_dir("call_edge_direct_dedup");
+    write_package(
+        &root,
+        "call_edge_direct_dedup",
+        r#"
+fn callee() {}
+
+fn caller() {
+    callee();
+}
+"#,
+    );
+
+    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let result = run_query(
+        r#"
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl def_name(D: Def, Name: string) extern.
+.decl direct_edge(Site: Span, Dispatch: DispatchKind).
+
+direct_edge(Site, Dispatch) :-
+  call_edge(Caller, Callee, Site, Dispatch),
+  def_name(Caller, "caller"),
+  def_name(Callee, "callee").
+"#,
+        &mut runtime,
+    );
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    let rows = result
+        .relations
+        .get("direct_edge")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        rows.len(),
+        1,
+        "direct caller->callee edge should appear exactly once"
+    );
+    assert!(rows.iter().any(|row| {
+        matches!(
+            row.as_slice(),
+            [
+                RuntimeValue::Host { .. },
+                RuntimeValue::Enum { name, variant }
+            ] if name == "DispatchKind" && variant == "DIRECT"
+        )
+    }));
 }
 
 #[test]

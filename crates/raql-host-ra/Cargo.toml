@@ -15,14 +15,9 @@ raql-engine = { path = "../raql-engine" }
 ide.workspace = true
 ide-db.workspace = true
 hir.workspace = true
-hir-def.workspace = true
-hir-expand.workspace = true
-hir-ty.workspace = true
 syntax.workspace = true
 span.workspace = true
 vfs.workspace = true
-paths.workspace = true
-intern.workspace = true
 base-db.workspace = true
 load-cargo.workspace = true
 project-model.workspace = true
