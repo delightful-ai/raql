@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use raql_compiler::{plan, resolve, typecheck};
-use raql_engine::{EngineHostView, EvalResult, EvalStatus, RuntimeValue, execute};
+use raql_engine::{EvalResult, EvalStatus, execute};
 use raql_host::HostRuntime;
 use raql_host_ra::legacy::LegacyRaHostRuntime;
 use raql_host_ra::RaHostInitError;
@@ -9,8 +9,8 @@ use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // TODO(ra-daemon-cutover): split this file into daemon-backed/runtime-service
-// coverage vs explicit legacy eager-runtime coverage, then remove the legacy
-// half as provider families come back online.
+// coverage vs explicit eager direct-runtime coverage, then delete the direct
+// runtime half as the daemon-backed surface absorbs the remaining cases.
 
 fn temp_dir(label: &str) -> Utf8PathBuf {
     let stamp = SystemTime::now()
@@ -568,95 +568,4 @@ dep_visible() :-
             .is_none_or(|rows| rows.is_empty()),
         "registry-like dependency roots must not be snapshot-expanded"
     );
-}
-
-#[test]
-fn public_and_in_test_markers_match_semantic_visibility_and_test_context() {
-    let root = temp_dir("visibility_test_markers");
-    write_package(
-        &root,
-        "visibility_test_markers",
-        r#"
-pub fn exported() {}
-fn hidden() {}
-
-#[cfg(test)]
-mod tests {
-    pub fn helper() {}
-
-    #[test]
-    fn test_case() {
-        helper();
-    }
-}
-"#,
-    );
-
-    let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
-    let result = run_query(
-        r#"
-.decl exported_public().
-.decl hidden_public().
-.decl helper_test().
-.decl exported_test().
-.decl def(D: Def) extern.
-.decl def_name(D: Def, Name: string) extern.
-.decl is_public(D: Def) extern.
-.decl in_test(D: Def) extern.
-
-exported_public() :- def(D), def_name(D, "exported"), is_public(D).
-hidden_public() :- def(D), def_name(D, "hidden"), is_public(D).
-helper_test() :- def(D), def_name(D, "helper"), in_test(D).
-exported_test() :- def(D), def_name(D, "exported"), in_test(D).
-"#,
-        &mut runtime,
-    );
-
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("exported_public")
-            .is_some_and(|rows| !rows.is_empty())
-    );
-    assert!(
-        result
-            .relations
-            .get("hidden_public")
-            .is_some_and(|rows| rows.is_empty())
-    );
-    assert!(
-        result
-            .relations
-            .get("helper_test")
-            .is_some_and(|rows| !rows.is_empty())
-    );
-    assert!(
-        result
-            .relations
-            .get("exported_test")
-            .is_some_and(|rows| rows.is_empty())
-    );
-}
-
-#[test]
-fn span_key_is_workspace_relative_for_local_files() {
-    let root = temp_dir("span_key_relative");
-    write_package(&root, "span_key_relative", "pub fn answer() -> i32 { 1 }\n");
-
-    let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
-    let rows = EngineHostView::extern_relation_rows(&mut runtime, "span_key")
-        .expect("span_key lookup")
-        .expect("span_key rows");
-
-    let mut has_relative = false;
-    for row in rows {
-        if let Some(RuntimeValue::String(path)) = row.get(1)
-            && path == "src/lib.rs"
-        {
-            has_relative = true;
-            break;
-        }
-    }
-    assert!(has_relative, "expected workspace-relative span path");
 }

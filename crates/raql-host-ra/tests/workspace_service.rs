@@ -341,3 +341,100 @@ hit(Path) :- def(D), def_name(D, "alpha"), def_path(D, Path).
         "expected a supported def_path row for alpha; observed={observed:?}"
     );
 }
+
+#[test]
+fn workspace_service_marks_public_and_test_defs() {
+    let root = temp_workspace_root("visibility_test_markers");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn exported() {}
+fn hidden() {}
+
+#[cfg(test)]
+mod tests {
+    pub fn helper() {}
+
+    #[test]
+    fn test_case() {
+        helper();
+    }
+}
+"#,
+    )
+    .expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl is_public(D: Def) extern.
+.decl in_test(D: Def) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl exported_public(Name: string).
+.decl hidden_public(Name: string).
+.decl helper_test(Name: string).
+.decl exported_test(Name: string).
+exported_public(Name) :- def(D), def_name(D, Name), is_public(D).
+hidden_public(Name) :- def(D), def_name(D, Name), is_public(D), contains(Name, "hidden").
+helper_test(Name) :- def(D), def_name(D, Name), in_test(D), contains(Name, "helper").
+exported_test(Name) :- def(D), def_name(D, Name), in_test(D), contains(Name, "exported").
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(
+        result
+            .relations
+            .get("exported_public")
+            .is_some_and(|rows| {
+                rows.contains(&vec![RuntimeValue::String("exported".to_string())])
+            })
+    );
+    assert!(
+        result
+            .relations
+            .get("hidden_public")
+            .is_some_and(|rows| rows.is_empty())
+    );
+    assert!(
+        result
+            .relations
+            .get("helper_test")
+            .is_some_and(|rows| {
+                rows.contains(&vec![RuntimeValue::String("helper".to_string())])
+            })
+    );
+    assert!(
+        result
+            .relations
+            .get("exported_test")
+            .is_some_and(|rows| rows.is_empty())
+    );
+}
+
+#[test]
+fn workspace_service_reports_workspace_relative_span_keys() {
+    let root = temp_workspace_root("span_key_relative");
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.func def_span(D: Def, S: Span) extern.
+.func span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
+.decl hit(RelPath: string).
+hit(RelPath) :-
+  def(D),
+  def_name(D, "answer"),
+  def_span(D, S),
+  span_key(S, RelPath, _L0, _C0, _L1, _C1).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(result.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("src/lib.rs".to_string())])
+    }));
+}
