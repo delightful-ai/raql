@@ -384,14 +384,17 @@ type_is_option(TR, Inner) :-
 .func node_id(N: Node, H: string) extern.
 .mode node_id(+Node, -string).
 
-.func call_id(C: Call, H: string) extern.
+.decl call_id(C: Call, H: string) extern.
 .mode call_id(+Call, -string).
+.mode call_id(-Call, -string).
 
-.func ref_id(R: Ref, H: string) extern.
+.decl ref_id(R: Ref, H: string) extern.
 .mode ref_id(+Ref, -string).
+.mode ref_id(-Ref, -string).
 
-.func impl_id(I: Impl, H: string) extern.
+.decl impl_id(I: Impl, H: string) extern.
 .mode impl_id(+Impl, -string).
+.mode impl_id(-Impl, -string).
 
 .func world_stamp(Stamp: string) extern.
 .mode world_stamp(-string).

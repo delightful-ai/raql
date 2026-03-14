@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ide::RootDatabase;
-use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
-use project_model::{CargoConfig, ProjectManifest, RustLibSource};
+use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, ProjectFolders, load_workspace_into_db};
+use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource};
 use toml::Value;
 use vfs::AbsPathBuf;
 
@@ -17,48 +18,64 @@ pub(crate) struct LoadedWorkspace {
     pub(crate) workspace_root: PathBuf,
     pub(crate) db: RootDatabase,
     pub(crate) vfs: vfs::Vfs,
+    pub(crate) watched_entries: Vec<vfs::loader::Entry>,
+    pub(crate) local_tracking_roots: Vec<PathBuf>,
     pub(crate) proc_macro_client: Option<Box<dyn ProcMacroClientHandle>>,
 }
 
 pub(crate) fn load_from_workspace_root(root: &Path) -> Result<LoadedWorkspace, RaHostInitError> {
+    let load_started = Instant::now();
     let input_path = root.to_string_lossy().to_string();
+    let canonical_started = Instant::now();
     let abs_root = canonical_abs(root).map_err(|details| RaHostInitError::WorkspaceNotFound {
         input_path: input_path.clone(),
         details,
     })?;
+    trace_loader_timing("workspace_loader.canonical_abs_root", canonical_started.elapsed());
 
+    let discover_started = Instant::now();
     let manifest = ProjectManifest::discover_single(abs_root.as_ref()).map_err(|err| {
         RaHostInitError::WorkspaceNotFound {
             input_path: input_path.clone(),
             details: err.to_string(),
         }
     })?;
+    trace_loader_timing("workspace_loader.discover_single", discover_started.elapsed());
 
-    load_from_manifest(manifest)
+    let loaded = load_from_manifest(manifest)?;
+    trace_loader_timing("workspace_loader.from_workspace_root.total", load_started.elapsed());
+    Ok(loaded)
 }
 
 pub(crate) fn load_from_manifest_path(
     manifest_path: &Path,
 ) -> Result<LoadedWorkspace, RaHostInitError> {
+    let load_started = Instant::now();
     let input_path = manifest_path.to_string_lossy().to_string();
+    let canonical_started = Instant::now();
     let abs_manifest =
         canonical_abs(manifest_path).map_err(|details| RaHostInitError::WorkspaceNotFound {
             input_path: input_path.clone(),
             details,
         })?;
+    trace_loader_timing("workspace_loader.canonical_abs_manifest", canonical_started.elapsed());
 
+    let manifest_started = Instant::now();
     let manifest = ProjectManifest::from_manifest_file(abs_manifest).map_err(|err| {
         RaHostInitError::WorkspaceNotFound {
             input_path: input_path.clone(),
             details: err.to_string(),
         }
     })?;
-    load_from_manifest(manifest)
+    trace_loader_timing("workspace_loader.from_manifest_file", manifest_started.elapsed());
+    let loaded = load_from_manifest(manifest)?;
+    trace_loader_timing("workspace_loader.from_manifest_path.total", load_started.elapsed());
+    Ok(loaded)
 }
 
 fn load_from_manifest(manifest: ProjectManifest) -> Result<LoadedWorkspace, RaHostInitError> {
+    let load_started = Instant::now();
     let manifest_path = PathBuf::from(manifest.manifest_path().to_string());
-    let workspace_root = true_workspace_root(manifest_path.as_path())?;
     let cargo_config = CargoConfig {
         sysroot: Some(RustLibSource::Discover),
         all_targets: true,
@@ -72,46 +89,66 @@ fn load_from_manifest(manifest: ProjectManifest) -> Result<LoadedWorkspace, RaHo
         prefill_caches: false,
     };
 
-    let (db, vfs, proc_macro_client) = load_workspace_with_config(
-        workspace_root.as_path(),
-        manifest_path.as_path(),
-        &cargo_config,
+    let workspace_load_started = Instant::now();
+    let mut workspace =
+        ProjectWorkspace::load(manifest, &cargo_config, &|_| {}).map_err(|err| {
+            RaHostInitError::WorkspaceLoad {
+                manifest: manifest_path.display().to_string(),
+                details: err.to_string(),
+            }
+        })?;
+    trace_loader_timing("workspace_loader.project_workspace_load", workspace_load_started.elapsed());
+
+    if load_config.load_out_dirs_from_check {
+        let build_scripts_started = Instant::now();
+        let build_scripts = workspace
+            .run_build_scripts(&cargo_config, &|_| {})
+            .map_err(|err| RaHostInitError::WorkspaceLoad {
+                manifest: manifest_path.display().to_string(),
+                details: err.to_string(),
+            })?;
+        workspace.set_build_scripts(build_scripts);
+        trace_loader_timing("workspace_loader.run_build_scripts", build_scripts_started.elapsed());
+    }
+
+    let workspace_root = PathBuf::from(workspace.workspace_root().to_string());
+    let local_tracking_roots = local_tracking_roots(&workspace);
+    let project_folders_started = Instant::now();
+    let project_folders = ProjectFolders::new(std::slice::from_ref(&workspace), &[], None);
+    let watched_entries = project_folders
+        .watch
+        .iter()
+        .filter_map(|&idx| project_folders.load.get(idx).cloned())
+        .collect::<Vec<_>>();
+    trace_loader_timing("workspace_loader.project_folders", project_folders_started.elapsed());
+
+    let lru_cap = std::env::var("RA_LRU_CAP")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok());
+    let mut db = RootDatabase::new(lru_cap);
+    let load_db_started = Instant::now();
+    let (vfs, proc_macro_client) = load_workspace_into_db(
+        workspace,
+        &cargo_config.extra_env,
         &load_config,
-    )?;
+        &mut db,
+    )
+    .map_err(|err| RaHostInitError::WorkspaceLoad {
+        manifest: manifest_path.display().to_string(),
+        details: err.to_string(),
+    })?;
+    trace_loader_timing("workspace_loader.load_workspace_into_db", load_db_started.elapsed());
+    trace_loader_timing("workspace_loader.total", load_started.elapsed());
     Ok(LoadedWorkspace {
         manifest_path,
         workspace_root,
         db,
         vfs,
-        proc_macro_client,
+        watched_entries,
+        local_tracking_roots,
+        proc_macro_client: proc_macro_client
+            .map(|client| Box::new(client) as Box<dyn ProcMacroClientHandle>),
     })
-}
-
-fn load_workspace_with_config(
-    workspace_root: &Path,
-    manifest_path: &Path,
-    cargo_config: &CargoConfig,
-    load_config: &LoadCargoConfig,
-) -> Result<
-    (
-        RootDatabase,
-        vfs::Vfs,
-        Option<Box<dyn ProcMacroClientHandle>>,
-    ),
-    RaHostInitError,
-> {
-    let (db, vfs, proc_macro_client) =
-        load_workspace_at(workspace_root, cargo_config, load_config, &|_| {}).map_err(|err| {
-            RaHostInitError::WorkspaceLoad {
-                manifest: manifest_path.to_string_lossy().to_string(),
-                details: err.to_string(),
-            }
-        })?;
-    Ok((
-        db,
-        vfs,
-        proc_macro_client.map(|client| Box::new(client) as Box<dyn ProcMacroClientHandle>),
-    ))
 }
 
 fn canonical_abs(path: &Path) -> Result<AbsPathBuf, String> {
@@ -185,4 +222,41 @@ fn manifest_value(path: &Path) -> Result<Value, RaHostInitError> {
         manifest: path.display().to_string(),
         details: err.to_string(),
     })
+}
+
+fn trace_loader_timing(label: &str, elapsed: std::time::Duration) {
+    if std::env::var_os("RAQL_TRACE_TIMINGS").is_none() {
+        return;
+    }
+    eprintln!("raql-timing {label} {}ms", elapsed.as_millis());
+}
+
+fn local_tracking_roots(workspace: &ProjectWorkspace) -> Vec<PathBuf> {
+    let mut roots = match &workspace.kind {
+        ProjectWorkspaceKind::Cargo { cargo, .. } => cargo
+            .packages()
+            .filter(|&pkg| cargo[pkg].is_local)
+            .flat_map(|pkg| {
+                cargo[pkg]
+                    .targets
+                    .iter()
+                    .filter_map(|&tgt| cargo[tgt].root.parent())
+                    .map(path_ref_to_path_buf)
+            })
+            .collect::<Vec<_>>(),
+        _ => workspace
+            .to_roots()
+            .into_iter()
+            .filter(|root| root.is_local)
+            .flat_map(|root| root.include.into_iter().map(path_ref_to_path_buf))
+            .collect::<Vec<_>>(),
+    };
+    roots.extend(workspace.extra_includes.iter().map(path_ref_to_path_buf));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn path_ref_to_path_buf(path: impl AsRef<Path>) -> PathBuf {
+    path.as_ref().to_path_buf()
 }

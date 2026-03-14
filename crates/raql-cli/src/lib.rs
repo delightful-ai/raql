@@ -8,7 +8,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
 use raql_compiler::{PlannedProgram, plan, resolve, typecheck};
 use raql_daemon::{spawn_or_connect, serve};
-use raql_protocol::{DaemonEvent, DaemonState, PlanSummary, ProtocolValue, RelationRows};
+use raql_protocol::{
+    DaemonEvent, DaemonState, PlanSummary, ProtocolValue, RelationRows, WarmupPhaseEvent,
+};
 use raql_syntax::parse_program_from_file;
 
 #[derive(Debug, Parser)]
@@ -129,6 +131,17 @@ fn render_events(
                     DaemonState::Warm => "warm",
                 };
                 println!("daemon: {state}");
+                let warmup = match session.warmup_status.phase {
+                    WarmupPhaseEvent::Cold => "cold",
+                    WarmupPhaseEvent::Running => "running",
+                    WarmupPhaseEvent::Warm => "warm",
+                    WarmupPhaseEvent::Failed => "failed",
+                };
+                println!("warmup: {warmup}");
+                println!("warmup_generation: {}", session.warmup_status.generation);
+                if let Some(error) = &session.warmup_status.error {
+                    println!("warmup_error: {error}");
+                }
                 println!("workspace: {}", session.workspace_root);
                 println!("workspace_epoch: {}", session.workspace_epoch);
                 println!("content_revision: {}", session.content_revision);

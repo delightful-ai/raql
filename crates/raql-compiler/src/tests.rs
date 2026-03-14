@@ -4,6 +4,7 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
+use raql_host::ExternLookupShape;
 use raql_syntax::{Directive, Goal, Stmt, parse_program, parse_program_from_file};
 
 use crate::{CompilerType, plan, resolve, typecheck};
@@ -898,4 +899,62 @@ q(X) :- X = Y, p(Y).
         .map(|g| g.index())
         .collect::<Vec<_>>();
     assert_eq!(order, vec![1, 0]);
+}
+
+#[test]
+fn planner_marks_function_extern_bound_input_for_pushdown() {
+    let src = r#"
+.decl src(A: int) input.
+.func f(A: int, Name: string) extern.
+.decl hit(Name: string).
+hit(Name) :- src(A), f(A, Name).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("type");
+    let planned = plan(typed).expect("plan");
+    let lookup = planned.planned_rules()[0].ordered_goals()[1]
+        .extern_lookup()
+        .expect("lookup metadata");
+
+    assert_eq!(lookup.shape(), ExternLookupShape::FunctionExactBindings);
+    assert_eq!(lookup.bound_positions(), &[0]);
+}
+
+#[test]
+fn planner_marks_function_extern_bound_output_constant_for_pushdown() {
+    let src = r#"
+.func def_name(D: Def, Name: string) extern.
+.decl hit().
+hit() :- def_name(_, "alpha").
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("type");
+    let planned = plan(typed).expect("plan");
+    let lookup = planned.planned_rules()[0].ordered_goals()[0]
+        .extern_lookup()
+        .expect("lookup metadata");
+
+    assert_eq!(lookup.shape(), ExternLookupShape::FunctionExactBindings);
+    assert_eq!(lookup.bound_positions(), &[1]);
+}
+
+#[test]
+fn planner_leaves_unbound_function_extern_without_pushdown_metadata() {
+    let src = r#"
+.func f(Name: string) extern.
+.decl hit(Name: string).
+hit(Name) :- f(Name).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("type");
+    let planned = plan(typed).expect("plan");
+
+    assert!(
+        planned.planned_rules()[0].ordered_goals()[0]
+            .extern_lookup()
+            .is_none()
+    );
 }

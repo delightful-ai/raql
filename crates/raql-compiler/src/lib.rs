@@ -11,7 +11,10 @@ use petgraph::{
     algo::toposort,
     graph::{DiGraph, NodeIndex},
 };
-use raql_host::{is_engine_managed_extern, is_runtime_scalar_input_predicate};
+use raql_host::{
+    ExternLookupShape, is_engine_managed_extern, is_runtime_scalar_input_predicate,
+    supports_lookup_seed_predicate,
+};
 use raql_syntax::{
     AggregateName, AstPhase, Atom, Constraint, DeclAttr, DeclarationKind, Directive, Expr, Goal,
     ModeDirection, Program, RelOp, Rule, Spanned, SrcSpan, Stmt, Term, TypeAst,
@@ -217,6 +220,7 @@ pub struct TypedProgram {
 pub struct GoalPlan {
     index: usize,
     chosen_mode: Option<usize>,
+    extern_lookup: Option<ExternLookupPlan>,
 }
 
 impl GoalPlan {
@@ -226,6 +230,26 @@ impl GoalPlan {
 
     pub fn chosen_mode(&self) -> Option<usize> {
         self.chosen_mode
+    }
+
+    pub fn extern_lookup(&self) -> Option<&ExternLookupPlan> {
+        self.extern_lookup.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternLookupPlan {
+    shape: ExternLookupShape,
+    bound_positions: Vec<usize>,
+}
+
+impl ExternLookupPlan {
+    pub const fn shape(&self) -> ExternLookupShape {
+        self.shape
+    }
+
+    pub fn bound_positions(&self) -> &[usize] {
+        &self.bound_positions
     }
 }
 
@@ -347,8 +371,7 @@ impl PlannedProgram {
     }
 }
 
-pub fn required_extern_capabilities(program: &PlannedProgram) -> BTreeSet<String> {
-    let mut required = BTreeSet::new();
+pub fn reachable_predicates(program: &PlannedProgram) -> BTreeSet<String> {
     let root_file = program
         .source_map()
         .files()
@@ -357,17 +380,28 @@ pub fn required_extern_capabilities(program: &PlannedProgram) -> BTreeSet<String
     let mut agenda = VecDeque::new();
     let mut seen_predicates = BTreeSet::new();
 
-    for rule in program.planned_rules() {
-        if root_file.is_some_and(|file| rule.typed_rule().rule().span.file != file) {
-            continue;
-        }
-        agenda.push_back(rule.head_predicate().to_string());
-    }
-
     if let Some(root_file) = root_file {
+        let mut seeded = false;
         for (name, decl) in program.predicates() {
-            if decl.span.file == root_file && !decl.attrs().contains(&DeclAttr::Extern) {
+            if decl.span.file == root_file && decl.is_output() {
                 agenda.push_back(name.clone());
+                seeded = true;
+            }
+        }
+        if seeded {
+            // Output-rooted execution is the supported path. Helper predicates that
+            // have been fully inlined into output rules should not stay alive just
+            // because they were declared in the root file.
+        } else {
+            for rule in program.planned_rules() {
+                if rule.typed_rule().rule().span.file == root_file {
+                    agenda.push_back(rule.head_predicate().to_string());
+                }
+            }
+            for (name, decl) in program.predicates() {
+                if decl.span.file == root_file && !decl.attrs().contains(&DeclAttr::Extern) {
+                    agenda.push_back(name.clone());
+                }
             }
         }
     } else {
@@ -385,10 +419,76 @@ pub fn required_extern_capabilities(program: &PlannedProgram) -> BTreeSet<String
             .iter()
             .filter(|rule| rule.head_predicate() == predicate)
         {
-            collect_required_from_goals(program, rule.typed_rule().goals(), &mut required, &mut agenda);
+            collect_reachable_from_goals(program, rule.typed_rule().goals(), &mut agenda);
+        }
+    }
+    seen_predicates
+}
+
+pub fn required_extern_capabilities(program: &PlannedProgram) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    let mut discard_agenda = VecDeque::new();
+    for predicate in reachable_predicates(program) {
+        for rule in program
+            .planned_rules()
+            .iter()
+            .filter(|rule| rule.head_predicate() == predicate)
+        {
+            collect_required_from_goals(
+                program,
+                rule.typed_rule().goals(),
+                &mut required,
+                &mut discard_agenda,
+            );
         }
     }
     required
+}
+
+fn collect_reachable_from_goals<'a>(
+    program: &PlannedProgram,
+    goals: impl Iterator<Item = &'a Spanned<Goal>>,
+    agenda: &mut VecDeque<String>,
+) {
+    for goal in goals {
+        match &goal.value {
+            Goal::Atom(atom) => collect_reachable_from_atom(program, atom, agenda),
+            Goal::Not(not_goal) => collect_reachable_from_atom(program, &not_goal.atom.value, agenda),
+            Goal::Aggregate(aggregate) => {
+                collect_reachable_from_goals(program, aggregate.goals.iter(), agenda);
+            }
+            Goal::ChooseTopK(choose) => {
+                collect_reachable_from_goals(program, choose.goals.iter(), agenda);
+            }
+            Goal::Disjunction(group) => {
+                for branch in &group.branches {
+                    collect_reachable_from_goals(program, branch.iter(), agenda);
+                }
+            }
+            Goal::Constraint(_) => {}
+        }
+    }
+}
+
+fn collect_reachable_from_atom(
+    program: &PlannedProgram,
+    atom: &Atom,
+    agenda: &mut VecDeque<String>,
+) {
+    let name = atom.name.value.as_str();
+    let Some(decl) = program.predicate_decl(name) else {
+        return;
+    };
+    if decl.attrs().contains(&DeclAttr::Extern) {
+        return;
+    }
+    if program
+        .planned_rules()
+        .iter()
+        .any(|rule| rule.head_predicate() == name)
+    {
+        agenda.push_back(name.to_string());
+    }
 }
 
 fn collect_required_from_goals<'a>(
@@ -1301,10 +1401,13 @@ pub fn plan(typed: TypedProgram) -> Result<PlannedProgram, DiagBundle> {
                 if let Some(chosen_mode) =
                     goal_runnable(goal, &typed, &bound, &ground, &typed_rule.var_types)
                 {
+                    let extern_lookup =
+                        planned_extern_lookup(goal, &typed, chosen_mode, &ground, &typed_rule.var_types);
                     apply_goal_bindings(goal, &mut bound, &mut ground);
                     ordered.push(GoalPlan {
                         index: idx,
                         chosen_mode,
+                        extern_lookup,
                     });
                     remaining.remove(&idx);
                     progress = true;
@@ -1876,29 +1979,10 @@ fn collect_goal_atoms(goal: &Goal, usages: &mut BTreeMap<String, Vec<PredicateUs
 }
 
 fn expand_rules(rules: &[TypedRule]) -> Vec<TypedRule> {
+    let inlineable = inlineable_rule_bodies(rules);
     let mut out = Vec::new();
     for rule in rules {
-        let mut bodies: Vec<Vec<Spanned<Goal>>> = vec![Vec::new()];
-        for goal in &rule.rule.value.body {
-            match &goal.value {
-                Goal::Disjunction(d) => {
-                    let mut next = Vec::new();
-                    for base in &bodies {
-                        for branch in &d.branches {
-                            let mut b = base.clone();
-                            b.extend(branch.clone());
-                            next.push(b);
-                        }
-                    }
-                    bodies = next;
-                }
-                _ => {
-                    for base in &mut bodies {
-                        base.push(goal.clone());
-                    }
-                }
-            }
-        }
+        let bodies = expand_goals_with_inline(&rule.rule.value.body, &inlineable);
         for body in bodies {
             let mut r = rule.clone();
             r.rule.value.body = body;
@@ -1906,6 +1990,247 @@ fn expand_rules(rules: &[TypedRule]) -> Vec<TypedRule> {
         }
     }
     out
+}
+
+fn expand_goals_with_inline(
+    goals: &[Spanned<Goal>],
+    inlineable: &BTreeMap<String, Vec<InlineRule>>,
+) -> Vec<Vec<Spanned<Goal>>> {
+    let mut bodies: Vec<Vec<Spanned<Goal>>> = vec![Vec::new()];
+    for goal in goals {
+        let expanded_segments = expand_goal_with_inline(goal, inlineable);
+        let mut next = Vec::new();
+        for base in &bodies {
+            for segment in &expanded_segments {
+                let mut body = base.clone();
+                body.extend(segment.clone());
+                next.push(body);
+            }
+        }
+        bodies = next;
+    }
+    bodies
+}
+
+fn expand_goal_with_inline(
+    goal: &Spanned<Goal>,
+    inlineable: &BTreeMap<String, Vec<InlineRule>>,
+) -> Vec<Vec<Spanned<Goal>>> {
+    match &goal.value {
+        Goal::Atom(atom) => {
+            if let Some(callees) = inlineable.get(atom.name.value.as_str()) {
+                let mut expanded = Vec::new();
+                for callee in callees {
+                    let body = inline_goal_body(atom, callee);
+                    expanded.extend(expand_goals_with_inline(&body, inlineable));
+                }
+                expanded
+            } else {
+                vec![vec![goal.clone()]]
+            }
+        }
+        Goal::Disjunction(d) => d
+            .branches
+            .iter()
+            .flat_map(|branch| expand_goals_with_inline(branch, inlineable))
+            .collect(),
+        Goal::Aggregate(a) => expand_goals_with_inline(&a.goals, inlineable)
+            .into_iter()
+            .map(|goals| {
+                let mut aggregate = a.clone();
+                aggregate.goals = goals;
+                vec![Spanned::new(goal.span, Goal::Aggregate(aggregate))]
+            })
+            .collect(),
+        Goal::ChooseTopK(c) => expand_goals_with_inline(&c.goals, inlineable)
+            .into_iter()
+            .map(|goals| {
+                let mut choose = c.clone();
+                choose.goals = goals;
+                vec![Spanned::new(goal.span, Goal::ChooseTopK(choose))]
+            })
+            .collect(),
+        _ => vec![vec![goal.clone()]],
+    }
+}
+
+#[derive(Clone)]
+struct InlineRule {
+    head_vars: Vec<String>,
+    body: Vec<Spanned<Goal>>,
+}
+
+fn inlineable_rule_bodies(rules: &[TypedRule]) -> BTreeMap<String, Vec<InlineRule>> {
+    let mut grouped = BTreeMap::<String, Vec<&TypedRule>>::new();
+    for rule in rules {
+        grouped
+            .entry(rule.rule.value.head.value.name.value.to_string())
+            .or_default()
+            .push(rule);
+    }
+
+    let mut inlineable = BTreeMap::<String, Vec<InlineRule>>::new();
+    for (predicate, predicate_rules) in grouped {
+        let mut bodies = Vec::new();
+        let mut ok = true;
+        for rule in predicate_rules {
+            let Some(head_vars) = inline_rule_head_vars(rule, predicate.as_str()) else {
+                ok = false;
+                break;
+            };
+            bodies.push(InlineRule {
+                head_vars,
+                body: rule.rule.value.body.clone(),
+            });
+        }
+        if ok {
+            inlineable.insert(predicate, bodies);
+        }
+    }
+    inlineable
+}
+
+fn inline_rule_head_vars(rule: &TypedRule, predicate: &str) -> Option<Vec<String>> {
+    let mut head_vars = Vec::<String>::new();
+    let mut seen_head_vars = BTreeSet::<String>::new();
+    for term in &rule.rule.value.head.value.terms {
+        let Term::Var(name) = &term.value else {
+            return None;
+        };
+        if !seen_head_vars.insert(name.to_string()) {
+            return None;
+        }
+        head_vars.push(name.to_string());
+    }
+    let head_var_set = head_vars.iter().cloned().collect::<BTreeSet<_>>();
+    if rule
+        .rule
+        .value
+        .body
+        .iter()
+        .any(|goal| goal_references_predicate(goal, predicate))
+    {
+        return None;
+    }
+    let mut body_vars = BTreeSet::new();
+    for goal in &rule.rule.value.body {
+        if !goal_is_inlineable(goal) {
+            return None;
+        }
+        collect_goal_vars(goal, &mut body_vars);
+    }
+    body_vars.is_subset(&head_var_set).then_some(head_vars)
+}
+
+fn goal_is_inlineable(goal: &Spanned<Goal>) -> bool {
+    matches!(
+        &goal.value,
+        Goal::Atom(_) | Goal::Not(_) | Goal::Constraint(Constraint::Relational(_))
+    )
+}
+
+fn goal_references_predicate(goal: &Spanned<Goal>, predicate: &str) -> bool {
+    match &goal.value {
+        Goal::Atom(atom) => atom.name.value.as_str() == predicate,
+        Goal::Not(not_goal) => not_goal.atom.value.name.value.as_str() == predicate,
+        Goal::Aggregate(aggregate) => aggregate
+            .goals
+            .iter()
+            .any(|goal| goal_references_predicate(goal, predicate)),
+        Goal::ChooseTopK(choose) => choose
+            .goals
+            .iter()
+            .any(|goal| goal_references_predicate(goal, predicate)),
+        Goal::Disjunction(group) => group
+            .branches
+            .iter()
+            .flat_map(|branch| branch.iter())
+            .any(|goal| goal_references_predicate(goal, predicate)),
+        Goal::Constraint(_) => false,
+    }
+}
+
+fn collect_goal_vars(goal: &Spanned<Goal>, out: &mut BTreeSet<String>) {
+    match &goal.value {
+        Goal::Atom(atom) => {
+            for term in &atom.terms {
+                out.extend(term_vars(term));
+            }
+        }
+        Goal::Not(not_goal) => {
+            for term in &not_goal.atom.value.terms {
+                out.extend(term_vars(term));
+            }
+        }
+        Goal::Constraint(Constraint::Relational(rel)) => {
+            out.extend(term_vars(&rel.lhs));
+            out.extend(term_vars(&rel.rhs));
+        }
+        Goal::Constraint(Constraint::ArithmeticBind(_))
+        | Goal::Aggregate(_)
+        | Goal::ChooseTopK(_)
+        | Goal::Disjunction(_) => {}
+    }
+}
+
+fn inline_goal_body(atom: &Atom, callee: &InlineRule) -> Vec<Spanned<Goal>> {
+    let substitution = atom
+        .terms
+        .iter()
+        .cloned()
+        .zip(callee.head_vars.iter().cloned())
+        .map(|(term, name)| (name, term))
+        .collect::<BTreeMap<_, _>>();
+    callee
+        .body
+        .iter()
+        .cloned()
+        .map(|goal| substitute_goal(goal, &substitution))
+        .collect()
+}
+
+fn substitute_goal(
+    mut goal: Spanned<Goal>,
+    substitution: &BTreeMap<String, Spanned<Term>>,
+) -> Spanned<Goal> {
+    match &mut goal.value {
+        Goal::Atom(atom) => {
+            for term in &mut atom.terms {
+                substitute_term(term, substitution);
+            }
+        }
+        Goal::Not(not_goal) => {
+            for term in &mut not_goal.atom.value.terms {
+                substitute_term(term, substitution);
+            }
+        }
+        Goal::Constraint(Constraint::Relational(rel)) => {
+            substitute_term(&mut rel.lhs, substitution);
+            substitute_term(&mut rel.rhs, substitution);
+        }
+        Goal::Constraint(Constraint::ArithmeticBind(_))
+        | Goal::Aggregate(_)
+        | Goal::ChooseTopK(_)
+        | Goal::Disjunction(_) => {}
+    }
+    goal
+}
+
+fn substitute_term(term: &mut Spanned<Term>, substitution: &BTreeMap<String, Spanned<Term>>) {
+    match &mut term.value {
+        Term::Var(name) => {
+            if let Some(replacement) = substitution.get(name.as_str()) {
+                *term = replacement.clone();
+            }
+        }
+        Term::Some(inner) => substitute_term(inner, substitution),
+        Term::List { items, .. } => {
+            for item in items {
+                substitute_term(item, substitution);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn type_goal(
@@ -2823,7 +3148,7 @@ fn goal_runnable(
                         return Some(Some(idx));
                     }
                 }
-                None
+                extern_lookup_seed_runnable(goal, typed, ground, var_types).then_some(None)
             } else {
                 Some(None)
             }
@@ -2877,6 +3202,76 @@ fn goal_runnable(
             if all_ok { Some(None) } else { None }
         }
     }
+}
+
+fn extern_lookup_seed_runnable(
+    goal: &Spanned<Goal>,
+    typed: &TypedProgram,
+    ground: &BTreeSet<String>,
+    var_types: &BTreeMap<String, CompilerType>,
+) -> bool {
+    let Goal::Atom(atom) = &goal.value else {
+        return false;
+    };
+    supports_lookup_seed_predicate(atom.name.value.as_str())
+        && planned_extern_lookup(goal, typed, None, ground, var_types).is_some()
+}
+
+fn planned_extern_lookup(
+    goal: &Spanned<Goal>,
+    typed: &TypedProgram,
+    chosen_mode: Option<usize>,
+    ground: &BTreeSet<String>,
+    var_types: &BTreeMap<String, CompilerType>,
+) -> Option<ExternLookupPlan> {
+    let Goal::Atom(atom) = &goal.value else {
+        return None;
+    };
+    let predicate = atom.name.value.as_str();
+    let decl = typed.predicates.get(predicate)?;
+    if !decl.attrs().contains(&DeclAttr::Extern)
+        || is_engine_managed_extern(predicate)
+        || is_runtime_scalar_input_predicate(predicate)
+    {
+        return None;
+    }
+
+    let bound_positions = atom
+        .terms
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, term)| term_is_ground(term, ground, var_types).then_some(idx))
+        .collect::<Vec<_>>();
+    if bound_positions.is_empty() {
+        return None;
+    }
+
+    let shape = match decl.kind() {
+        DeclarationKind::Function => ExternLookupShape::FunctionExactBindings,
+        DeclarationKind::Relation => {
+            if let Some(mode) = typed
+                .modes
+                .get(predicate)
+                .and_then(|modes| chosen_mode.and_then(|idx| modes.get(idx)))
+            {
+                let input_positions = mode
+                    .args()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, (dir, _))| (*dir == ModeDir::In).then_some(idx))
+                    .collect::<Vec<_>>();
+                if input_positions.iter().any(|idx| !bound_positions.contains(idx)) {
+                    return None;
+                }
+            }
+            ExternLookupShape::RelationExactBindings
+        }
+    };
+
+    Some(ExternLookupPlan {
+        shape,
+        bound_positions,
+    })
 }
 
 #[derive(Debug, Clone)]

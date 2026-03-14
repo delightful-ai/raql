@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexSet;
 use raql_compiler::{plan, resolve, typecheck};
-use raql_host::MockHostRuntime;
+use raql_host::{
+    ExternLookupRequest, ExternLookupShape, ExternLookupValue, MockHostRuntime,
+};
 use raql_syntax::{Constraint, Goal, Stmt, parse_program};
 
 use crate::{
     EngineHostError, EngineHostView, EvalStatus, HostValueKind, RuntimeError, RuntimeValue,
-    execute, stable_cmp, term_type_tag,
+    build_function_extern_index, collect_function_index_specs, execute,
+    lookup_indexed_function_rows, stable_cmp, term_type_tag,
 };
 
 #[derive(Default)]
@@ -108,6 +111,61 @@ impl EngineHostView for StableKeyFallbackHost {
     }
 }
 
+#[derive(Default)]
+struct PushdownPendingHost {
+    lookup_rows: BTreeMap<ExternLookupRequest, Vec<Vec<ExternLookupValue>>>,
+    lookup_only_predicates: BTreeSet<String>,
+}
+
+impl PushdownPendingHost {
+    fn with_lookup_rows(
+        mut self,
+        request: ExternLookupRequest,
+        rows: Vec<Vec<ExternLookupValue>>,
+    ) -> Self {
+        self.lookup_rows.insert(request, rows);
+        self
+    }
+
+    fn prefer_lookup_only(mut self, predicate: &str) -> Self {
+        self.lookup_only_predicates.insert(predicate.to_string());
+        self
+    }
+}
+
+impl EngineHostView for PushdownPendingHost {
+    fn world_stamp(&mut self) -> String {
+        "test:pushdown".to_string()
+    }
+
+    fn stable_key(&mut self, value: &RuntimeValue) -> String {
+        format!("{value:?}")
+    }
+
+    fn extern_relation_rows(
+        &mut self,
+        predicate: &str,
+    ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
+        Err(EngineHostError::new(
+            "extern_relation_rows",
+            format!(
+                "predicate `{predicate}` fell back to full relation materialization instead of lookup-first evaluation"
+            ),
+        ))
+    }
+
+    fn extern_lookup(
+        &mut self,
+        request: &ExternLookupRequest,
+    ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, EngineHostError> {
+        Ok(self.lookup_rows.get(request).cloned())
+    }
+
+    fn prefers_lookup_only(&mut self, predicate: &str) -> bool {
+        self.lookup_only_predicates.contains(predicate)
+    }
+}
+
 fn planned_src(src: &str) -> raql_compiler::PlannedProgram {
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
@@ -119,6 +177,352 @@ fn execute_src(src: &str) -> crate::EvalResult {
     let planned = planned_src(src);
     let mut host = MockHostRuntime::new();
     execute(&planned, &mut host)
+}
+
+#[test]
+fn function_extern_index_returns_only_rows_matching_mode_inputs() {
+    let planned = planned_src(
+        r#"
+.decl f(A: int, B: int, Name: string) extern.
+.mode f(+int, +int, -string).
+.decl out(Name: string) output.
+out(Name) :- f(1, 2, Name).
+"#,
+    );
+    let mut relations = BTreeMap::<String, IndexSet<Vec<RuntimeValue>>>::new();
+    relations.insert(
+        "f".to_string(),
+        IndexSet::from([
+            vec![
+                RuntimeValue::Int(1),
+                RuntimeValue::Int(2),
+                RuntimeValue::String("hit".to_string()),
+            ],
+            vec![
+                RuntimeValue::Int(1),
+                RuntimeValue::Int(3),
+                RuntimeValue::String("miss-b".to_string()),
+            ],
+            vec![
+                RuntimeValue::Int(2),
+                RuntimeValue::Int(2),
+                RuntimeValue::String("miss-a".to_string()),
+            ],
+        ]),
+    );
+
+    let specs = collect_function_index_specs(&planned);
+    let index = build_function_extern_index(&planned, &relations, &specs);
+    let matches = lookup_indexed_function_rows(
+        &index,
+        "f",
+        &[0, 1],
+        &[RuntimeValue::Int(1), RuntimeValue::Int(2)],
+        relations.get("f").expect("f rows"),
+    );
+
+    assert_eq!(
+        matches,
+        vec![vec![
+            RuntimeValue::Int(1),
+            RuntimeValue::Int(2),
+            RuntimeValue::String("hit".to_string()),
+        ]]
+    );
+}
+
+#[test]
+fn unmodeled_function_with_ground_output_constant_filters_without_partial_error() {
+    let planned = planned_src(
+        r#"
+.decl src(A: int) input.
+.func f(A: int, Name: string) extern.
+.decl hit() output.
+src(1).
+src(2).
+hit() :- src(A), f(A, "alpha").
+"#,
+    );
+    let mut host = ExternRowsHost::default().with_rows(
+        "f",
+        vec![
+            vec![RuntimeValue::Int(1), RuntimeValue::String("alpha".to_string())],
+            vec![RuntimeValue::Int(2), RuntimeValue::String("beta".to_string())],
+        ],
+    );
+    let result = execute(&planned, &mut host);
+
+    assert_eq!(result.status, EvalStatus::Ok);
+    assert!(
+        result
+            .relations
+            .get("hit")
+            .is_some_and(|rows| !rows.is_empty()),
+        "unmodeled function fallback should treat only the final argument as output and allow constant filtering"
+    );
+}
+
+#[test]
+fn pushdown_exact_input_function_lookup_avoids_full_relation_materialization() {
+    let planned = planned_src(
+        r#"
+.decl src(A: int) input.
+.func f(A: int, Name: string) extern.
+.decl hit(Name: string) output.
+src(1).
+hit(Name) :- src(A), f(A, Name).
+"#,
+    );
+    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
+        ExternLookupRequest::new(
+            "f",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [0],
+            vec![ExternLookupValue::Int(1)],
+        ),
+        vec![vec![
+            ExternLookupValue::Int(1),
+            ExternLookupValue::String("alpha".into()),
+        ]],
+    );
+    let result = execute(&planned, &mut host);
+
+    assert_eq!(
+        result.status,
+        EvalStatus::Ok,
+        "bound-input function externs should be served through lookup-first evaluation; notes={:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn pushdown_constant_output_filter_avoids_full_relation_materialization() {
+    let planned = planned_src(
+        r#"
+.decl src(A: int) input.
+.func f(A: int, Name: string) extern.
+.decl hit() output.
+src(1).
+hit() :- src(A), f(A, "alpha").
+"#,
+    );
+    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
+        ExternLookupRequest::new(
+            "f",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [0, 1],
+            vec![
+                ExternLookupValue::Int(1),
+                ExternLookupValue::String("alpha".into()),
+            ],
+        ),
+        vec![vec![
+            ExternLookupValue::Int(1),
+            ExternLookupValue::String("alpha".into()),
+        ]],
+    );
+    let result = execute(&planned, &mut host);
+
+    assert_eq!(
+        result.status,
+        EvalStatus::Ok,
+        "constant-output function filters should still use lookup-first evaluation; notes={:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn pushdown_constant_output_filter_miss_fails_cleanly_without_partial_error() {
+    let planned = planned_src(
+        r#"
+.decl src(A: int) input.
+.func f(A: int, Name: string) extern.
+.decl hit() output.
+src(1).
+hit() :- src(A), f(A, "alpha").
+"#,
+    );
+    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
+        ExternLookupRequest::new(
+            "f",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [0, 1],
+            vec![
+                ExternLookupValue::Int(1),
+                ExternLookupValue::String("alpha".into()),
+            ],
+        ),
+        Vec::new(),
+    );
+    let result = execute(&planned, &mut host);
+
+    assert_eq!(
+        result.status,
+        EvalStatus::Ok,
+        "constant-output lookup misses should behave like a failed filter, not a function-cardinality error; notes={:?}",
+        result.notes
+    );
+    assert!(
+        result.relations.get("hit").is_none_or(|rows| rows.is_empty()),
+        "a lookup miss on a constant output should not emit rows"
+    );
+    assert!(
+        result
+            .notes
+            .iter()
+            .all(|note| !note.message.contains("[RAQL0907]")),
+        "a constant-output lookup miss should not surface a function-cardinality error; notes={:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn pushdown_reverse_constant_filter_enumerates_all_matching_inputs() {
+    let planned = planned_src(
+        r#"
+.func f(A: int, Name: string) extern.
+.decl hit(A: int) output.
+hit(A) :- f(A, "alpha").
+"#,
+    );
+    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
+        ExternLookupRequest::new(
+            "f",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [1],
+            vec![ExternLookupValue::String("alpha".into())],
+        ),
+        vec![
+            vec![
+                ExternLookupValue::Int(1),
+                ExternLookupValue::String("alpha".into()),
+            ],
+            vec![
+                ExternLookupValue::Int(2),
+                ExternLookupValue::String("alpha".into()),
+            ],
+        ],
+    );
+    let result = execute(&planned, &mut host);
+
+    assert_eq!(
+        result.status,
+        EvalStatus::Ok,
+        "reverse exact-binding filters should enumerate all matching inputs instead of surfacing a function-cardinality error; notes={:?}",
+        result.notes
+    );
+    let hit_rows = result.relations.get("hit").expect("hit relation");
+    assert!(hit_rows.contains(&vec![RuntimeValue::Int(1)]), "rows={hit_rows:?}");
+    assert!(hit_rows.contains(&vec![RuntimeValue::Int(2)]), "rows={hit_rows:?}");
+    assert!(
+        result
+            .notes
+            .iter()
+            .all(|note| !note.message.contains("[RAQL0907]")),
+        "reverse exact-binding filters should not surface a function-cardinality error; notes={:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn pushdown_exact_input_miss_reports_cardinality_without_full_materialization() {
+    let planned = planned_src(
+        r#"
+.decl src(A: int) input.
+.func f(A: int, Name: string) extern.
+.decl hit(Name: string) output.
+src(7).
+hit(Name) :- src(A), f(A, Name).
+"#,
+    );
+    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
+        ExternLookupRequest::new(
+            "f",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [0],
+            vec![ExternLookupValue::Int(7)],
+        ),
+        Vec::new(),
+    );
+    let result = execute(&planned, &mut host);
+
+    assert!(
+        result.notes.iter().any(|note| {
+            note.section == "Errors"
+                && note.message.contains("[RAQL0907]")
+                && note.message.contains("functional predicate `f` cardinality violation")
+        }),
+        "a lookup miss should still report cardinality under current function semantics; notes={:?}",
+        result.notes
+    );
+    assert!(
+        result
+            .notes
+            .iter()
+            .all(|note| !note.message.contains("extern_relation_rows")),
+        "lookup-first miss handling should not surface full materialization fallback notes; notes={:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn pushdown_inline_helper_relation_keeps_seeded_call_edge_lookup_only() {
+    let planned = planned_src(
+        r#"
+.type DispatchKind = { DIRECT }.
+.decl call_edge(Caller: int, Callee: int, Site: int, Dispatch: DispatchKind) extern.
+.mode call_edge(+int, -int, -int, -DispatchKind).
+.mode call_edge(-int, +int, -int, -DispatchKind).
+.mode call_edge(-int, -int, -int, -DispatchKind).
+.decl caller(Callee: int, Caller: int, Site: int, Dispatch: DispatchKind).
+.mode caller(+int, -int, -int, -DispatchKind).
+caller(Callee, Caller, Site, Dispatch) :- call_edge(Caller, Callee, Site, Dispatch).
+.decl target(Callee: int) output.
+.decl out(Caller: int) output.
+target(7).
+out(Caller) :- target(Callee), caller(Callee, Caller, _, _).
+"#,
+    );
+    let mut host = PushdownPendingHost::default()
+        .prefer_lookup_only("call_edge")
+        .with_lookup_rows(
+            ExternLookupRequest::new(
+                "call_edge",
+                ExternLookupShape::RelationExactBindings,
+                4,
+                [1],
+                vec![ExternLookupValue::Int(7)],
+            ),
+            vec![vec![
+                ExternLookupValue::Int(5),
+                ExternLookupValue::Int(7),
+                ExternLookupValue::Int(11),
+                ExternLookupValue::Enum {
+                    name: "DispatchKind".into(),
+                    variant: "DIRECT".into(),
+                },
+            ]],
+        );
+    let result = execute(&planned, &mut host);
+
+    assert_eq!(result.status, EvalStatus::Ok, "notes={:?}", result.notes);
+    assert_eq!(
+        result.relations.get("out"),
+        Some(&IndexSet::from([vec![RuntimeValue::Int(5)]]))
+    );
+    assert!(
+        result
+            .notes
+            .iter()
+            .all(|note| !note.message.contains("extern_relation_rows")),
+        "lookup-only seeded helper evaluation should not fall back to full relation materialization; notes={:?}",
+        result.notes
+    );
 }
 
 #[test]
@@ -556,10 +960,10 @@ fn witness_path_hop_order_uses_stable_order() {
 .type Def = { Start, Beta, Alpha, End }.
 .type Span = { S1, S2, S3, S4 }.
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
-.decl path_hop(P: string, Seq: int, From: Def, To: Def, Kind: string, Evidence: Span) extern.
-.mode path_hop(+string, -int, -Def, -Def, -string, -Span).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
+.decl path_hop(P: Path, Seq: int, From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.
+.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
 .decl first_hop(To: Def).
 graph_edge("g", Def::Start, Def::Alpha, "edge", Span::S1).
 graph_edge("g", Def::Start, Def::Beta, "edge", Span::S2).
@@ -586,10 +990,10 @@ fn witness_path_and_path_hop_produce_expected_hops() {
 .type Def = { D1, D2, D3 }.
 .type Span = { E12, E23 }.
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
-.decl path_hop(P: string, Seq: int, From: Def, To: Def, Kind: string, Evidence: Span) extern.
-.mode path_hop(+string, -int, -Def, -Def, -string, -Span).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
+.decl path_hop(P: Path, Seq: int, From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.
+.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
 .decl hop(Seq: int, From: Def, To: Def, Kind: string, Evidence: Span).
 graph_edge("g", Def::D1, Def::D2, "edge", Span::E12).
 graph_edge("g", Def::D2, Def::D3, "edge", Span::E23).
@@ -655,11 +1059,11 @@ fn witness_path_hop_sequences_are_zero_based_and_gapless_per_path() {
 .func path_limit(N: int) input.
 .mode path_limit(-int).
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
-.decl path_hop(P: string, Seq: int, From: Def, To: Def, Kind: string, Evidence: Span) extern.
-.mode path_hop(+string, -int, -Def, -Def, -string, -Span).
-.decl hop_seq(P: string, Seq: int).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
+.decl path_hop(P: Path, Seq: int, From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.
+.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
+.decl hop_seq(P: Path, Seq: int).
 path_max_depth(8).
 path_limit(2).
 graph_edge("g", Def::Start, Def::A, "edge", Span::SA).
@@ -959,8 +1363,8 @@ p() :- q(_).
 fn missing_relation_for_witness_path_includes_reference_context() {
     let src = r#"
 .type Def = { A, B }.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
 .decl out().
 out() :- witness_path("g", Def::A, Def::B, _).
 "#;
@@ -980,34 +1384,32 @@ out() :- witness_path("g", Def::A, Def::B, _).
 #[test]
 fn builtin_type_mismatch_contains_reports_predicate_and_argument() {
     let src = r#"
-.decl contains(Haystack: int, Needle: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
 .decl out().
 out() :- contains(1, "x").
 "#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0905]")
-            && n.message
-                .contains("builtin `contains` argument 1 expected string, found int")
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let err = typecheck(resolved).expect_err("type mismatch");
+    assert!(err.iter().any(|d| d.code_str() == "RAQL0200"));
+    assert!(err.iter().any(|d| {
+        d.to_string().contains("cannot unify `string` with `int`")
     }));
 }
 
 #[test]
 fn builtin_type_mismatch_fmt_reports_nested_argument_path() {
     let src = r#"
-.decl fmt(Format: string, Args: list<int>, Out: string) extern.
+.decl fmt(Format: string, Args: list<string>, Out: string) extern.
 .decl out().
 out() :- fmt("{}", [1], _).
 "#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0905]")
-            && n.message
-                .contains("builtin `fmt` argument 2[1] expected string, found int")
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let err = typecheck(resolved).expect_err("type mismatch");
+    assert!(err.iter().any(|d| d.code_str() == "RAQL0200"));
+    assert!(err.iter().any(|d| {
+        d.to_string().contains("cannot unify `string` with `int`")
     }));
 }
 
@@ -1093,9 +1495,9 @@ fn host_scalar_overrides_for_witness_path_do_not_collide_with_defaults() {
 .func path_limit(N: int) extern.
 .mode path_limit(-int).
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
-.decl out(P: string).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
+.decl out(P: Path).
 graph_edge("g", Def::A, Def::B, "edge", Span::S1).
 graph_edge("g", Def::B, Def::C, "edge", Span::S2).
 out(P) :- witness_path("g", Def::A, Def::C, P).
@@ -1355,8 +1757,8 @@ fn witness_path_negative_max_depth_reports_actionable_runtime_context() {
 .func path_limit(N: int) input.
 .mode path_limit(-int).
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
 .decl out().
 path_max_depth(-1).
 path_limit(1).
@@ -1386,8 +1788,8 @@ fn witness_path_non_positive_limit_reports_actionable_runtime_context() {
 .func path_limit(N: int) input.
 .mode path_limit(-int).
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
 .decl out().
 path_max_depth(8).
 path_limit(0).
@@ -1416,8 +1818,8 @@ fn witness_path_scalar_input_cardinality_violation_reports_actionable_runtime_co
 .func path_limit(N: int) input.
 .mode path_limit(-int).
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
 .decl out().
 path_max_depth(4).
 path_max_depth(8).
@@ -1448,8 +1850,8 @@ fn witness_path_limit_cardinality_violation_reports_actionable_runtime_context()
 .func path_limit(N: int) input.
 .mode path_limit(-int).
 .decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: string) extern.
-.mode witness_path(+string, +Def, +Def, -string).
+.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
+.mode witness_path(+string, +Def, +Def, -Path).
 .decl out().
 path_max_depth(8).
 path_limit(1).

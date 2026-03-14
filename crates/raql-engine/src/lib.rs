@@ -5,9 +5,15 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexSet;
-use raql_compiler::{CompilerType, ModeDir, PlannedProgram, PlannedRule};
+use raql_compiler::{
+    CompilerType, ModeDir, PlannedProgram, PlannedRule, reachable_predicates,
+    required_extern_capabilities,
+};
 use raql_host::HostRuntime;
-use raql_host::{CallId, DefId, ImplId, NodeId, RefId, SpanId, TypeRefId};
+use raql_host::{
+    CallId, DefId, ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest,
+    ExternLookupValue, ImplId, NodeId, RefId, SpanId, TypeRefId,
+};
 use raql_ir::StableId;
 use raql_syntax::{
     Constraint, DeclAttr, DeclarationKind, Expr, Goal, RelOp, Spanned, SrcSpan, Term, TypeAst,
@@ -182,6 +188,12 @@ impl ExecutionContext {
     }
 }
 
+#[derive(Debug, Default)]
+struct FunctionExternIndex {
+    rows_by_predicate:
+        BTreeMap<String, BTreeMap<Vec<usize>, BTreeMap<Vec<RuntimeValue>, Vec<usize>>>>,
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("host `{operation}` failed: {message}")]
 pub struct EngineHostError {
@@ -228,6 +240,17 @@ pub trait EngineHostView {
         _predicate: &str,
     ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
         Ok(None)
+    }
+
+    fn extern_lookup(
+        &mut self,
+        _request: &ExternLookupRequest,
+    ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, EngineHostError> {
+        Ok(None)
+    }
+
+    fn prefers_lookup_only(&mut self, _predicate: &str) -> bool {
+        false
     }
 }
 
@@ -286,6 +309,16 @@ impl EngineHostView for raql_host::MockHostRuntime {
             _ => format!("{value:?}"),
         }
     }
+
+    fn extern_lookup(
+        &mut self,
+        request: &ExternLookupRequest,
+    ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, EngineHostError> {
+        match HostRuntime::extern_lookup(self, request) {
+            Ok(rows) => Ok(rows),
+            Err(never) => match never {},
+        }
+    }
 }
 
 pub fn execute(plan: &impl EnginePlanView, host: &mut impl EngineHostView) -> EvalResult {
@@ -311,14 +344,22 @@ pub fn execute(plan: &impl EnginePlanView, host: &mut impl EngineHostView) -> Ev
 
     let mut notes = Vec::new();
     let mut has_non_fatal_partial_note = false;
+    trace_engine_phase("execute.start");
     let _ = host.take_runtime_notes();
+    trace_engine_phase("execute.after_take_runtime_notes");
+    let reachable = reachable_predicates(program);
+    trace_engine_phase("execute.after_reachable_predicates");
     let extern_predicates = collect_extern_predicates(program);
+    let lookup_covered_externs = collect_lookup_covered_extern_predicates(program, &reachable);
+    trace_engine_phase("execute.after_lookup_coverage");
+    trace_engine_lookup_coverage(&lookup_covered_externs);
 
     inject_required_host_relations(&mut relations, host);
     let scalar_extern_notes = match inject_host_extern_relations(
         program,
         extern_predicates.scalar.as_slice(),
         &mut relations,
+        &lookup_covered_externs,
         host,
     ) {
         Ok(notes) => notes,
@@ -354,6 +395,7 @@ pub fn execute(plan: &impl EnginePlanView, host: &mut impl EngineHostView) -> Ev
         program,
         extern_predicates.non_scalar.as_slice(),
         &mut relations,
+        &lookup_covered_externs,
         host,
     ) {
         Ok(notes) => notes,
@@ -373,6 +415,8 @@ pub fn execute(plan: &impl EnginePlanView, host: &mut impl EngineHostView) -> Ev
         has_non_fatal_partial_note = true;
         emit_partial_status(&mut relations, &mut notes, "Notes", note);
     }
+    let function_index_specs = collect_function_index_specs(program);
+    let function_index = build_function_extern_index(program, &relations, &function_index_specs);
     if drain_host_runtime_notes(&mut relations, &mut notes, host) {
         has_non_fatal_partial_note = true;
     }
@@ -394,7 +438,11 @@ pub fn execute(plan: &impl EnginePlanView, host: &mut impl EngineHostView) -> Ev
     let mut total_iterations = 0usize;
 
     let mut rules_by_pred = BTreeMap::<String, Vec<&PlannedRule>>::new();
-    for planned_rule in program.planned_rules() {
+    for planned_rule in program
+        .planned_rules()
+        .iter()
+        .filter(|rule| reachable.contains(rule.head_predicate()))
+    {
         let head = planned_rule.head_predicate().to_string();
         rules_by_pred.entry(head).or_default().push(planned_rule);
     }
@@ -441,6 +489,7 @@ pub fn execute(plan: &impl EnginePlanView, host: &mut impl EngineHostView) -> Ev
                     rules.as_slice(),
                     &mut context,
                     &mut relations,
+                    &function_index,
                     &mut notes,
                     host,
                     &mut has_non_fatal_partial_note,
@@ -470,6 +519,7 @@ pub fn execute(plan: &impl EnginePlanView, host: &mut impl EngineHostView) -> Ev
                 rules.as_slice(),
                 &mut context,
                 &mut relations,
+                &function_index,
                 &mut notes,
                 host,
                 &mut has_non_fatal_partial_note,
@@ -518,13 +568,14 @@ fn apply_rules_once(
     rules: &[&PlannedRule],
     context: &mut ExecutionContext,
     relations: &mut BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    function_index: &FunctionExternIndex,
     notes: &mut Vec<EvalNote>,
     host: &mut impl EngineHostView,
     has_non_fatal_partial_note: &mut bool,
 ) -> Result<bool, RuntimeError> {
     let mut changed = false;
     for planned_rule in rules {
-        let rows = eval_rule(program, planned_rule, context, relations, host)?;
+        let rows = eval_rule(program, planned_rule, context, relations, function_index, host)?;
         let head_name = planned_rule.head_predicate().to_string();
         let rel = relations.entry(head_name).or_default();
         let before = rel.len();
@@ -580,10 +631,15 @@ fn inject_host_extern_relations(
     program: &PlannedProgram,
     predicates: &[String],
     relations: &mut BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    lookup_covered_externs: &BTreeSet<String>,
     host: &mut impl EngineHostView,
 ) -> Result<Vec<String>, RuntimeError> {
     let mut notes = Vec::new();
     for predicate in predicates {
+        if lookup_covered_externs.contains(predicate) && host.prefers_lookup_only(predicate) {
+            relations.entry(predicate.clone()).or_default();
+            continue;
+        }
         let Some(decl) = program.predicates().get(predicate) else {
             continue;
         };
@@ -594,7 +650,9 @@ fn inject_host_extern_relations(
         let rows = match host.extern_relation_rows(predicate) {
             Ok(Some(rows)) => rows,
             Ok(None) => {
-                if !is_engine_managed_extern(predicate) {
+                if !is_engine_managed_extern(predicate)
+                    && !lookup_covered_externs.contains(predicate)
+                {
                     notes.push(format_extern_rows_none_note(
                         program,
                         kind,
@@ -605,7 +663,9 @@ fn inject_host_extern_relations(
                 continue;
             }
             Err(error) => {
-                if !is_engine_managed_extern(predicate) {
+                if !is_engine_managed_extern(predicate)
+                    && !lookup_covered_externs.contains(predicate)
+                {
                     notes.push(format_extern_rows_error_note(
                         program,
                         kind,
@@ -634,6 +694,58 @@ fn inject_host_extern_relations(
     Ok(notes)
 }
 
+fn collect_lookup_covered_extern_predicates(
+    program: &PlannedProgram,
+    reachable: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut covered = BTreeSet::<String>::new();
+    let mut disqualified = BTreeSet::<String>::new();
+    for planned_rule in program
+        .planned_rules()
+        .iter()
+        .filter(|rule| reachable.contains(rule.head_predicate()))
+    {
+        for goal_plan in planned_rule.ordered_goals() {
+            let Some(goal) = planned_rule.goal(goal_plan.index()) else {
+                continue;
+            };
+            let Goal::Atom(atom) = &goal.value else {
+                continue;
+            };
+            let predicate = atom.name.value.as_str();
+            let Some(decl) = program.predicate_decl(predicate) else {
+                continue;
+            };
+            if !decl.attrs().contains(&DeclAttr::Extern) || is_engine_managed_extern(predicate) {
+                continue;
+            }
+            if goal_plan.extern_lookup().is_some() {
+                if !disqualified.contains(predicate) {
+                    covered.insert(predicate.to_string());
+                }
+            } else {
+                covered.remove(predicate);
+                disqualified.insert(predicate.to_string());
+            }
+        }
+    }
+    covered
+}
+
+fn trace_engine_lookup_coverage(covered: &BTreeSet<String>) {
+    if std::env::var_os("RAQL_TRACE_TIMINGS").is_none() {
+        return;
+    }
+    eprintln!("raql-timing engine.lookup_covered [{}]", covered.iter().cloned().collect::<Vec<_>>().join(","));
+}
+
+fn trace_engine_phase(label: &str) {
+    if std::env::var_os("RAQL_TRACE_TIMINGS").is_none() {
+        return;
+    }
+    eprintln!("raql-timing engine.{label}");
+}
+
 #[derive(Debug, Default)]
 struct ExternPredicateGroups {
     scalar: Vec<String>,
@@ -642,14 +754,11 @@ struct ExternPredicateGroups {
 
 fn collect_extern_predicates(program: &PlannedProgram) -> ExternPredicateGroups {
     let mut groups = ExternPredicateGroups::default();
-    for (predicate, decl) in program.predicates() {
-        if !decl.attrs().contains(&DeclAttr::Extern) {
-            continue;
-        }
-        if is_scalar_input_predicate(predicate) {
-            groups.scalar.push(predicate.clone());
+    for predicate in required_extern_capabilities(program) {
+        if is_scalar_input_predicate(predicate.as_str()) {
+            groups.scalar.push(predicate);
         } else {
-            groups.non_scalar.push(predicate.clone());
+            groups.non_scalar.push(predicate);
         }
     }
     groups
@@ -1059,19 +1168,252 @@ fn function_input_constraints(
     Ok(constraints)
 }
 
-fn function_match_count(
+fn function_declared_input_positions(
+    program: &PlannedProgram,
+    predicate: &str,
     atom: &raql_syntax::Atom,
-    rel: &IndexSet<Vec<RuntimeValue>>,
+    selected_mode: Option<usize>,
+) -> Vec<usize> {
+    if let Some(mode_idx) = selected_mode {
+        if let Some(modes) = program.modes(predicate) {
+            if let Some(mode) = modes.get(mode_idx) {
+                return mode
+                    .args()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, (dir, _))| matches!(dir, ModeDir::In).then_some(idx))
+                    .collect();
+            }
+        }
+    }
+
+    if is_function_predicate(program, predicate) {
+        return (0..atom.terms.len().saturating_sub(1)).collect();
+    }
+
+    Vec::new()
+}
+
+fn lookup_binds_non_input_positions(
+    lookup: &raql_compiler::ExternLookupPlan,
     constraints: &[(usize, RuntimeValue)],
-) -> usize {
-    rel.iter()
-        .filter(|tuple| tuple.len() == atom.terms.len())
-        .filter(|tuple| {
-            constraints
+) -> bool {
+    lookup
+        .bound_positions()
+        .iter()
+        .any(|idx| !constraints.iter().any(|(input_idx, _)| input_idx == idx))
+}
+
+fn lookup_rows_for_atom(
+    atom: &raql_syntax::Atom,
+    lookup: &raql_compiler::ExternLookupPlan,
+    env: &Env,
+    host: &mut impl EngineHostView,
+) -> Option<Vec<Vec<RuntimeValue>>> {
+    let request = build_extern_lookup_request(atom, lookup, env).ok()?;
+    let rows = host.extern_lookup(&request).ok()??;
+    Some(
+        rows.into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(runtime_value_from_lookup_value)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn build_extern_lookup_request(
+    atom: &raql_syntax::Atom,
+    lookup: &raql_compiler::ExternLookupPlan,
+    env: &Env,
+) -> Result<ExternLookupRequest, RuntimeError> {
+    let mut bound_values = Vec::with_capacity(lookup.bound_positions().len());
+    for idx in lookup.bound_positions() {
+        let value = eval_ground_term(&atom.terms[*idx], env)?;
+        bound_values.push(lookup_value_from_runtime_value(&value));
+    }
+    Ok(ExternLookupRequest::new(
+        atom.name.value.to_string(),
+        lookup.shape(),
+        atom.terms.len(),
+        lookup.bound_positions().to_vec(),
+        bound_values,
+    ))
+}
+
+fn lookup_value_from_runtime_value(value: &RuntimeValue) -> ExternLookupValue {
+    match value {
+        RuntimeValue::Int(v) => ExternLookupValue::Int(*v),
+        RuntimeValue::String(v) => ExternLookupValue::String(v.clone().into_boxed_str()),
+        RuntimeValue::Bool(v) => ExternLookupValue::Bool(*v),
+        RuntimeValue::Enum { name, variant } => ExternLookupValue::Enum {
+            name: name.clone().into_boxed_str(),
+            variant: variant.clone().into_boxed_str(),
+        },
+        RuntimeValue::Host { kind, id } => ExternLookupValue::Host(ExternLookupHostValue::new(
+            lookup_host_value_kind(*kind),
+            StableId::new(*id),
+        )),
+        RuntimeValue::None => ExternLookupValue::None,
+        RuntimeValue::Some(inner) => {
+            ExternLookupValue::Some(Box::new(lookup_value_from_runtime_value(inner)))
+        }
+        RuntimeValue::List(items) => ExternLookupValue::List(
+            items
                 .iter()
-                .all(|(idx, expected)| tuple.get(*idx).is_some_and(|value| value == expected))
-        })
+                .map(lookup_value_from_runtime_value)
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+fn runtime_value_from_lookup_value(value: ExternLookupValue) -> RuntimeValue {
+    match value {
+        ExternLookupValue::Int(v) => RuntimeValue::Int(v),
+        ExternLookupValue::String(v) => RuntimeValue::String(v.into()),
+        ExternLookupValue::Bool(v) => RuntimeValue::Bool(v),
+        ExternLookupValue::Enum { name, variant } => RuntimeValue::Enum {
+            name: name.into(),
+            variant: variant.into(),
+        },
+        ExternLookupValue::Host(value) => RuntimeValue::Host {
+            kind: runtime_host_value_kind(value.kind()),
+            id: value.stable_id().as_u64(),
+        },
+        ExternLookupValue::None => RuntimeValue::None,
+        ExternLookupValue::Some(inner) => {
+            RuntimeValue::Some(Box::new(runtime_value_from_lookup_value(*inner)))
+        }
+        ExternLookupValue::List(items) => RuntimeValue::List(
+            items
+                .into_iter()
+                .map(runtime_value_from_lookup_value)
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+const fn lookup_host_value_kind(kind: HostValueKind) -> ExternLookupHostValueKind {
+    match kind {
+        HostValueKind::Def => ExternLookupHostValueKind::Def,
+        HostValueKind::Span => ExternLookupHostValueKind::Span,
+        HostValueKind::TypeRef => ExternLookupHostValueKind::TypeRef,
+        HostValueKind::Node => ExternLookupHostValueKind::Node,
+        HostValueKind::Call => ExternLookupHostValueKind::Call,
+        HostValueKind::Ref => ExternLookupHostValueKind::Ref,
+        HostValueKind::Impl => ExternLookupHostValueKind::Impl,
+    }
+}
+
+const fn runtime_host_value_kind(kind: ExternLookupHostValueKind) -> HostValueKind {
+    match kind {
+        ExternLookupHostValueKind::Def => HostValueKind::Def,
+        ExternLookupHostValueKind::Span => HostValueKind::Span,
+        ExternLookupHostValueKind::TypeRef => HostValueKind::TypeRef,
+        ExternLookupHostValueKind::Node => HostValueKind::Node,
+        ExternLookupHostValueKind::Call => HostValueKind::Call,
+        ExternLookupHostValueKind::Ref => HostValueKind::Ref,
+        ExternLookupHostValueKind::Impl => HostValueKind::Impl,
+    }
+}
+
+fn function_match_count(
+    tuples: &[Vec<RuntimeValue>],
+    arity: usize,
+) -> usize {
+    tuples
+        .iter()
+        .filter(|tuple| tuple.len() == arity)
         .count()
+}
+
+fn collect_function_index_specs(program: &PlannedProgram) -> BTreeMap<String, BTreeSet<Vec<usize>>> {
+    let mut specs = BTreeMap::<String, BTreeSet<Vec<usize>>>::new();
+    for (predicate, decl) in program.predicates() {
+        if decl.kind() != DeclarationKind::Function || !decl.attrs().contains(&DeclAttr::Extern) {
+            continue;
+        }
+        let Some(modes) = program.modes(predicate) else {
+            continue;
+        };
+        for mode in modes {
+            let positions = mode
+                .args()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, (dir, _))| matches!(dir, ModeDir::In).then_some(idx))
+                .collect::<Vec<_>>();
+            specs.entry(predicate.clone()).or_default().insert(positions);
+        }
+    }
+    specs
+}
+
+fn build_function_extern_index(
+    program: &PlannedProgram,
+    relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    specs: &BTreeMap<String, BTreeSet<Vec<usize>>>,
+) -> FunctionExternIndex {
+    let mut index = FunctionExternIndex::default();
+    for (predicate, position_sets) in specs {
+        let Some(decl) = program.predicate_decl(predicate) else {
+            continue;
+        };
+        let expected_arity = decl.args().len();
+        let Some(rows) = relations.get(predicate) else {
+            continue;
+        };
+        let predicate_index = index.rows_by_predicate.entry(predicate.clone()).or_default();
+        for positions in position_sets {
+            let mut keyed_rows = BTreeMap::<Vec<RuntimeValue>, Vec<usize>>::new();
+            for (row_idx, row) in rows.iter().enumerate() {
+                if row.len() != expected_arity {
+                    continue;
+                }
+                let key = positions
+                    .iter()
+                    .filter_map(|pos| row.get(*pos).cloned())
+                    .collect::<Vec<_>>();
+                if key.len() == positions.len() {
+                    keyed_rows.entry(key).or_default().push(row_idx);
+                }
+            }
+            predicate_index.insert(positions.clone(), keyed_rows);
+        }
+    }
+    index
+}
+
+fn lookup_indexed_function_rows(
+    index: &FunctionExternIndex,
+    predicate: &str,
+    positions: &[usize],
+    values: &[RuntimeValue],
+    rel: &IndexSet<Vec<RuntimeValue>>,
+) -> Vec<Vec<RuntimeValue>> {
+    let indexed = index
+        .rows_by_predicate
+        .get(predicate)
+        .and_then(|by_positions| by_positions.get(positions))
+        .and_then(|by_values| by_values.get(values))
+        .map(|row_indexes| {
+            row_indexes
+                .iter()
+                .filter_map(|row_idx| rel.get_index(*row_idx).cloned())
+                .collect::<Vec<_>>()
+        });
+    indexed.unwrap_or_else(|| {
+        rel.iter()
+            .filter(|tuple| {
+                positions
+                    .iter()
+                    .zip(values.iter())
+                    .all(|(idx, expected)| tuple.get(*idx).is_some_and(|value| value == expected))
+            })
+            .cloned()
+            .collect()
+    })
 }
 
 fn input_positions(
@@ -1095,7 +1437,18 @@ fn input_positions(
         }
     }
 
-    // Fallback for predicates without explicit modes: treat currently-ground terms as inputs.
+    if is_function_predicate(program, predicate) {
+        let mut positions = Vec::new();
+        let input_arity = atom.terms.len().saturating_sub(1);
+        for idx in 0..input_arity {
+            if eval_ground_term(&atom.terms[idx], env).is_ok() {
+                positions.push(idx);
+            }
+        }
+        return Ok(positions);
+    }
+
+    // Fallback for relation predicates without explicit modes: treat currently-ground terms as inputs.
     let mut positions = Vec::new();
     for (idx, term) in atom.terms.iter().enumerate() {
         if eval_ground_term(term, env).is_ok() {
@@ -1259,6 +1612,7 @@ fn eval_rule(
     planned_rule: &PlannedRule,
     context: &mut ExecutionContext,
     relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    function_index: &FunctionExternIndex,
     host: &mut impl EngineHostView,
 ) -> Result<Vec<Vec<RuntimeValue>>, RuntimeError> {
     let mut envs = vec![Env::new()];
@@ -1272,10 +1626,12 @@ fn eval_rule(
                 program,
                 goal,
                 goal_plan.chosen_mode(),
+                goal_plan.extern_lookup(),
                 env,
                 planned_rule.var_types(),
                 context,
                 relations,
+                function_index,
                 host,
             )?;
             next.append(&mut rows);
@@ -1301,10 +1657,12 @@ fn eval_goal(
     program: &PlannedProgram,
     goal: &Spanned<Goal>,
     selected_mode: Option<usize>,
+    extern_lookup: Option<&raql_compiler::ExternLookupPlan>,
     env: &Env,
     var_types: &BTreeMap<String, CompilerType>,
     context: &mut ExecutionContext,
     relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    function_index: &FunctionExternIndex,
     host: &mut impl EngineHostView,
 ) -> Result<Vec<Env>, RuntimeError> {
     match &goal.value {
@@ -1331,25 +1689,74 @@ fn eval_goal(
                         goal_anchor_suffix(program, goal.span)
                     ),
                 })?;
+            let mut candidate_tuples = Vec::new();
+            let lookup_rows =
+                extern_lookup.and_then(|lookup| lookup_rows_for_atom(atom, lookup, env, host));
             if is_function_predicate(program, name.as_str()) {
+                let declared_input_positions =
+                    function_declared_input_positions(program, name.as_str(), atom, selected_mode);
                 let constraints = function_input_constraints(program, atom, env, selected_mode)?;
-                let cardinality = function_match_count(atom, rel, &constraints);
-                if cardinality != 1 {
-                    return Err(RuntimeError::FunctionCardinality {
-                        predicate: name.clone(),
-                        got: cardinality,
-                        context: format_function_input_context(atom, &constraints),
-                    });
+                let lookup_is_filter =
+                    extern_lookup.is_some_and(|lookup| lookup_binds_non_input_positions(lookup, &constraints));
+                candidate_tuples = if let Some(rows) = lookup_rows.clone() {
+                    rows
+                } else {
+                    let positions = constraints
+                        .iter()
+                        .map(|(idx, _)| *idx)
+                        .collect::<Vec<_>>();
+                    let values = constraints
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .collect::<Vec<_>>();
+                    lookup_indexed_function_rows(function_index, &name, &positions, &values, rel)
+                };
+                let all_inputs_bound = declared_input_positions
+                    .iter()
+                    .all(|idx| constraints.iter().any(|(bound_idx, _)| bound_idx == idx));
+                if all_inputs_bound {
+                    let cardinality = function_match_count(&candidate_tuples, atom.terms.len());
+                    if cardinality != 1 && !(lookup_is_filter && cardinality == 0) {
+                        return Err(RuntimeError::FunctionCardinality {
+                            predicate: name.clone(),
+                            got: cardinality,
+                            context: format_function_input_context(atom, &constraints),
+                        });
+                    }
                 }
             }
             let mut out = Vec::new();
-            for tuple in rel {
-                if tuple.len() != atom.terms.len() {
-                    continue;
+            if is_function_predicate(program, name.as_str()) {
+                for tuple in &candidate_tuples {
+                    if tuple.len() != atom.terms.len() {
+                        continue;
+                    }
+                    let mut candidate = env.clone();
+                    if unify_terms_with_tuple(&atom.terms, tuple, &mut candidate)? {
+                        out.push(candidate);
+                    }
                 }
-                let mut candidate = env.clone();
-                if unify_terms_with_tuple(&atom.terms, tuple, &mut candidate)? {
-                    out.push(candidate);
+            } else {
+                if let Some(rows) = lookup_rows {
+                    for tuple in &rows {
+                        if tuple.len() != atom.terms.len() {
+                            continue;
+                        }
+                        let mut candidate = env.clone();
+                        if unify_terms_with_tuple(&atom.terms, tuple, &mut candidate)? {
+                            out.push(candidate);
+                        }
+                    }
+                } else {
+                    for tuple in rel {
+                        if tuple.len() != atom.terms.len() {
+                            continue;
+                        }
+                        let mut candidate = env.clone();
+                        if unify_terms_with_tuple(&atom.terms, tuple, &mut candidate)? {
+                            out.push(candidate);
+                        }
+                    }
                 }
             }
             Ok(out)
@@ -1399,9 +1806,27 @@ fn eval_goal(
             },
             Constraint::ArithmeticBind(b) => eval_arithmetic_bind_constraint(b, env),
         },
-        Goal::Aggregate(a) => eval_aggregate(program, a, env, var_types, context, relations, host),
+        Goal::Aggregate(a) => eval_aggregate(
+            program,
+            a,
+            env,
+            var_types,
+            context,
+            relations,
+            function_index,
+            host,
+        ),
         Goal::ChooseTopK(c) => {
-            eval_choose_topk(program, c, env, var_types, context, relations, host)
+            eval_choose_topk(
+                program,
+                c,
+                env,
+                var_types,
+                context,
+                relations,
+                function_index,
+                host,
+            )
         }
         Goal::Disjunction(d) => {
             let mut out = Vec::new();
@@ -1411,7 +1836,18 @@ fn eval_goal(
                     let mut next = Vec::new();
                     for e in &branch_envs {
                         let mut rows =
-                            eval_goal(program, g, None, e, var_types, context, relations, host)?;
+                            eval_goal(
+                                program,
+                                g,
+                                None,
+                                None,
+                                e,
+                                var_types,
+                                context,
+                                relations,
+                                function_index,
+                                host,
+                            )?;
                         next.append(&mut rows);
                     }
                     branch_envs = next;
@@ -1819,13 +2255,25 @@ fn eval_aggregate(
     var_types: &BTreeMap<String, CompilerType>,
     context: &mut ExecutionContext,
     relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    function_index: &FunctionExternIndex,
     host: &mut impl EngineHostView,
 ) -> Result<Vec<Env>, RuntimeError> {
     let mut rows = vec![env.clone()];
     for goal in &a.goals {
         let mut next = Vec::new();
         for e in &rows {
-            let mut out = eval_goal(program, goal, None, e, var_types, context, relations, host)?;
+            let mut out = eval_goal(
+                program,
+                goal,
+                None,
+                None,
+                e,
+                var_types,
+                context,
+                relations,
+                function_index,
+                host,
+            )?;
             next.append(&mut out);
         }
         rows = next;
@@ -1941,6 +2389,7 @@ fn eval_choose_topk(
     var_types: &BTreeMap<String, CompilerType>,
     context: &mut ExecutionContext,
     relations: &BTreeMap<String, IndexSet<Vec<RuntimeValue>>>,
+    function_index: &FunctionExternIndex,
     host: &mut impl EngineHostView,
 ) -> Result<Vec<Env>, RuntimeError> {
     let k_value = eval_ground_term(&c.k, env)?;
@@ -1984,7 +2433,18 @@ fn eval_choose_topk(
     for goal in &c.goals {
         let mut next = Vec::new();
         for e in &rows {
-            let mut out = eval_goal(program, goal, None, e, var_types, context, relations, host)?;
+            let mut out = eval_goal(
+                program,
+                goal,
+                None,
+                None,
+                e,
+                var_types,
+                context,
+                relations,
+                function_index,
+                host,
+            )?;
             next.append(&mut out);
         }
         rows = next;

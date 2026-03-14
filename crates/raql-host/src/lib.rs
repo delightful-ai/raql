@@ -174,6 +174,12 @@ pub fn is_engine_managed_extern(predicate: &str) -> bool {
     )
 }
 
+/// Returns whether the compiler may treat this extern as runnable via exact-binding lookup
+/// even when no declared input mode is currently satisfied.
+pub fn supports_lookup_seed_predicate(predicate: &str) -> bool {
+    matches!(predicate, "def_name")
+}
+
 macro_rules! stable_entity_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -350,6 +356,118 @@ impl RuntimeScalarOptions {
     }
 }
 
+/// Typed host value used by extern lookup requests and responses.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExternLookupValue {
+    Int(i64),
+    String(Box<str>),
+    Bool(bool),
+    Enum { name: Box<str>, variant: Box<str> },
+    Host(ExternLookupHostValue),
+    None,
+    Some(Box<ExternLookupValue>),
+    List(Vec<ExternLookupValue>),
+}
+
+/// Typed host entity reference carried across the host lookup boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternLookupHostValue {
+    kind: ExternLookupHostValueKind,
+    id: StableId,
+}
+
+impl ExternLookupHostValue {
+    /// Creates a typed host entity reference for the lookup boundary.
+    pub const fn new(kind: ExternLookupHostValueKind, id: StableId) -> Self {
+        Self { kind, id }
+    }
+
+    /// Returns the host entity kind.
+    pub const fn kind(self) -> ExternLookupHostValueKind {
+        self.kind
+    }
+
+    /// Returns the stable identifier.
+    pub const fn stable_id(self) -> StableId {
+        self.id
+    }
+}
+
+/// Host entity kinds allowed across the extern lookup boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExternLookupHostValueKind {
+    Def,
+    Span,
+    TypeRef,
+    Node,
+    Call,
+    Ref,
+    Impl,
+}
+
+/// Supported lookup request shapes for extern pushdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExternLookupShape {
+    /// Exact bound-argument lookup for a functional extern predicate.
+    FunctionExactBindings,
+    /// Exact bound-argument lookup for a relational extern predicate.
+    RelationExactBindings,
+}
+
+/// Lookup request issued by the engine to avoid full extern materialization.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExternLookupRequest {
+    predicate: Box<str>,
+    shape: ExternLookupShape,
+    arity: usize,
+    bound_positions: Box<[usize]>,
+    bound_values: Vec<ExternLookupValue>,
+}
+
+impl ExternLookupRequest {
+    /// Creates a new extern lookup request.
+    pub fn new(
+        predicate: impl Into<Box<str>>,
+        shape: ExternLookupShape,
+        arity: usize,
+        bound_positions: impl Into<Box<[usize]>>,
+        bound_values: Vec<ExternLookupValue>,
+    ) -> Self {
+        Self {
+            predicate: predicate.into(),
+            shape,
+            arity,
+            bound_positions: bound_positions.into(),
+            bound_values,
+        }
+    }
+
+    /// Returns the extern predicate name.
+    pub fn predicate(&self) -> &str {
+        &self.predicate
+    }
+
+    /// Returns the lookup shape.
+    pub const fn shape(&self) -> ExternLookupShape {
+        self.shape
+    }
+
+    /// Returns the declaration arity for the target extern predicate.
+    pub const fn arity(&self) -> usize {
+        self.arity
+    }
+
+    /// Returns the bound argument positions used by the lookup.
+    pub fn bound_positions(&self) -> &[usize] {
+        &self.bound_positions
+    }
+
+    /// Returns the bound argument values used by the lookup.
+    pub fn bound_values(&self) -> &[ExternLookupValue] {
+        &self.bound_values
+    }
+}
+
 /// Runtime hooks used by RAQL planning and execution boundaries.
 pub trait HostRuntime {
     /// Error type returned by runtime hooks.
@@ -390,6 +508,14 @@ pub trait HostRuntime {
 
     /// Resolves an arbitrary scalar input value from the host.
     fn scalar_input(&self, key: &ScalarInputKey) -> Result<Option<ScalarValue>, Self::Error>;
+
+    /// Resolves a lookup-shaped extern request without materializing the full relation.
+    fn extern_lookup(
+        &self,
+        _request: &ExternLookupRequest,
+    ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, Self::Error> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -423,6 +549,7 @@ pub struct MockHostRuntime {
     scalar_inputs: BTreeMap<ScalarInputKey, ScalarValue>,
     stable_keys: BTreeMap<(StableKeyKind, StableId), StableHandle>,
     span_keys: BTreeMap<SpanId, SpanKey>,
+    extern_lookup_rows: BTreeMap<ExternLookupRequest, Vec<Vec<ExternLookupValue>>>,
     runtime_scalar_options: RuntimeScalarOptions,
 }
 
@@ -474,6 +601,25 @@ impl MockHostRuntime {
     /// Inserts/overrides a scalar input mapping.
     pub fn insert_scalar_input(&mut self, key: ScalarInputKey, value: ScalarValue) {
         self.scalar_inputs.insert(key, value);
+    }
+
+    /// Adds an explicit extern lookup override and returns `self` for chaining.
+    pub fn with_extern_lookup(
+        mut self,
+        request: ExternLookupRequest,
+        rows: Vec<Vec<ExternLookupValue>>,
+    ) -> Self {
+        self.insert_extern_lookup(request, rows);
+        self
+    }
+
+    /// Inserts/overrides an extern lookup mapping.
+    pub fn insert_extern_lookup(
+        &mut self,
+        request: ExternLookupRequest,
+        rows: Vec<Vec<ExternLookupValue>>,
+    ) {
+        self.extern_lookup_rows.insert(request, rows);
     }
 
     /// Sets runtime scalar option overrides and returns `self` for chaining.
@@ -677,13 +823,21 @@ impl HostRuntime for MockHostRuntime {
     fn scalar_input(&self, key: &ScalarInputKey) -> Result<Option<ScalarValue>, Self::Error> {
         Ok(self.scalar_inputs.get(key).cloned())
     }
+
+    fn extern_lookup(
+        &self,
+        request: &ExternLookupRequest,
+    ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, Self::Error> {
+        Ok(self.extern_lookup_rows.get(request).cloned())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        CallId, DefId, HostRuntime, MockHostRuntime, RuntimeScalarOptions, ScalarInputKey,
-        SpanCoord, SpanId, SpanKey, StableHandle, TypeRefId, WorldStamp,
+        CallId, DefId, ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest,
+        ExternLookupShape, ExternLookupValue, HostRuntime, MockHostRuntime, RuntimeScalarOptions,
+        ScalarInputKey, SpanCoord, SpanId, SpanKey, StableHandle, TypeRefId, WorldStamp,
     };
     use raql_ir::{ScalarValue, StableId};
 
@@ -813,6 +967,46 @@ mod tests {
                 .runtime_scalar_options()
                 .expect("infallible scalar options"),
             options
+        );
+    }
+
+    #[test]
+    fn extern_lookup_rows_are_keyed_by_full_request_shape() {
+        let def = DefId::new(StableId::new(0x77));
+        let request = ExternLookupRequest::new(
+            "def_name",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [0],
+            vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+                ExternLookupHostValueKind::Def,
+                def.stable_id(),
+            ))],
+        );
+        let rows = vec![vec![
+            ExternLookupValue::Host(ExternLookupHostValue::new(
+                ExternLookupHostValueKind::Def,
+                def.stable_id(),
+            )),
+            ExternLookupValue::String("load_and_plan".into()),
+        ]];
+        let runtime = MockHostRuntime::new().with_extern_lookup(request.clone(), rows.clone());
+
+        assert_eq!(
+            runtime.extern_lookup(&request).expect("infallible extern lookup"),
+            Some(rows)
+        );
+        assert_eq!(
+            runtime
+                .extern_lookup(&ExternLookupRequest::new(
+                    "def_name",
+                    ExternLookupShape::FunctionExactBindings,
+                    2,
+                    [1],
+                    vec![ExternLookupValue::String("load_and_plan".into())],
+                ))
+                .expect("infallible extern lookup"),
+            None
         );
     }
 }

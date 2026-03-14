@@ -29,6 +29,7 @@ pub enum DaemonEvent {
 pub struct SessionEvent {
     pub workspace_root: String,
     pub daemon_state: DaemonState,
+    pub warmup_status: WarmupStatusEvent,
     pub workspace_epoch: u64,
     pub content_revision: u64,
     pub supported_capabilities: Vec<String>,
@@ -38,6 +39,21 @@ pub struct SessionEvent {
 pub enum DaemonState {
     Cold,
     Warm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WarmupStatusEvent {
+    pub phase: WarmupPhaseEvent,
+    pub generation: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WarmupPhaseEvent {
+    Cold,
+    Running,
+    Warm,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

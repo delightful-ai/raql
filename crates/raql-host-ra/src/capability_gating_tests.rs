@@ -34,14 +34,13 @@ edition = "2021"
 }
 
 #[test]
-fn unsupported_stdlib_capabilities_fail_explicitly() {
+fn unknown_extern_capabilities_fail_explicitly() {
     let root = temp_workspace_root("unsupported");
     let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
     let src = r#"
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
-.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl unsupported_predicate(D: Def) extern.
 .decl hit().
-hit() :- call_edge(_, _, _, _).
+hit() :- unsupported_predicate(_).
 "#;
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
@@ -52,19 +51,21 @@ hit() :- call_edge(_, _, _, _).
         .map(Into::into)
         .collect::<Vec<_>>();
     let err = MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
-        .expect_err("call_edge should be unsupported in the day-one RA core");
-    assert!(err.to_string().contains("call_edge"), "error={err}");
+        .expect_err("unknown extern predicates should be rejected");
+    assert!(
+        err.to_string().contains("unsupported_predicate"),
+        "error={err}"
+    );
 }
 
 #[test]
-fn workspace_service_rejects_unsupported_capabilities_during_run() {
+fn workspace_service_rejects_unknown_capabilities_during_run() {
     let root = temp_workspace_root("run_rejects_unsupported");
     let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
     let src = r#"
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
-.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl unsupported_predicate(D: Def) extern.
 .decl hit().
-hit() :- call_edge(_, _, _, _).
+hit() :- unsupported_predicate(_).
 "#;
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
@@ -72,8 +73,11 @@ hit() :- call_edge(_, _, _, _).
     let planned = plan(typed).expect("plan");
     let err = service
         .run_planned(&planned)
-        .expect_err("WorkspaceService should reject unsupported capabilities before execution");
-    assert!(err.to_string().contains("call_edge"), "error={err}");
+        .expect_err("WorkspaceService should reject unknown capabilities before execution");
+    assert!(
+        err.to_string().contains("unsupported_predicate"),
+        "error={err}"
+    );
 }
 
 #[test]
@@ -117,8 +121,8 @@ seed().
 }
 
 #[test]
-fn search_capability_is_supported_on_the_daemon_runtime() {
-    let root = temp_workspace_root("search_supported");
+fn search_capability_is_rejected_on_the_daemon_runtime() {
+    let root = temp_workspace_root("search_rejected");
     let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
     let src = r#"
 .decl search(Q: string, D: Def, Score: int) extern.
@@ -133,8 +137,13 @@ hit(D, Score) :- search("caller", D, Score).
         .into_iter()
         .map(Into::into)
         .collect::<Vec<_>>();
-    MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
-        .expect("search should be supported in the daemon runtime");
+    let missing =
+        MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+            .expect_err("search should stay disabled until rebuilt from RA-native truth");
+    assert!(
+        missing.to_string().contains("search"),
+        "missing capabilities should include search; err={missing}"
+    );
 }
 
 #[test]
@@ -212,4 +221,150 @@ hit() :-
         .collect::<Vec<_>>();
     MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
         .expect("type-surface capabilities should be supported in the daemon runtime");
+}
+
+#[test]
+fn call_graph_capabilities_are_supported_on_the_daemon_runtime() {
+    let root = temp_workspace_root("call_graph_supported");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.func dispatch_str(Dispatch: DispatchKind, Label: string) extern.
+.decl hit().
+hit() :- call_edge(_, _, _, Dispatch), dispatch_str(Dispatch, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+        .expect("call-graph capabilities should be supported in the daemon runtime");
+}
+
+#[test]
+fn syntax_control_capabilities_are_supported_on_the_daemon_runtime() {
+    let root = temp_workspace_root("syntax_control_supported");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.type NodeKind = { IF, MATCH, WHILE, FOR, LOOP, BLOCK, TRY, ARM, OTHER }.
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.func node_at(S: Span, N: option<Node>) extern.
+.func node_kind(N: Node, K: NodeKind) extern.
+.func node_span(N: Node, S: Span) extern.
+.func node_parent(N: Node, P: option<Node>) extern.
+.decl enclosing_control(S: Span, K: NodeKind, ControlS: Span, Dist: int) extern.
+.func node_id(N: Node, H: string) extern.
+.decl hit().
+hit() :-
+  call_edge(_, _, Site, _),
+  node_at(Site, some(Node)),
+  node_kind(Node, _),
+  node_span(Node, _),
+  node_parent(Node, _),
+  enclosing_control(Site, _, _, _),
+  node_id(Node, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+        .expect("syntax/control capabilities should be supported in the daemon runtime");
+}
+
+#[test]
+fn approximate_reference_capabilities_are_rejected_on_the_daemon_runtime() {
+    let root = temp_workspace_root("reference_events_rejected");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.decl compares(Type: Def, Site: Span, Op: string, Fn: Def) extern.
+.decl writes(Subject: Def, Site: Span, Fn: Def) extern.
+.decl ref_id(R: Ref, H: string) extern.
+.mode ref_id(-Ref, -string).
+.decl hit().
+hit() :- compares(_, _, _, _), writes(_, _, _), ref_id(_, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    let err =
+        MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+            .expect_err("approximate reference capabilities should be disabled until RA-native");
+    let message = err.to_string();
+    assert!(message.contains("compares"), "error={message}");
+    assert!(message.contains("writes"), "error={message}");
+    assert!(message.contains("ref_id"), "error={message}");
+}
+
+#[test]
+fn error_flow_capabilities_are_rejected_on_the_daemon_runtime() {
+    let root = temp_workspace_root("error_flow_rejected");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.decl constructs(ErrType: Def, Variant: string, Site: Span, Fn: Def) extern.
+.decl propagates(ErrType: Def, Site: Span, Fn: Def) extern.
+.decl converts(SrcErr: Def, DstErr: Def, Site: Span, Fn: Def) extern.
+.decl handles(ErrType: Def, Variant: option<string>, Site: Span, Fn: Def) extern.
+.decl hit().
+hit() :-
+  constructs(_, _, _, _),
+  propagates(_, _, _),
+  converts(_, _, _, _),
+  handles(_, _, _, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    let err =
+        MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+            .expect_err("approximate error-flow capabilities should be disabled until RA-native");
+    let message = err.to_string();
+    assert!(message.contains("constructs"), "error={message}");
+    assert!(message.contains("propagates"), "error={message}");
+    assert!(message.contains("converts"), "error={message}");
+    assert!(message.contains("handles"), "error={message}");
+}
+
+#[test]
+fn stable_handle_capabilities_are_supported_on_the_daemon_runtime() {
+    let root = temp_workspace_root("stable_handles_supported");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.decl call_id(C: Call, H: string) extern.
+.mode call_id(-Call, -string).
+.decl impl_id(I: Impl, H: string) extern.
+.mode impl_id(-Impl, -string).
+.decl hit().
+hit() :- call_id(_, _), impl_id(_, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+        .expect("stable-handle capabilities should be supported in the daemon runtime");
 }

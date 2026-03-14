@@ -26,6 +26,7 @@ pub use raql_host::{
 pub use raql_ir::{ScalarValue, StableId};
 
 pub mod daemon {
+    pub use super::workspace_service::WarmupSnapshot;
     pub use super::workspace_service::WorkspaceService as DaemonWorkspace;
     pub use super::workspace_service::resolve_workspace_root;
 }

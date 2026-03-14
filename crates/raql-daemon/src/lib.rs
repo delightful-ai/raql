@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::{fs::OpenOptions, io::ErrorKind};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,10 +15,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use raql_compiler::{PlannedProgram, plan, required_extern_capabilities, resolve, typecheck};
 use raql_engine::{EvalResult, RuntimeValue};
 use raql_host::MissingCapabilitiesError;
-use raql_host_ra::daemon::{DaemonWorkspace, resolve_workspace_root};
+use raql_host_ra::daemon::{DaemonWorkspace, WarmupSnapshot, resolve_workspace_root};
 use raql_protocol::{
     DaemonEvent, DaemonRequest, DaemonState, ErrorEvent, PROTOCOL_VERSION, PlanSummary,
     ProtocolValue, RelationRows, RunNote, RunRequest, RunResult, SessionEvent,
+    WarmupPhaseEvent, WarmupStatusEvent,
 };
 use raql_syntax::parse_program_from_file;
 use thiserror::Error;
@@ -32,13 +34,153 @@ pub enum DaemonError {
     Json(#[from] serde_json::Error),
 }
 
-const DEFAULT_IDLE_TIMEOUT_MS: u64 = 600_000;
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 21_600_000;
 const IDLE_TIMEOUT_ENV: &str = "RAQL_DAEMON_IDLE_TIMEOUT_MS";
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 20_000;
 const CONNECT_TIMEOUT_ENV: &str = "RAQL_DAEMON_CONNECT_TIMEOUT_MS";
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 const REQUEST_TIMEOUT_ENV: &str = "RAQL_DAEMON_REQUEST_TIMEOUT_MS";
 const ACCEPT_POLL_INTERVAL_MS: u64 = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WarmupGeneration(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmupPhase {
+    Cold,
+    Running,
+    Warm,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WarmupStatus {
+    phase: WarmupPhase,
+    generation: WarmupGeneration,
+    error: Option<Arc<str>>,
+}
+
+type WarmupStateCell = Mutex<WarmupStatus>;
+
+trait WarmupExecutor: Send + Sync + 'static {
+    fn spawn(
+        &self,
+        analysis: WarmupSnapshot,
+        generation: WarmupGeneration,
+        state: Arc<WarmupStateCell>,
+    );
+}
+
+#[derive(Default)]
+struct ParallelPrimeWarmupExecutor;
+
+impl WarmupExecutor for ParallelPrimeWarmupExecutor {
+    fn spawn(
+        &self,
+        analysis: WarmupSnapshot,
+        generation: WarmupGeneration,
+        state: Arc<WarmupStateCell>,
+    ) {
+        let worker_threads = warmup_worker_threads();
+        thread::spawn(move || {
+            let result = analysis.parallel_prime_caches(worker_threads);
+            finish_warmup_generation(state, generation, result);
+        });
+    }
+}
+
+struct WarmupCoordinator {
+    state: Arc<WarmupStateCell>,
+    current_generation: WarmupGeneration,
+    executor: Arc<dyn WarmupExecutor>,
+}
+
+impl WarmupCoordinator {
+    fn new(executor: Arc<dyn WarmupExecutor>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(WarmupStatus {
+                phase: WarmupPhase::Cold,
+                generation: WarmupGeneration(0),
+                error: None,
+            })),
+            current_generation: WarmupGeneration(0),
+            executor,
+        }
+    }
+
+    fn start_initial(&mut self, analysis: WarmupSnapshot) {
+        self.start_next(analysis);
+    }
+
+    fn restart_after_reload(&mut self, analysis: WarmupSnapshot) {
+        self.start_next(analysis);
+    }
+
+    fn snapshot(&self) -> WarmupStatus {
+        self.state.lock().expect("lock warmup state").clone()
+    }
+
+    fn start_next(&mut self, analysis: WarmupSnapshot) {
+        let next_generation = WarmupGeneration(self.current_generation.0 + 1);
+        self.current_generation = next_generation;
+        {
+            let mut state = self.state.lock().expect("lock warmup state");
+            *state = WarmupStatus {
+                phase: WarmupPhase::Running,
+                generation: next_generation,
+                error: None,
+            };
+        }
+        self.executor
+            .spawn(analysis, next_generation, Arc::clone(&self.state));
+    }
+}
+
+fn finish_warmup_generation(
+    state: Arc<WarmupStateCell>,
+    generation: WarmupGeneration,
+    result: Result<(), String>,
+) {
+    let mut current = state.lock().expect("lock warmup state");
+    if current.generation != generation {
+        return;
+    }
+    match result {
+        Ok(()) => {
+            current.phase = WarmupPhase::Warm;
+            current.error = None;
+        }
+        Err(message) => {
+            current.phase = WarmupPhase::Failed;
+            current.error = Some(message.into());
+        }
+    }
+}
+
+fn warmup_worker_threads() -> usize {
+    std::env::var("RAQL_PRIME_CACHE_THREADS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|threads| threads.get().min(4))
+                .unwrap_or(1)
+        })
+}
+
+fn protocol_warmup_status(status: &WarmupStatus) -> WarmupStatusEvent {
+    WarmupStatusEvent {
+        phase: match status.phase {
+            WarmupPhase::Cold => WarmupPhaseEvent::Cold,
+            WarmupPhase::Running => WarmupPhaseEvent::Running,
+            WarmupPhase::Warm => WarmupPhaseEvent::Warm,
+            WarmupPhase::Failed => WarmupPhaseEvent::Failed,
+        },
+        generation: status.generation.0,
+        error: status.error.as_ref().map(|message| message.to_string()),
+    }
+}
 
 pub fn socket_path_for_workspace(workspace_root: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -74,15 +216,30 @@ fn spawn_or_connect_with_timeout(
         ))
     })?;
     let socket_path = socket_path_for_workspace(&workspace_root);
+    trace_daemon_debug(format!(
+        "client.resolve workspace_root={} socket={}",
+        workspace_root.display(),
+        socket_path.display()
+    ));
     if let Ok(stream) = UnixStream::connect(&socket_path) {
+        trace_daemon_debug(format!("client.connect_hit socket={}", socket_path.display()));
         return Ok(DaemonClient { stream });
     }
     let lock_path = spawn_lock_path_for_socket(&socket_path);
     let startup_log_path = startup_log_path_for_socket(&socket_path);
     if let Some(_lock) = try_acquire_spawn_lock(&lock_path)? {
         if let Ok(stream) = UnixStream::connect(&socket_path) {
+            trace_daemon_debug(format!(
+                "client.connect_hit_after_lock socket={}",
+                socket_path.display()
+            ));
             return Ok(DaemonClient { stream });
         }
+        trace_daemon_debug(format!(
+            "client.spawn socket={} workspace_root={}",
+            socket_path.display(),
+            workspace_root.display()
+        ));
         let stderr = OpenOptions::new()
             .create(true)
             .write(true)
@@ -112,6 +269,10 @@ fn spawn_or_connect_with_timeout(
         }
         return connected;
     }
+    trace_daemon_debug(format!(
+        "client.wait_existing socket={}",
+        socket_path.display()
+    ));
     wait_for_connect(
         &socket_path,
         Some(startup_log_path.as_path()),
@@ -307,16 +468,41 @@ fn serve_with_timeouts(
     idle_timeout: Duration,
     request_timeout: Duration,
 ) -> Result<(), DaemonError> {
-    let mut session = DaemonWorkspace::from_workspace_root(workspace_root)
-        .map_err(|err| DaemonError::Message(format!("failed to initialize rust-analyzer runtime from `{}`: {err}", workspace_root.display())))?;
+    serve_with_executor(
+        socket_path,
+        workspace_root,
+        idle_timeout,
+        request_timeout,
+        Arc::new(ParallelPrimeWarmupExecutor),
+    )
+}
+
+fn serve_with_executor(
+    socket_path: &Path,
+    workspace_root: &Path,
+    idle_timeout: Duration,
+    request_timeout: Duration,
+    warmup_executor: Arc<dyn WarmupExecutor>,
+) -> Result<(), DaemonError> {
     if socket_path.exists() {
+        let remove_started = Instant::now();
         let _ = std::fs::remove_file(socket_path);
+        trace_daemon_timing("raql_daemon.remove_stale_socket", remove_started.elapsed());
     }
+    let bind_started = Instant::now();
     let listener = UnixListener::bind(socket_path)?;
+    trace_daemon_timing("raql_daemon.bind_socket", bind_started.elapsed());
     listener.set_nonblocking(true)?;
     let _socket_guard = SocketGuard {
         path: socket_path.to_path_buf(),
     };
+    let session_started = Instant::now();
+    let mut session = DaemonWorkspace::from_workspace_root(workspace_root)
+        .map_err(|err| DaemonError::Message(format!("failed to initialize rust-analyzer runtime from `{}`: {err}", workspace_root.display())))?;
+    trace_daemon_timing("raql_daemon.session_init", session_started.elapsed());
+    let mut warmup = WarmupCoordinator::new(warmup_executor);
+    let mut plan_cache = PlanCache::default();
+    warmup.start_initial(session.analysis_snapshot());
     let poll_interval = Duration::from_millis(ACCEPT_POLL_INTERVAL_MS);
     let mut last_activity = Instant::now();
     let mut cold = true;
@@ -325,11 +511,25 @@ fn serve_with_timeouts(
             Ok((stream, _addr)) => {
                 stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(request_timeout))?;
-                let served_request = handle_connection(stream, &mut session, cold)?;
+                let cold_before = cold;
+                let served_request = handle_connection(
+                    stream,
+                    &mut session,
+                    &mut plan_cache,
+                    &mut warmup,
+                    cold,
+                )?;
                 if served_request {
                     cold = false;
                     last_activity = Instant::now();
                 }
+                trace_daemon_debug(format!(
+                    "server.accept served_request={} cold_before={} cold_after={} socket={}",
+                    served_request,
+                    cold_before,
+                    cold,
+                    socket_path.display()
+                ));
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 if last_activity.elapsed() >= idle_timeout {
@@ -341,6 +541,20 @@ fn serve_with_timeouts(
         }
     }
     Ok(())
+}
+
+fn trace_daemon_timing(label: &str, elapsed: Duration) {
+    if std::env::var_os("RAQL_TRACE_TIMINGS").is_none() {
+        return;
+    }
+    eprintln!("raql-timing {label} {}ms", elapsed.as_millis());
+}
+
+fn trace_daemon_debug(message: String) {
+    if std::env::var_os("RAQL_TRACE_TIMINGS").is_none() {
+        return;
+    }
+    eprintln!("raql-timing {message}");
 }
 
 struct SocketGuard {
@@ -356,11 +570,13 @@ impl Drop for SocketGuard {
 fn handle_connection(
     stream: UnixStream,
     session: &mut DaemonWorkspace,
+    plan_cache: &mut PlanCache,
+    warmup: &mut WarmupCoordinator,
     cold: bool,
 ) -> Result<bool, DaemonError> {
     let mut writer = BufWriter::new(stream.try_clone()?);
     let mut reader = BufReader::new(stream);
-    match handle_connection_impl(&mut reader, session, cold, &mut writer) {
+    match handle_connection_impl(&mut reader, session, plan_cache, warmup, cold, &mut writer) {
         Ok(served_request) => Ok(served_request),
         Err(err) => {
             let _ = emit_event(
@@ -378,6 +594,8 @@ fn handle_connection(
 fn handle_connection_impl(
     reader: &mut BufReader<UnixStream>,
     session: &mut DaemonWorkspace,
+    plan_cache: &mut PlanCache,
+    warmup: &mut WarmupCoordinator,
     cold: bool,
     writer: &mut BufWriter<UnixStream>,
 ) -> Result<bool, DaemonError> {
@@ -397,13 +615,15 @@ fn handle_connection_impl(
     }
     let request: DaemonRequest = serde_json::from_str(line.trim_end())?;
     match request {
-        DaemonRequest::Run(run) => handle_run(run, session, cold, writer)?,
+        DaemonRequest::Run(run) => handle_run(run, session, plan_cache, warmup, cold, writer)?,
     }
     Ok(true)
 }
 fn handle_run(
     run: RunRequest,
     session: &mut DaemonWorkspace,
+    plan_cache: &mut PlanCache,
+    warmup: &mut WarmupCoordinator,
     cold: bool,
     writer: &mut BufWriter<UnixStream>,
 ) -> Result<(), DaemonError> {
@@ -421,15 +641,19 @@ fn handle_run(
         return Ok(());
     }
 
-    session
-        .sync()
-        .map_err(|err| DaemonError::Message(err.to_string()))?;
+    let workspace_epoch_before = session.workspace_epoch();
+    session.sync().map_err(|err| DaemonError::Message(err.to_string()))?;
+    if session.workspace_epoch() != workspace_epoch_before {
+        warmup.restart_after_reload(session.analysis_snapshot());
+    }
+    let warmup_status = warmup.snapshot();
 
     emit_event(
         writer,
         &DaemonEvent::Session(SessionEvent {
             workspace_root: session.workspace_root().display().to_string(),
             daemon_state: if cold { DaemonState::Cold } else { DaemonState::Warm },
+            warmup_status: protocol_warmup_status(&warmup_status),
             workspace_epoch: session.workspace_epoch(),
             content_revision: session.content_revision(),
             supported_capabilities: session.supported_capabilities().into_iter().map(|cap| cap.as_str().to_string()).collect(),
@@ -442,7 +666,9 @@ fn handle_run(
         .map(|path| Utf8PathBuf::from(path.as_str()))
         .collect::<Vec<_>>();
     let program_path = Utf8PathBuf::from(run.program_path.as_str());
-    let planned = load_and_plan(&program_path, &include_dirs).map_err(DaemonError::Message)?;
+    let planned = plan_cache
+        .load_and_plan(&program_path, &include_dirs)
+        .map_err(DaemonError::Message)?;
     emit_event(writer, &DaemonEvent::Plan(plan_summary(&program_path, &planned)))?;
 
     let required = required_extern_capabilities(&planned)
@@ -470,12 +696,93 @@ fn emit_event(writer: &mut BufWriter<UnixStream>, event: &DaemonEvent) -> Result
     Ok(())
 }
 
-fn load_and_plan(program_path: &Utf8Path, include_dirs: &[Utf8PathBuf]) -> Result<PlannedProgram, String> {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanCacheKey {
+    program_path: Utf8PathBuf,
+    include_dirs: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceFingerprint {
+    path: Utf8PathBuf,
+    content_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PlanCacheEntry {
+    planned: PlannedProgram,
+    fingerprints: Vec<SourceFingerprint>,
+}
+
+#[derive(Debug, Default)]
+struct PlanCache {
+    entries: BTreeMap<PlanCacheKey, PlanCacheEntry>,
+}
+
+impl PlanCache {
+    fn load_and_plan(
+        &mut self,
+        program_path: &Utf8Path,
+        include_dirs: &[Utf8PathBuf],
+    ) -> Result<PlannedProgram, String> {
+        let key = PlanCacheKey {
+            program_path: program_path.to_path_buf(),
+            include_dirs: include_dirs.to_vec(),
+        };
+        if let Some(entry) = self.entries.get(&key)
+            && fingerprints_match(&entry.fingerprints)?
+        {
+            return Ok(entry.planned.clone());
+        }
+        let planned = load_and_plan_uncached(program_path, include_dirs)?;
+        let fingerprints = source_fingerprints(planned.source_map())?;
+        self.entries.insert(
+            key,
+            PlanCacheEntry {
+                planned: planned.clone(),
+                fingerprints,
+            },
+        );
+        Ok(planned)
+    }
+}
+
+fn load_and_plan_uncached(program_path: &Utf8Path, include_dirs: &[Utf8PathBuf]) -> Result<PlannedProgram, String> {
     let parsed = parse_program_from_file(program_path, include_dirs)
         .map_err(|diags| format!("parse failed for `{program_path}`: {diags:?}"))?;
     let resolved = resolve(parsed).map_err(|diags| format!("resolve failed: {diags:?}"))?;
     let typed = typecheck(resolved).map_err(|diags| format!("typecheck failed: {diags:?}"))?;
     plan(typed).map_err(|diags| format!("plan failed: {diags:?}"))
+}
+
+fn source_fingerprints(source_map: &raql_syntax::SourceMap) -> Result<Vec<SourceFingerprint>, String> {
+    let mut fingerprints = source_map
+        .files()
+        .iter()
+        .map(|file| SourceFingerprint {
+            path: file.path().clone(),
+            content_hash: hash_text(file.text()),
+        })
+        .collect::<Vec<_>>();
+    fingerprints.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(fingerprints)
+}
+
+fn fingerprints_match(fingerprints: &[SourceFingerprint]) -> Result<bool, String> {
+    for fingerprint in fingerprints {
+        let text = std::fs::read_to_string(fingerprint.path.as_std_path())
+            .map_err(|err| format!("failed to read `{}`: {err}", fingerprint.path))?;
+        if hash_text(&text) != fingerprint.content_hash {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn plan_summary(program_path: &Utf8Path, planned: &PlannedProgram) -> PlanSummary {
@@ -579,22 +886,38 @@ fn daemon_connect_timeout_from_raw(raw: Option<&str>) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use super::{
         DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS,
-        DaemonClient, PROTOCOL_VERSION, connection_failure_message,
+        DaemonClient, PROTOCOL_VERSION, ParallelPrimeWarmupExecutor, PlanCache, WarmupCoordinator,
+        WarmupExecutor, WarmupGeneration, WarmupPhase, connection_failure_message,
         daemon_connect_timeout_from_raw, handle_connection, idle_shutdown_timeout_from_raw,
-        request_read_timeout_from_raw, serve_with_timeouts, socket_path_for_workspace,
+        request_read_timeout_from_raw, serve_with_executor, serve_with_timeouts, socket_path_for_workspace,
         spawn_or_connect_with_timeout, startup_log_path_for_socket,
         try_acquire_spawn_lock_with_timeout,
     };
     use camino::Utf8PathBuf;
-    use raql_host_ra::daemon::DaemonWorkspace;
-    use raql_protocol::DaemonEvent;
+    use raql_host_ra::daemon::{DaemonWorkspace, WarmupSnapshot};
+    use raql_protocol::{DaemonEvent, WarmupPhaseEvent};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_query_root(label: &str) -> Utf8PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "raql_daemon_query_{label}_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        fs::create_dir_all(&root).expect("create query dir");
+        Utf8PathBuf::from_path_buf(root).expect("utf8 query root")
+    }
 
     fn temp_workspace_root(label: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now()
@@ -620,6 +943,43 @@ edition = "2021"
         .expect("write Cargo.toml");
         fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");
         root
+    }
+
+    #[derive(Default)]
+    struct DelayedWarmupExecutor {
+        delay_ms: u64,
+    }
+
+    impl WarmupExecutor for DelayedWarmupExecutor {
+        fn spawn(
+            &self,
+            analysis: WarmupSnapshot,
+            generation: WarmupGeneration,
+            state: Arc<Mutex<super::WarmupStatus>>,
+        ) {
+            let delay = self.delay_ms;
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_millis(delay));
+                let result = analysis.parallel_prime_caches(1);
+                super::finish_warmup_generation(state, generation, result);
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct ManualWarmupExecutor {
+        spawned: Arc<Mutex<Vec<(Arc<Mutex<super::WarmupStatus>>, WarmupGeneration)>>>,
+    }
+
+    impl WarmupExecutor for ManualWarmupExecutor {
+        fn spawn(
+            &self,
+            _analysis: WarmupSnapshot,
+            generation: WarmupGeneration,
+            state: Arc<Mutex<super::WarmupStatus>>,
+        ) {
+            self.spawned.lock().expect("lock spawned").push((state, generation));
+        }
     }
 
     #[test]
@@ -673,13 +1033,108 @@ edition = "2021"
     fn connect_and_close_before_request_does_not_count_as_served_activity() {
         let root = temp_workspace_root("no_request");
         let mut session = DaemonWorkspace::from_workspace_root(root.as_path()).expect("session");
+        let mut plan_cache = PlanCache::default();
+        let mut warmup = WarmupCoordinator::new(Arc::new(ParallelPrimeWarmupExecutor));
         let (server, client) = UnixStream::pair().expect("stream pair");
         drop(client);
 
-        let served = handle_connection(server, &mut session, true).expect("handle connection");
+        let served = handle_connection(
+            server,
+            &mut session,
+            &mut plan_cache,
+            &mut warmup,
+            true,
+        )
+        .expect("handle connection");
         assert!(
             !served,
             "connect-and-close without a request should not advance warm or idle accounting"
+        );
+    }
+
+    #[test]
+    fn warmup_coordinator_ignores_stale_completion() {
+        let root = temp_workspace_root("warmup_generation");
+        let session = DaemonWorkspace::from_workspace_root(root.as_path()).expect("session");
+        let executor = Arc::new(ManualWarmupExecutor::default());
+        let mut coordinator = WarmupCoordinator::new(executor.clone());
+
+        coordinator.start_initial(session.analysis_snapshot());
+        assert_eq!(coordinator.snapshot().phase, WarmupPhase::Running);
+        let first_generation = coordinator.snapshot().generation;
+
+        coordinator.restart_after_reload(session.analysis_snapshot());
+        let second = coordinator.snapshot();
+        assert_eq!(second.phase, WarmupPhase::Running);
+        assert_ne!(second.generation, first_generation);
+
+        let spawned = executor.spawned.lock().expect("lock spawned");
+        let (first_state, first_generation) = spawned[0].clone();
+        let (second_state, second_generation) = spawned[1].clone();
+        drop(spawned);
+
+        super::finish_warmup_generation(first_state, first_generation, Ok(()));
+        let after_stale = coordinator.snapshot();
+        assert_eq!(after_stale.phase, WarmupPhase::Running);
+        assert_eq!(after_stale.generation, second_generation);
+
+        super::finish_warmup_generation(second_state, second_generation, Ok(()));
+        let warmed = coordinator.snapshot();
+        assert_eq!(warmed.phase, WarmupPhase::Warm);
+        assert_eq!(warmed.generation, second_generation);
+    }
+
+    #[test]
+    fn plan_cache_reuses_planned_program_when_query_sources_are_unchanged() {
+        let query_root = temp_query_root("plan_cache_hit");
+        let helper = query_root.join("helper.raql");
+        let entry = query_root.join("entry.raql");
+        fs::write(&helper, ".decl helper().\nhelper().\n").expect("write helper");
+        fs::write(&entry, ".include \"helper.raql\".\n.decl hit().\nhit() :- helper().\n")
+            .expect("write entry");
+
+        let mut cache = PlanCache::default();
+        let first = cache
+            .load_and_plan(entry.as_path(), &[])
+            .expect("first load_and_plan");
+        let second = cache
+            .load_and_plan(entry.as_path(), &[])
+            .expect("second load_and_plan");
+
+        assert_eq!(
+            first.planned_rules().len(),
+            second.planned_rules().len(),
+            "cached plan should match the original planned program"
+        );
+        assert_eq!(cache.entries.len(), 1, "query should occupy one cache entry");
+    }
+
+    #[test]
+    fn plan_cache_invalidates_when_included_query_file_changes() {
+        let query_root = temp_query_root("plan_cache_invalidation");
+        let helper = query_root.join("helper.raql");
+        let entry = query_root.join("entry.raql");
+        fs::write(&helper, ".decl helper().\nhelper().\n").expect("write helper");
+        fs::write(&entry, ".include \"helper.raql\".\n.decl hit().\nhit() :- helper().\n")
+            .expect("write entry");
+
+        let mut cache = PlanCache::default();
+        let first = cache
+            .load_and_plan(entry.as_path(), &[])
+            .expect("first load_and_plan");
+        fs::write(
+            &helper,
+            ".decl helper().\n.decl extra().\nhelper().\nextra().\n",
+        )
+        .expect("rewrite helper");
+        let second = cache
+            .load_and_plan(entry.as_path(), &[])
+            .expect("second load_and_plan");
+
+        assert_ne!(
+            first.facts().len(),
+            second.facts().len(),
+            "included-file edits should invalidate the cached plan"
         );
     }
 
@@ -766,6 +1221,142 @@ edition = "2021"
         );
 
         drop(blocker);
+        let server_result = server.join().expect("join server");
+        assert!(server_result.is_ok(), "server should exit cleanly; result={server_result:?}");
+    }
+
+    #[test]
+    fn serve_marks_followup_requests_warm() {
+        let root = temp_workspace_root("warm_reuse");
+        let query = root.join("query.raql");
+        fs::write(&query, ".decl ping() output.\nping().\n").expect("write query");
+        let socket = std::env::temp_dir().join(format!(
+            "raql-daemon-warm-reuse-{}_{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let server_root = root.clone();
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                server_socket.as_path(),
+                server_root.as_path(),
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(5_000),
+            )
+        });
+
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(socket.exists(), "daemon socket should appear");
+
+        let mut first = DaemonClient {
+            stream: UnixStream::connect(&socket).expect("connect first client"),
+        };
+        let first_events = first
+            .run(
+                &Utf8PathBuf::from_path_buf(query.clone()).expect("utf8 query"),
+                &[],
+            )
+            .expect("run first query");
+        assert!(
+            first_events.iter().any(|event| matches!(
+                event,
+                DaemonEvent::Session(session)
+                    if matches!(session.daemon_state, raql_protocol::DaemonState::Cold)
+            )),
+            "expected first request to report cold daemon state; events={first_events:?}"
+        );
+
+        let mut second = DaemonClient {
+            stream: UnixStream::connect(&socket).expect("connect second client"),
+        };
+        let second_events = second
+            .run(
+                &Utf8PathBuf::from_path_buf(query.clone()).expect("utf8 query"),
+                &[],
+            )
+            .expect("run second query");
+        assert!(
+            second_events.iter().any(|event| matches!(
+                event,
+                DaemonEvent::Session(session)
+                    if matches!(session.daemon_state, raql_protocol::DaemonState::Warm)
+            )),
+            "expected follow-up request to report warm daemon state; events={second_events:?}"
+        );
+
+        thread::sleep(std::time::Duration::from_millis(350));
+        let server_result = server.join().expect("join server");
+        assert!(server_result.is_ok(), "server should exit cleanly; result={server_result:?}");
+    }
+
+    #[test]
+    fn serve_reports_running_warmup_while_still_serving_requests() {
+        let root = temp_workspace_root("warmup_running");
+        let query = root.join("query.raql");
+        fs::write(&query, ".decl ping() output.\nping().\n").expect("write query");
+        let socket = std::env::temp_dir().join(format!(
+            "raql-warmup-{}_{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let server_root = root.clone();
+        let server_socket = socket.clone();
+        let executor = Arc::new(DelayedWarmupExecutor { delay_ms: 200 });
+        let server = thread::spawn(move || {
+            serve_with_executor(
+                server_socket.as_path(),
+                server_root.as_path(),
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(5_000),
+                executor,
+            )
+        });
+
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(socket.exists(), "daemon socket should appear");
+
+        let mut client = DaemonClient {
+            stream: UnixStream::connect(&socket).expect("connect client"),
+        };
+        let events = client
+            .run(
+                &Utf8PathBuf::from_path_buf(query.clone()).expect("utf8 query"),
+                &[],
+            )
+            .expect("run query");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                DaemonEvent::Session(session)
+                    if matches!(session.warmup_status.phase, WarmupPhaseEvent::Running)
+            )),
+            "expected session to report running warmup; events={events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, DaemonEvent::Result(_))),
+            "expected daemon to serve request while warmup is running; events={events:?}"
+        );
+
+        thread::sleep(std::time::Duration::from_millis(350));
         let server_result = server.join().expect("join server");
         assert!(server_result.is_ok(), "server should exit cleanly; result={server_result:?}");
     }

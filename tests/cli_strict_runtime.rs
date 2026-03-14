@@ -12,6 +12,16 @@ fn temp_dir(label: &str) -> std::path::PathBuf {
     path
 }
 
+fn raql_bin() -> std::path::PathBuf {
+    let cargo_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_raql"));
+    cargo_bin
+        .parent()
+        .and_then(|dir| dir.parent())
+        .map(|dir| dir.join("raql"))
+        .filter(|path| path.is_file())
+        .unwrap_or(cargo_bin)
+}
+
 fn write_workspace(root: &std::path::Path) {
     fs::create_dir_all(root.join("src")).expect("create src");
     fs::write(
@@ -42,7 +52,7 @@ ping().
     let not_a_workspace = work.join("not_a_workspace");
     fs::create_dir_all(&not_a_workspace).expect("create non-workspace dir");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+    let output = Command::new(raql_bin())
         .args([
             "lang",
             "run",
@@ -76,7 +86,7 @@ fn lang_run_surfaces_daemon_side_query_failures() {
     let program = work.join("bad_query.raql");
     fs::write(&program, ".decl broken(\n").expect("write broken query");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+    let output = Command::new(raql_bin())
         .args([
             "lang",
             "run",
@@ -111,15 +121,14 @@ fn lang_run_surfaces_unsupported_capability_failures() {
     fs::write(
         &program,
         r#"
-.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
-.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl unsupported_predicate(D: Def) extern.
 .decl hit().
-hit() :- call_edge(_, _, _, _).
+hit() :- unsupported_predicate(_).
 "#,
     )
     .expect("write unsupported query");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+    let output = Command::new(raql_bin())
         .args([
             "lang",
             "run",
@@ -139,7 +148,7 @@ hit() :- call_edge(_, _, _, _).
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("call_edge"),
+        stderr.contains("unsupported_predicate"),
         "stderr should name the unsupported capability; stderr={stderr}"
     );
     assert!(
@@ -161,7 +170,7 @@ ping().
     )
     .expect("write query");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+    let output = Command::new(raql_bin())
         .args(["dev", "run-direct", query.to_str().expect("utf8 query path")])
         .output()
         .expect("run raql binary");
@@ -197,7 +206,7 @@ ping().
     )
     .expect("write query");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+    let output = Command::new(raql_bin())
         .args(["lang", "run", query.to_str().expect("utf8 query path")])
         .output()
         .expect("run raql binary");
