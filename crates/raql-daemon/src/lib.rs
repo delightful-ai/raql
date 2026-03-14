@@ -199,14 +199,40 @@ impl Drop for SpawnLock {
 }
 
 fn try_acquire_spawn_lock(path: &Path) -> Result<Option<SpawnLock>, DaemonError> {
+    try_acquire_spawn_lock_with_timeout(path, daemon_connect_timeout())
+}
+
+fn try_acquire_spawn_lock_with_timeout(
+    path: &Path,
+    stale_after: Duration,
+) -> Result<Option<SpawnLock>, DaemonError> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(file) => Ok(Some(SpawnLock {
             path: path.to_path_buf(),
             _file: file,
         })),
-        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(None),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            if spawn_lock_is_stale(path, stale_after)? {
+                let _ = std::fs::remove_file(path);
+                match OpenOptions::new().write(true).create_new(true).open(path) {
+                    Ok(file) => Ok(Some(SpawnLock {
+                        path: path.to_path_buf(),
+                        _file: file,
+                    })),
+                    Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(None),
+                    Err(err) => Err(err.into()),
+                }
+            } else {
+                Ok(None)
+            }
+        }
         Err(err) => Err(err.into()),
     }
+}
+
+fn spawn_lock_is_stale(path: &Path, stale_after: Duration) -> Result<bool, DaemonError> {
+    let modified = std::fs::metadata(path)?.modified()?;
+    Ok(modified.elapsed().unwrap_or(Duration::ZERO) >= stale_after)
 }
 
 pub struct DaemonClient {
@@ -558,6 +584,7 @@ mod tests {
         daemon_connect_timeout_from_raw, handle_connection, idle_shutdown_timeout_from_raw,
         request_read_timeout_from_raw, serve_with_timeouts, socket_path_for_workspace,
         spawn_or_connect_with_timeout, startup_log_path_for_socket,
+        try_acquire_spawn_lock_with_timeout,
     };
     use camino::Utf8PathBuf;
     use raql_host_ra::daemon::DaemonWorkspace;
@@ -785,5 +812,26 @@ edition = "2021"
             !marker.exists(),
             "timed-out spawn should be killed before it can outlive the spawn lock"
         );
+    }
+
+    #[test]
+    fn stale_spawn_lock_is_recovered_after_timeout() {
+        let lock_path = std::env::temp_dir().join(format!(
+            "raql-daemon-stale-lock-{}_{}.lock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::write(&lock_path, "stale").expect("write stale lock");
+        thread::sleep(std::time::Duration::from_millis(75));
+
+        let lock = try_acquire_spawn_lock_with_timeout(
+            lock_path.as_path(),
+            std::time::Duration::from_millis(50),
+        )
+        .expect("acquire stale lock");
+        assert!(lock.is_some(), "stale spawn lock should be recovered");
     }
 }
