@@ -270,18 +270,37 @@ edition = "2021"
 
     let mut service = WorkspaceService::from_manifest_path(member_a.join("Cargo.toml").as_std_path())
         .expect("service from member manifest");
+    let canonical_root = fs::canonicalize(root.as_std_path()).expect("canonical workspace root");
+    assert_eq!(
+        raql_host_ra::daemon::resolve_workspace_root(member_a.join("Cargo.toml").as_std_path())
+            .expect("resolved workspace root"),
+        canonical_root,
+    );
+    assert_eq!(service.workspace_root(), canonical_root.as_path());
     let planned = plan_query(
         r#"
 .decl def(D: Def) extern.
 .func def_name(D: Def, Name: string) extern.
+.func def_span(D: Def, S: Span) extern.
+.func span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
 .decl contains(Haystack: string, Needle: string) extern.
 .decl hit(Name: string).
+.decl beta_span(RelPath: string).
 hit(Name) :- def(D), def_name(D, Name), contains(Name, "beta").
+beta_span(RelPath) :-
+  def(D),
+  def_name(D, Name),
+  contains(Name, "beta"),
+  def_span(D, S),
+  span_key(S, RelPath, _L0, _C0, _L1, _C1).
 "#,
     );
     let result = service.run_planned(&planned).expect("run query");
     assert!(result.relations.get("hit").is_some_and(|rows| {
         rows.contains(&vec![RuntimeValue::String("beta".to_string())])
+    }));
+    assert!(result.relations.get("beta_span").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("member_b/src/lib.rs".to_string())])
     }));
 }
 

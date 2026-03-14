@@ -223,7 +223,7 @@ pub fn resolve_workspace_root(input: &Path) -> Result<PathBuf, RaHostInitError> 
             details: err.to_string(),
         })?
     };
-    Ok(PathBuf::from(manifest.manifest_path().parent().to_string()))
+    workspace_loader::true_workspace_root(Path::new(&manifest.manifest_path().to_string()))
 }
 
 #[derive(Debug)]
