@@ -630,6 +630,7 @@ fn is_external_dependency_path(path: &Path) -> bool {
         || has_component_sequence(path, &[".cargo", "registry"])
         || has_component_sequence(path, &[".cargo", "git", "checkouts"])
         || has_component_sequence(path, &[".rustup", "toolchains"])
+        || has_registry_source_layout(path)
 }
 
 fn cargo_home_dir() -> PathBuf {
@@ -657,4 +658,17 @@ fn has_component_sequence(path: &Path, sequence: &[&str]) -> bool {
     components
         .windows(sequence.len())
         .any(|window| window == sequence)
+}
+
+fn has_registry_source_layout(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    components
+        .windows(4)
+        .any(|window| window[0] == "registry" && window[1] == "src")
 }

@@ -286,6 +286,202 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "beta").
 }
 
 #[test]
+fn workspace_service_from_workspace_root_sees_all_workspace_members() {
+    let root = temp_workspace_root("workspace_root_scope");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[workspace]
+members = ["corelib", "app"]
+resolver = "2"
+"#,
+    )
+    .expect("write workspace Cargo.toml");
+
+    let core_dir = root.join("corelib");
+    let app_dir = root.join("app");
+    fs::create_dir_all(core_dir.join("src")).expect("create corelib src");
+    fs::create_dir_all(app_dir.join("src")).expect("create app src");
+    fs::write(
+        core_dir.join("Cargo.toml"),
+        r#"[package]
+name = "corelib"
+version = "0.0.0"
+edition = "2021"
+"#,
+    )
+    .expect("write corelib Cargo.toml");
+    fs::write(core_dir.join("src/lib.rs"), "pub fn helper() {}\n").expect("write corelib lib.rs");
+    fs::write(
+        app_dir.join("Cargo.toml"),
+        r#"[package]
+name = "app"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+corelib = { path = "../corelib" }
+"#,
+    )
+    .expect("write app Cargo.toml");
+    fs::write(
+        app_dir.join("src/lib.rs"),
+        r#"
+pub fn caller() {
+    corelib::helper();
+}
+"#,
+    )
+    .expect("write app lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl visible(Name: string).
+visible(Name) :- def(D), def_name(D, Name).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(result.relations.get("visible").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("caller".to_string())])
+            && rows.contains(&vec![RuntimeValue::String("helper".to_string())])
+    }));
+}
+
+#[test]
+fn workspace_service_includes_path_dependency_defs() {
+    let dep_root = temp_workspace_root("path_dep_source");
+    fs::write(
+        dep_root.join("Cargo.toml"),
+        r#"[package]
+name = "path_dep_source"
+version = "0.0.0"
+edition = "2021"
+"#,
+    )
+    .expect("write dep Cargo.toml");
+    fs::write(
+        dep_root.join("src/lib.rs"),
+        r#"
+pub fn helper() {
+    deep();
+}
+
+fn deep() {}
+"#,
+    )
+    .expect("write dep lib.rs");
+
+    let root = temp_workspace_root("path_dep_app");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "path_dep_app"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+path_dep_source = {{ path = "{}" }}
+"#,
+            dep_root.as_std_path().display()
+        ),
+    )
+    .expect("write app Cargo.toml");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn caller() {
+    path_dep_source::helper();
+}
+"#,
+    )
+    .expect("write app lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl visible(Name: string).
+visible(Name) :- def(D), def_name(D, Name).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    let observed = result.relations.get("visible").cloned().unwrap_or_default();
+    assert!(
+        observed.contains(&vec![RuntimeValue::String("caller".to_string())])
+            && observed.contains(&vec![RuntimeValue::String("helper".to_string())])
+            && observed.contains(&vec![RuntimeValue::String("deep".to_string())]),
+        "expected caller/helper/deep in path-dependency scope; observed={observed:?}"
+    );
+}
+
+#[test]
+fn workspace_service_excludes_registry_like_dependency_defs() {
+    let dep_root = temp_workspace_root("registry_like_dep")
+        .join("registry")
+        .join("src")
+        .join("fake-index")
+        .join("registry_like_dep");
+    fs::create_dir_all(dep_root.join("src")).expect("create dep src");
+    fs::write(
+        dep_root.join("Cargo.toml"),
+        r#"[package]
+name = "registry_like_dep"
+version = "0.0.0"
+edition = "2021"
+"#,
+    )
+    .expect("write dep Cargo.toml");
+    fs::write(dep_root.join("src/lib.rs"), "pub fn helper() {}\n").expect("write dep lib.rs");
+
+    let root = temp_workspace_root("registry_like_dep_app");
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "registry_like_dep_app"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+registry_like_dep = {{ path = "{}" }}
+"#,
+            dep_root.as_std_path().display()
+        ),
+    )
+    .expect("write app Cargo.toml");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn caller() {
+    registry_like_dep::helper();
+}
+"#,
+    )
+    .expect("write app lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl visible(Name: string).
+visible(Name) :- def(D), def_name(D, Name).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    let observed = result.relations.get("visible").cloned().unwrap_or_default();
+    assert!(
+        observed.contains(&vec![RuntimeValue::String("caller".to_string())])
+            && !observed.contains(&vec![RuntimeValue::String("helper".to_string())]),
+        "expected registry-like dep helper to stay hidden; observed={observed:?}"
+    );
+}
+
+#[test]
 fn workspace_service_surfaces_generated_build_symbols() {
     let root = temp_workspace_root("generated_symbols");
     fs::write(
