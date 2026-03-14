@@ -134,3 +134,60 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "beta").
         rows.contains(&vec![RuntimeValue::String("beta".to_string())])
     }));
 }
+
+#[test]
+fn workspace_service_exposes_world_stamp_on_supported_runs() {
+    let root = temp_workspace_root("world_stamp_smoke");
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.func world_stamp(Stamp: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl stamp(Stamp: string).
+stamp(Stamp) :- world_stamp(Stamp), contains(Stamp, "ra-workspace:").
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(result.relations.get("stamp").is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row.first().is_some_and(|value| match value {
+                RuntimeValue::String(text) => text.starts_with("ra-workspace:"),
+                _ => false,
+            })
+        })
+    }));
+}
+
+#[test]
+fn workspace_service_reports_supported_def_paths() {
+    let root = temp_workspace_root("def_path_smoke");
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.func def_path(D: Def, Path: string) extern.
+.decl hit(Path: string).
+hit(Path) :- def(D), def_name(D, "alpha"), def_path(D, Path).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    let observed = result
+        .relations
+        .get("hit")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        observed.iter().any(|row| {
+            row.first().is_some_and(|value| match value {
+                RuntimeValue::String(path) => path.ends_with("alpha"),
+                _ => false,
+            })
+        }),
+        "expected a supported def_path row for alpha; observed={observed:?}"
+    );
+}
