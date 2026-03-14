@@ -34,6 +34,8 @@ pub enum DaemonError {
 
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 600_000;
 const IDLE_TIMEOUT_ENV: &str = "RAQL_DAEMON_IDLE_TIMEOUT_MS";
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 20_000;
+const CONNECT_TIMEOUT_ENV: &str = "RAQL_DAEMON_CONNECT_TIMEOUT_MS";
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 const REQUEST_TIMEOUT_ENV: &str = "RAQL_DAEMON_REQUEST_TIMEOUT_MS";
 const ACCEPT_POLL_INTERVAL_MS: u64 = 50;
@@ -57,6 +59,14 @@ fn startup_log_path_for_socket(socket_path: &Path) -> PathBuf {
 }
 
 pub fn spawn_or_connect(current_exe: &Path, rust_input: &Path) -> Result<DaemonClient, DaemonError> {
+    spawn_or_connect_with_timeout(current_exe, rust_input, daemon_connect_timeout())
+}
+
+fn spawn_or_connect_with_timeout(
+    current_exe: &Path,
+    rust_input: &Path,
+    connect_timeout: Duration,
+) -> Result<DaemonClient, DaemonError> {
     let workspace_root = resolve_workspace_root(rust_input).map_err(|err| {
         DaemonError::Message(format!(
             "failed to initialize rust-analyzer runtime from `{}`: {err}",
@@ -92,21 +102,32 @@ pub fn spawn_or_connect(current_exe: &Path, rust_input: &Path) -> Result<DaemonC
             &socket_path,
             Some(startup_log_path.as_path()),
             Some(&mut child),
+            connect_timeout,
         );
+        if connected.is_err() {
+            cleanup_failed_spawn(&mut child)?;
+        }
         if connected.is_ok() {
             let _ = std::fs::remove_file(&startup_log_path);
         }
         return connected;
     }
-    wait_for_connect(&socket_path, Some(startup_log_path.as_path()), None)
+    wait_for_connect(
+        &socket_path,
+        Some(startup_log_path.as_path()),
+        None,
+        connect_timeout,
+    )
 }
 
 fn wait_for_connect(
     socket_path: &Path,
     startup_log_path: Option<&Path>,
     mut child: Option<&mut Child>,
+    connect_timeout: Duration,
 ) -> Result<DaemonClient, DaemonError> {
-    for _ in 0..200 {
+    let start = Instant::now();
+    while start.elapsed() < connect_timeout {
         if let Some(child) = child.as_mut()
             && let Some(status) = child.try_wait()?
         {
@@ -126,6 +147,15 @@ fn wait_for_connect(
         startup_log_path,
         None,
     )))
+}
+
+fn cleanup_failed_spawn(child: &mut Child) -> Result<(), DaemonError> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
 }
 
 fn connection_failure_message(
@@ -508,18 +538,32 @@ fn request_read_timeout_from_raw(raw: Option<&str>) -> Duration {
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS))
 }
 
+fn daemon_connect_timeout() -> Duration {
+    let configured = std::env::var(CONNECT_TIMEOUT_ENV).ok();
+    daemon_connect_timeout_from_raw(configured.as_deref())
+}
+
+fn daemon_connect_timeout_from_raw(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, DaemonClient, PROTOCOL_VERSION,
-        connection_failure_message, handle_connection, idle_shutdown_timeout_from_raw,
+        DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS,
+        DaemonClient, PROTOCOL_VERSION, connection_failure_message,
+        daemon_connect_timeout_from_raw, handle_connection, idle_shutdown_timeout_from_raw,
         request_read_timeout_from_raw, serve_with_timeouts, socket_path_for_workspace,
-        startup_log_path_for_socket,
+        spawn_or_connect_with_timeout, startup_log_path_for_socket,
     };
     use camino::Utf8PathBuf;
     use raql_host_ra::daemon::DaemonWorkspace;
     use raql_protocol::DaemonEvent;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -628,6 +672,22 @@ edition = "2021"
     }
 
     #[test]
+    fn daemon_connect_timeout_uses_default_and_rejects_zero() {
+        assert_eq!(
+            daemon_connect_timeout_from_raw(None),
+            std::time::Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            daemon_connect_timeout_from_raw(Some("0")),
+            std::time::Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            daemon_connect_timeout_from_raw(Some("200")),
+            std::time::Duration::from_millis(200)
+        );
+    }
+
+    #[test]
     fn half_open_client_times_out_without_blocking_next_request() {
         let root = temp_workspace_root("half_open_timeout");
         let query = root.join("query.raql");
@@ -680,5 +740,50 @@ edition = "2021"
         drop(blocker);
         let server_result = server.join().expect("join server");
         assert!(server_result.is_ok(), "server should exit cleanly; result={server_result:?}");
+    }
+
+    #[test]
+    fn timed_out_spawn_is_killed_before_lock_release() {
+        let root = temp_workspace_root("timed_out_spawn");
+        let script_dir = std::env::temp_dir().join(format!(
+            "raql-daemon-timeout-script-{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&script_dir).expect("create script dir");
+        let marker = script_dir.join("marker.txt");
+        let script = script_dir.join("fake-daemon.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 1\necho timed-out > '{}'\n",
+                marker.display()
+            ),
+        )
+        .expect("write fake daemon script");
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod script");
+
+        let err = spawn_or_connect_with_timeout(
+            script.as_path(),
+            root.as_path(),
+            std::time::Duration::from_millis(100),
+        )
+        .err()
+        .expect("fake daemon should time out");
+        assert!(
+            err.to_string().contains("failed to connect"),
+            "expected connection timeout error; err={err}"
+        );
+
+        thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(
+            !marker.exists(),
+            "timed-out spawn should be killed before it can outlive the spawn lock"
+        );
     }
 }
