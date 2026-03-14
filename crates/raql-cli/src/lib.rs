@@ -8,9 +8,6 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
 use raql_compiler::{PlannedProgram, plan, resolve, typecheck};
 use raql_daemon::{spawn_or_connect, serve};
-use raql_engine::{EvalResult, HostValueKind, RuntimeValue, execute};
-use raql_host::MockHostRuntime;
-use raql_host_ra::legacy::LegacyRaHostRuntime;
 use raql_protocol::{DaemonEvent, DaemonState, PlanSummary, ProtocolValue, RelationRows};
 use raql_syntax::parse_program_from_file;
 
@@ -26,8 +23,6 @@ struct Cli {
 enum TopLevelCommand {
     #[command(subcommand)]
     Lang(LangCommand),
-    #[command(subcommand)]
-    Dev(DevCommand),
     #[command(name = "__daemon-serve", hide = true)]
     DaemonServe(DaemonServeArgs),
 }
@@ -36,15 +31,6 @@ enum TopLevelCommand {
 enum LangCommand {
     Check(LangCheckArgs),
     Run(LangRunArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum DevCommand {
-    // TODO(ra-daemon-cutover): remove this once all remaining direct-runtime
-    // debugging and legacy backend coverage has migrated to daemon-backed or
-    // explicit internal host-ra test helpers.
-    #[command(name = "run-direct")]
-    RunDirect(LangRunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -96,7 +82,6 @@ pub fn main_entry() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         TopLevelCommand::Lang(cmd) => run_lang(cmd),
-        TopLevelCommand::Dev(cmd) => run_dev(cmd),
         TopLevelCommand::DaemonServe(args) => {
             serve(&args.socket, &args.workspace_root).map_err(|err| err.to_string())
         }
@@ -110,12 +95,6 @@ fn run_lang(cmd: LangCommand) -> Result<(), String> {
     }
 }
 
-fn run_dev(cmd: DevCommand) -> Result<(), String> {
-    match cmd {
-        DevCommand::RunDirect(args) => run_direct(args),
-    }
-}
-
 fn run_lang_check(args: LangCheckArgs) -> Result<(), String> {
     let (program_path, include_dirs) = decode_common_args(&args.common)?;
     let planned = load_and_plan(&program_path, &include_dirs)?;
@@ -125,43 +104,13 @@ fn run_lang_check(args: LangCheckArgs) -> Result<(), String> {
 
 fn run_lang_run(args: LangRunArgs) -> Result<(), String> {
     let rust_file = args.rust_file.clone().ok_or_else(|| {
-        "supported `raql lang run` requires `--rust-file`; use `raql dev run-direct` for the quarantined direct runtime path".to_string()
+        "supported `raql lang run` requires `--rust-file`".to_string()
     })?;
     let (program_path, include_dirs) = decode_common_args(&args.common)?;
     let current_exe = std::env::current_exe().map_err(|err| format!("failed to locate current executable: {err}"))?;
     let mut client = spawn_or_connect(&current_exe, &rust_file).map_err(|err| err.to_string())?;
     let events = client.run(&program_path, &include_dirs).map_err(|err| err.to_string())?;
     render_events(&events, &args.relation_filters, args.show_empty, args.max_rows)
-}
-
-fn run_direct(args: LangRunArgs) -> Result<(), String> {
-    // TODO(ra-daemon-cutover): delete this eager direct-runtime CLI path after
-    // the legacy host-ra tests and bring-up workflows stop depending on it.
-    let (program_path, include_dirs) = decode_common_args(&args.common)?;
-    let planned = load_and_plan(&program_path, &include_dirs)?;
-    print_plan_summary(&plan_summary_from_planned(&program_path, &planned));
-
-    let result = if let Some(rust_file) = args.rust_file {
-        let runtime_path = into_utf8_pathbuf(rust_file, "--rust-file")?;
-        let mut runtime = if runtime_path.file_name() == Some("Cargo.toml") {
-            LegacyRaHostRuntime::from_manifest_path_no_deps(runtime_path.as_std_path())
-        } else {
-            LegacyRaHostRuntime::from_workspace_root_no_deps(runtime_path.as_std_path())
-        }
-        .map_err(|err| {
-            format!(
-                "failed to initialize rust-analyzer runtime from `{}`: {err}",
-                runtime_path
-            )
-        })?;
-        execute(&planned, &mut runtime)
-    } else {
-        let mut runtime = MockHostRuntime::new();
-        execute(&planned, &mut runtime)
-    };
-
-    print_eval_result(&result, &args.relation_filters, args.show_empty, args.max_rows);
-    Ok(())
 }
 
 fn render_events(
@@ -309,51 +258,6 @@ fn print_protocol_result(
     }
 }
 
-fn print_eval_result(
-    result: &EvalResult,
-    relation_filters: &[String],
-    show_empty: bool,
-    max_rows: usize,
-) {
-    let status = match result.status {
-        raql_engine::EvalStatus::Ok => "ok",
-        raql_engine::EvalStatus::Partial => "partial",
-    };
-    println!("status: {status}");
-    println!("iterations: {}", result.iterations);
-    if !result.notes.is_empty() {
-        println!("notes:");
-        for note in &result.notes {
-            println!("- [{}] {}", note.section, note.message);
-        }
-    }
-    println!("relations:");
-    for (name, rows) in &result.relations {
-        if !relation_filters.is_empty() && !relation_filters.iter().any(|filter| filter == name) {
-            continue;
-        }
-        if !show_empty && rows.is_empty() {
-            continue;
-        }
-        println!("{name}: {}", rows.len());
-        let row_limit = max_rows.max(1);
-        let mut shown = 0usize;
-        for row in rows {
-            if shown >= row_limit {
-                break;
-            }
-            println!("  {}({}).", name, format_row_values(row));
-            shown += 1;
-        }
-        if rows.len() > shown {
-            println!(
-                "  ... omitted {} row(s); use --max-rows to expand.",
-                rows.len() - shown
-            );
-        }
-    }
-}
-
 fn format_protocol_row_values(row: &[ProtocolValue]) -> String {
     row.iter().map(format_protocol_value).collect::<Vec<_>>().join(", ")
 }
@@ -371,37 +275,5 @@ fn format_protocol_value(value: &ProtocolValue) -> String {
             let inner = items.iter().map(format_protocol_value).collect::<Vec<_>>().join(", ");
             format!("[{inner}]")
         }
-    }
-}
-
-fn format_row_values(row: &[RuntimeValue]) -> String {
-    row.iter().map(format_value).collect::<Vec<_>>().join(", ")
-}
-
-fn format_value(value: &RuntimeValue) -> String {
-    match value {
-        RuntimeValue::Int(v) => v.to_string(),
-        RuntimeValue::String(v) => format!("{v:?}"),
-        RuntimeValue::Bool(v) => v.to_string(),
-        RuntimeValue::Enum { name, variant } => format!("{name}::{variant}"),
-        RuntimeValue::Host { kind, id } => format!("{}#0x{id:016x}", format_host_kind(*kind)),
-        RuntimeValue::None => "none".to_string(),
-        RuntimeValue::Some(inner) => format!("some({})", format_value(inner)),
-        RuntimeValue::List(items) => {
-            let inner = items.iter().map(format_value).collect::<Vec<_>>().join(", ");
-            format!("[{inner}]")
-        }
-    }
-}
-
-fn format_host_kind(kind: HostValueKind) -> &'static str {
-    match kind {
-        HostValueKind::Def => "Def",
-        HostValueKind::Span => "Span",
-        HostValueKind::TypeRef => "TypeRef",
-        HostValueKind::Node => "Node",
-        HostValueKind::Call => "Call",
-        HostValueKind::Ref => "Ref",
-        HostValueKind::Impl => "Impl",
     }
 }

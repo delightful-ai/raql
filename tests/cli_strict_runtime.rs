@@ -100,3 +100,75 @@ fn lang_run_surfaces_daemon_side_query_failures() {
         "stderr should surface daemon-side planning failure; stderr={stderr}"
     );
 }
+
+#[test]
+fn dev_run_direct_is_not_a_supported_cli_command() {
+    let work = temp_dir("dev_run_direct_removed");
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.decl ping().
+ping().
+"#,
+    )
+    .expect("write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+        .args(["dev", "run-direct", query.to_str().expect("utf8 query path")])
+        .output()
+        .expect("run raql binary");
+
+    assert!(
+        !output.status.success(),
+        "dev run-direct should be rejected; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "stderr should show clap rejecting removed command; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("dev"),
+        "stderr should mention the removed top-level command; stderr={stderr}"
+    );
+}
+
+#[test]
+fn lang_run_requires_rust_file_without_advertising_direct_runtime_escape_hatch() {
+    let work = temp_dir("lang_run_requires_rust_file");
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.decl ping().
+ping().
+"#,
+    )
+    .expect("write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+        .args(["lang", "run", query.to_str().expect("utf8 query path")])
+        .output()
+        .expect("run raql binary");
+
+    assert!(
+        !output.status.success(),
+        "lang run without --rust-file should fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("supported `raql lang run` requires `--rust-file`"),
+        "stderr should explain the daemon-backed requirement; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("run-direct"),
+        "stderr should not advertise deleted direct-runtime commands; stderr={stderr}"
+    );
+}
