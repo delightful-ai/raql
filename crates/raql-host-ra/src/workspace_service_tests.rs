@@ -569,6 +569,75 @@ generated(Name) :- def(D), def_name(D, Name), contains(Name, "generated_fn").
 }
 
 #[test]
+fn workspace_service_refreshes_generated_build_symbols_when_build_inputs_change() {
+    let root = temp_workspace_root("generated_refresh");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub fn caller() {
+    generated_alpha();
+}
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(root.join("schema.txt"), "generated_alpha\n").expect("write schema");
+    fs::write(
+        root.join("build.rs"),
+        r#"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    println!("cargo:rerun-if-changed=schema.txt");
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let symbol = fs::read_to_string("schema.txt").expect("read schema");
+    let symbol = symbol.trim();
+    fs::write(out.join("generated.rs"), format!("pub fn {symbol}() {{}}\n")).expect("write generated");
+}
+"#,
+    )
+    .expect("write build.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let initial_epoch = service.workspace_epoch();
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl generated(Name: string).
+generated(Name) :- def(D), def_name(D, Name), contains(Name, "generated_").
+"#,
+    );
+    let first = service.run_planned(&planned).expect("first run");
+    assert!(first.relations.get("generated").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("generated_alpha".to_string())])
+    }));
+
+    fs::write(root.join("schema.txt"), "generated_omega\n").expect("rewrite schema");
+
+    let second = service.run_planned(&planned).expect("second run");
+    let observed = second
+        .relations
+        .get("generated")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        observed.contains(&vec![RuntimeValue::String("generated_omega".to_string())]),
+        "expected refreshed generated symbol after build input change; observed={observed:?}"
+    );
+    assert!(
+        !observed.contains(&vec![RuntimeValue::String("generated_alpha".to_string())]),
+        "stale generated symbol should disappear after build input change; observed={observed:?}"
+    );
+    assert!(
+        service.workspace_epoch() > initial_epoch,
+        "build input changes should force a workspace reload"
+    );
+}
+
+#[test]
 fn workspace_service_exposes_world_stamp_on_supported_runs() {
     let root = temp_workspace_root("world_stamp_smoke");
     fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");

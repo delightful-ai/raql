@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::UNIX_EPOCH;
 
 use base_db::SourceDatabase;
 use camino::Utf8PathBuf;
@@ -34,28 +35,36 @@ pub struct WorkspaceService {
     core_host: Option<DeterministicRaHost>,
     tracked_files: BTreeSet<PathBuf>,
     scan_roots: BTreeSet<PathBuf>,
+    auxiliary_build_inputs: BTreeMap<PathBuf, WatchedFileState>,
     workspace_epoch: u64,
     content_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WatchedFileState {
+    len: u64,
+    modified_unix_nanos: Option<u128>,
 }
 
 impl WorkspaceService {
     pub fn from_workspace_root(root: &Path) -> Result<Self, RaHostInitError> {
         let loaded = workspace_loader::load_from_workspace_root(root)?;
-        Ok(Self::from_loaded(loaded))
+        Self::from_loaded(loaded)
     }
 
     pub fn from_manifest_path(manifest: &Path) -> Result<Self, RaHostInitError> {
         let loaded = workspace_loader::load_from_manifest_path(manifest)?;
-        Ok(Self::from_loaded(loaded))
+        Self::from_loaded(loaded)
     }
 
-    fn from_loaded(loaded: workspace_loader::LoadedWorkspace) -> Self {
+    fn from_loaded(loaded: workspace_loader::LoadedWorkspace) -> Result<Self, RaHostInitError> {
         let (tracked_files, scan_roots) = tracked_workspace_state(
             &loaded.vfs,
             loaded.manifest_path.as_path(),
             loaded.workspace_root.as_path(),
         );
-        Self {
+        let auxiliary_build_inputs = auxiliary_build_input_state(&scan_roots, &tracked_files)?;
+        Ok(Self {
             manifest_path: loaded.manifest_path,
             workspace_root: loaded.workspace_root,
             analysis_host: AnalysisHost::with_database(loaded.db),
@@ -64,9 +73,10 @@ impl WorkspaceService {
             core_host: None,
             tracked_files,
             scan_roots,
+            auxiliary_build_inputs,
             workspace_epoch: 0,
             content_revision: 0,
-        }
+        })
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -125,6 +135,11 @@ impl WorkspaceService {
     }
 
     fn sync_workspace(&mut self) -> Result<(), RaHostInitError> {
+        let auxiliary_build_inputs = auxiliary_build_input_state(&self.scan_roots, &self.tracked_files)?;
+        if auxiliary_build_inputs != self.auxiliary_build_inputs {
+            return self.reload_full();
+        }
+
         let scanned = scan_relevant_files(&self.scan_roots, &self.tracked_files)?;
         if scanned != self.tracked_files {
             return self.reload_full();
@@ -187,6 +202,7 @@ impl WorkspaceService {
         } = loaded;
         let (tracked_files, scan_roots) =
             tracked_workspace_state(&vfs, manifest_path.as_path(), workspace_root.as_path());
+        let auxiliary_build_inputs = auxiliary_build_input_state(&scan_roots, &tracked_files)?;
         self.manifest_path = manifest_path;
         self.workspace_root = workspace_root;
         self.analysis_host = AnalysisHost::with_database(db);
@@ -195,6 +211,7 @@ impl WorkspaceService {
         self.core_host = None;
         self.tracked_files = tracked_files;
         self.scan_roots = scan_roots;
+        self.auxiliary_build_inputs = auxiliary_build_inputs;
         self.workspace_epoch = self.workspace_epoch.saturating_add(1);
         self.content_revision = self.content_revision.saturating_add(1);
         Ok(())
@@ -550,6 +567,26 @@ fn scan_relevant_files(
     Ok(files)
 }
 
+fn auxiliary_build_input_state(
+    roots: &BTreeSet<PathBuf>,
+    tracked_files: &BTreeSet<PathBuf>,
+) -> Result<BTreeMap<PathBuf, WatchedFileState>, RaHostInitError> {
+    if !tracked_files
+        .iter()
+        .any(|path| path.file_name().and_then(|value| value.to_str()) == Some("build.rs"))
+    {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut files = BTreeMap::new();
+    for root in roots {
+        if root.exists() {
+            scan_auxiliary_build_inputs(root.as_path(), tracked_files, &mut files)?;
+        }
+    }
+    Ok(files)
+}
+
 fn scan_dir(dir: &Path, out: &mut BTreeSet<PathBuf>) -> Result<(), RaHostInitError> {
     let entries = fs::read_dir(dir).map_err(|err| RaHostInitError::WorkspaceLoad {
         manifest: dir.display().to_string(),
@@ -576,6 +613,55 @@ fn scan_dir(dir: &Path, out: &mut BTreeSet<PathBuf>) -> Result<(), RaHostInitErr
         }
     }
     Ok(())
+}
+
+fn scan_auxiliary_build_inputs(
+    dir: &Path,
+    tracked_files: &BTreeSet<PathBuf>,
+    out: &mut BTreeMap<PathBuf, WatchedFileState>,
+) -> Result<(), RaHostInitError> {
+    let entries = fs::read_dir(dir).map_err(|err| RaHostInitError::WorkspaceLoad {
+        manifest: dir.display().to_string(),
+        details: err.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| RaHostInitError::WorkspaceLoad {
+            manifest: dir.display().to_string(),
+            details: err.to_string(),
+        })?;
+        let path = entry.path();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if matches!(name, "target" | ".git" | ".jj") {
+                continue;
+            }
+            scan_auxiliary_build_inputs(path.as_path(), tracked_files, out)?;
+            continue;
+        }
+        if tracked_files.contains(&path) {
+            continue;
+        }
+        out.insert(path.clone(), watched_file_state(path.as_path())?);
+    }
+    Ok(())
+}
+
+fn watched_file_state(path: &Path) -> Result<WatchedFileState, RaHostInitError> {
+    let metadata = fs::metadata(path).map_err(|err| RaHostInitError::WorkspaceLoad {
+        manifest: path.display().to_string(),
+        details: err.to_string(),
+    })?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Ok(WatchedFileState {
+        len: metadata.len(),
+        modified_unix_nanos,
+    })
 }
 
 fn is_relevant_workspace_file(path: &Path) -> bool {
