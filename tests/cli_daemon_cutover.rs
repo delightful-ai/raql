@@ -1,7 +1,7 @@
 use std::fs;
 use std::process::Command;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn temp_dir(label: &str) -> std::path::PathBuf {
     let stamp = SystemTime::now()
@@ -294,5 +294,153 @@ visible(Name) :- def(D), is_fn(D), def_name(D, Name).
     assert!(
         !second_stdout.contains("alpha_only_marker"),
         "warm daemon run should not retain stale defs after incremental edit; stdout={second_stdout}"
+    );
+}
+
+#[test]
+fn lang_run_respawns_cleanly_after_daemon_idle_shutdown() {
+    let work = temp_dir("idle_shutdown");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl hit(Name: string).
+hit(Name) :- def(D), is_fn(D), def_name(D, Name), contains(Name, "alpha").
+"#,
+    )
+    .expect("write query");
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_raql"))
+            .env("RAQL_DAEMON_IDLE_TIMEOUT_MS", "200")
+            .args([
+                "lang",
+                "run",
+                query.to_str().expect("utf8 query"),
+                "--rust-file",
+                workspace.to_str().expect("utf8 workspace"),
+                "--include-dir",
+                env!("CARGO_MANIFEST_DIR"),
+            ])
+            .output()
+            .expect("run raql")
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "first daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first_stdout.contains("daemon: cold"), "stdout={first_stdout}");
+
+    thread::sleep(Duration::from_millis(500));
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "daemon-backed run after idle timeout should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second_stdout.contains("daemon: cold"),
+        "daemon should have idled out and respawned cleanly; stdout={second_stdout}"
+    );
+}
+
+#[test]
+fn lang_run_reports_executed_workspace_state_after_sync_and_reload() {
+    let work = temp_dir("session_state");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl hit(Name: string).
+hit(Name) :- def(D), is_fn(D), def_name(D, Name), contains(Name, "alpha").
+"#,
+    )
+    .expect("write query");
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_raql"))
+            .args([
+                "lang",
+                "run",
+                query.to_str().expect("utf8 query"),
+                "--rust-file",
+                workspace.to_str().expect("utf8 workspace"),
+                "--include-dir",
+                env!("CARGO_MANIFEST_DIR"),
+            ])
+            .output()
+            .expect("run raql")
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "first daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first_stdout.contains("workspace_epoch: 0"), "stdout={first_stdout}");
+    assert!(first_stdout.contains("content_revision: 0"), "stdout={first_stdout}");
+
+    fs::write(workspace.join("src/lib.rs"), "pub fn alpha() {}\npub fn omega() {}\n").expect("rewrite lib.rs");
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "second daemon-backed run should succeed after source edit; stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second_stdout.contains("daemon: warm"), "stdout={second_stdout}");
+    assert!(second_stdout.contains("workspace_epoch: 0"), "stdout={second_stdout}");
+    assert!(
+        second_stdout.contains("content_revision: 1"),
+        "session metadata should reflect the incrementally synced revision; stdout={second_stdout}"
+    );
+
+    let manifest = workspace.join("Cargo.toml");
+    let mut manifest_text = fs::read_to_string(&manifest).expect("read Cargo.toml");
+    manifest_text.push_str(
+        r#"
+[features]
+extra = []
+"#,
+    );
+    fs::write(&manifest, manifest_text).expect("rewrite Cargo.toml");
+
+    let third = run();
+    assert!(
+        third.status.success(),
+        "third daemon-backed run should succeed after manifest change; stdout={} stderr={}",
+        String::from_utf8_lossy(&third.stdout),
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let third_stdout = String::from_utf8_lossy(&third.stdout);
+    assert!(third_stdout.contains("daemon: warm"), "stdout={third_stdout}");
+    assert!(
+        third_stdout.contains("workspace_epoch: 1"),
+        "session metadata should reflect the reloaded workspace epoch; stdout={third_stdout}"
+    );
+    assert!(
+        third_stdout.contains("content_revision: 2"),
+        "session metadata should reflect the executed post-reload revision; stdout={third_stdout}"
     );
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::{fs::OpenOptions, io::ErrorKind};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use raql_compiler::{PlannedProgram, plan, required_extern_capabilities, resolve, typecheck};
@@ -31,6 +31,10 @@ pub enum DaemonError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
+
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 600_000;
+const IDLE_TIMEOUT_ENV: &str = "RAQL_DAEMON_IDLE_TIMEOUT_MS";
+const ACCEPT_POLL_INTERVAL_MS: u64 = 50;
 
 pub fn socket_path_for_workspace(workspace_root: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -237,12 +241,28 @@ pub fn serve(socket_path: &Path, workspace_root: &Path) -> Result<(), DaemonErro
         let _ = std::fs::remove_file(socket_path);
     }
     let listener = UnixListener::bind(socket_path)?;
+    listener.set_nonblocking(true)?;
+    let _socket_guard = SocketGuard {
+        path: socket_path.to_path_buf(),
+    };
+    let idle_timeout = idle_shutdown_timeout();
+    let poll_interval = Duration::from_millis(ACCEPT_POLL_INTERVAL_MS);
+    let mut last_activity = Instant::now();
     let mut cold = true;
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let _ = handle_connection(stream, &mut session, cold);
-                cold = false;
+    loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let served_request = handle_connection(stream, &mut session, cold)?;
+                if served_request {
+                    cold = false;
+                    last_activity = Instant::now();
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                if last_activity.elapsed() >= idle_timeout {
+                    break;
+                }
+                thread::sleep(poll_interval);
             }
             Err(err) => return Err(err.into()),
         }
@@ -250,23 +270,36 @@ pub fn serve(socket_path: &Path, workspace_root: &Path) -> Result<(), DaemonErro
     Ok(())
 }
 
+struct SocketGuard {
+    path: PathBuf,
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn handle_connection(
     stream: UnixStream,
     session: &mut DaemonWorkspace,
     cold: bool,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
     let mut writer = BufWriter::new(stream.try_clone()?);
     let mut reader = BufReader::new(stream);
-    if let Err(err) = handle_connection_impl(&mut reader, session, cold, &mut writer) {
-        let _ = emit_event(
-            &mut writer,
-            &DaemonEvent::Error(ErrorEvent {
-                message: err.to_string(),
-            }),
-        );
-        let _ = emit_event(&mut writer, &DaemonEvent::Done);
+    match handle_connection_impl(&mut reader, session, cold, &mut writer) {
+        Ok(served_request) => Ok(served_request),
+        Err(err) => {
+            let _ = emit_event(
+                &mut writer,
+                &DaemonEvent::Error(ErrorEvent {
+                    message: err.to_string(),
+                }),
+            );
+            let _ = emit_event(&mut writer, &DaemonEvent::Done);
+            Ok(true)
+        }
     }
-    Ok(())
 }
 
 fn handle_connection_impl(
@@ -274,19 +307,17 @@ fn handle_connection_impl(
     session: &mut DaemonWorkspace,
     cold: bool,
     writer: &mut BufWriter<UnixStream>,
-) -> Result<(), DaemonError> {
+) -> Result<bool, DaemonError> {
     let mut line = String::new();
     let n = reader.read_line(&mut line)?;
     if n == 0 {
-        return Err(DaemonError::Message(
-            "daemon connection closed before request".to_string(),
-        ));
+        return Ok(false);
     }
     let request: DaemonRequest = serde_json::from_str(line.trim_end())?;
     match request {
         DaemonRequest::Run(run) => handle_run(run, session, cold, writer)?,
     }
-    Ok(())
+    Ok(true)
 }
 fn handle_run(
     run: RunRequest,
@@ -307,6 +338,10 @@ fn handle_run(
         emit_event(writer, &DaemonEvent::Done)?;
         return Ok(());
     }
+
+    session
+        .sync()
+        .map_err(|err| DaemonError::Message(err.to_string()))?;
 
     emit_event(
         writer,
@@ -424,13 +459,55 @@ fn protocol_value(value: RuntimeValue) -> ProtocolValue {
     }
 }
 
+fn idle_shutdown_timeout() -> Duration {
+    let configured = std::env::var(IDLE_TIMEOUT_ENV).ok();
+    idle_shutdown_timeout_from_raw(configured.as_deref())
+}
+
+fn idle_shutdown_timeout_from_raw(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PROTOCOL_VERSION, connection_failure_message, socket_path_for_workspace,
+        DEFAULT_IDLE_TIMEOUT_MS, PROTOCOL_VERSION, connection_failure_message,
+        handle_connection, idle_shutdown_timeout_from_raw, socket_path_for_workspace,
         startup_log_path_for_socket,
     };
+    use raql_host_ra::daemon::DaemonWorkspace;
     use std::fs;
+    use std::os::unix::net::UnixStream;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_workspace_root(label: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "raql_daemon_{label}_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "raql_daemon_{stamp}"
+version = "0.0.0"
+edition = "2021"
+"#
+            ),
+        )
+        .expect("write Cargo.toml");
+        fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");
+        root
+    }
 
     #[test]
     fn socket_path_for_workspace_is_protocol_versioned() {
@@ -461,5 +538,35 @@ mod tests {
         assert!(message.contains("failed to connect to daemon socket"), "message={message}");
         assert!(message.contains("Operation not permitted"), "message={message}");
         assert!(message.contains("bind failed"), "message={message}");
+    }
+
+    #[test]
+    fn idle_shutdown_timeout_uses_default_and_rejects_zero() {
+        assert_eq!(
+            idle_shutdown_timeout_from_raw(None),
+            std::time::Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            idle_shutdown_timeout_from_raw(Some("0")),
+            std::time::Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS)
+        );
+        assert_eq!(
+            idle_shutdown_timeout_from_raw(Some("200")),
+            std::time::Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn connect_and_close_before_request_does_not_count_as_served_activity() {
+        let root = temp_workspace_root("no_request");
+        let mut session = DaemonWorkspace::from_workspace_root(root.as_path()).expect("session");
+        let (server, client) = UnixStream::pair().expect("stream pair");
+        drop(client);
+
+        let served = handle_connection(server, &mut session, true).expect("handle connection");
+        assert!(
+            !served,
+            "connect-and-close without a request should not advance warm or idle accounting"
+        );
     }
 }

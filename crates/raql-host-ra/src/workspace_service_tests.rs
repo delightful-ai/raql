@@ -638,6 +638,188 @@ generated(Name) :- def(D), def_name(D, Name), contains(Name, "generated_").
 }
 
 #[test]
+fn workspace_service_refreshes_generated_build_symbols_when_build_rs_changes() {
+    let root = temp_workspace_root("generated_refresh_build_rs");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(
+        root.join("build.rs"),
+        r#"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    fs::write(out.join("generated.rs"), "pub fn generated_alpha() {}\n").expect("write generated");
+}
+"#,
+    )
+    .expect("write build.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let initial_epoch = service.workspace_epoch();
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl generated(Name: string).
+generated(Name) :- def(D), def_name(D, Name), contains(Name, "generated_").
+"#,
+    );
+    let first = service.run_planned(&planned).expect("first run");
+    assert!(first.relations.get("generated").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("generated_alpha".to_string())])
+    }));
+
+    fs::write(
+        root.join("build.rs"),
+        r#"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    fs::write(out.join("generated.rs"), "pub fn generated_omega() {}\n").expect("write generated");
+}
+"#,
+    )
+    .expect("rewrite build.rs");
+
+    let second = service.run_planned(&planned).expect("second run");
+    let observed = second
+        .relations
+        .get("generated")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        observed.contains(&vec![RuntimeValue::String("generated_omega".to_string())]),
+        "expected generated symbol refresh after build.rs edit; observed={observed:?}"
+    );
+    assert!(
+        !observed.contains(&vec![RuntimeValue::String("generated_alpha".to_string())]),
+        "stale generated symbol should disappear after build.rs edit; observed={observed:?}"
+    );
+    assert!(
+        service.workspace_epoch() > initial_epoch,
+        "build.rs edits should force a workspace reload"
+    );
+}
+
+#[test]
+fn workspace_service_refreshes_generated_build_symbols_when_tracked_rust_inputs_change() {
+    let root = temp_workspace_root("generated_refresh_tracked_rust");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(root.join("src/input.rs"), "generated_alpha\n").expect("write input");
+    fs::write(
+        root.join("build.rs"),
+        r#"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    println!("cargo:rerun-if-changed=src/input.rs");
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let symbol = fs::read_to_string("src/input.rs").expect("read input");
+    let symbol = symbol.trim();
+    fs::write(out.join("generated.rs"), format!("pub fn {symbol}() {{}}\n")).expect("write generated");
+}
+"#,
+    )
+    .expect("write build.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let initial_epoch = service.workspace_epoch();
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl generated(Name: string).
+generated(Name) :- def(D), def_name(D, Name), contains(Name, "generated_").
+"#,
+    );
+    let first = service.run_planned(&planned).expect("first run");
+    assert!(first.relations.get("generated").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("generated_alpha".to_string())])
+    }));
+
+    fs::write(root.join("src/input.rs"), "generated_omega\n").expect("rewrite input");
+
+    let second = service.run_planned(&planned).expect("second run");
+    let observed = second
+        .relations
+        .get("generated")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        observed.contains(&vec![RuntimeValue::String("generated_omega".to_string())]),
+        "expected generated symbol refresh after tracked Rust input edit; observed={observed:?}"
+    );
+    assert!(
+        !observed.contains(&vec![RuntimeValue::String("generated_alpha".to_string())]),
+        "stale generated symbol should disappear after tracked Rust input edit; observed={observed:?}"
+    );
+    assert!(
+        service.workspace_epoch() > initial_epoch,
+        "tracked Rust rerun inputs should force a workspace reload"
+    );
+}
+
+#[test]
+fn workspace_service_ignores_unrelated_files_for_explicit_build_script_inputs() {
+    let root = temp_workspace_root("generated_explicit_inputs");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(root.join("schema.txt"), "generated_alpha\n").expect("write schema");
+    fs::write(
+        root.join("build.rs"),
+        r#"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    println!("cargo:rerun-if-changed=schema.txt");
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let symbol = fs::read_to_string("schema.txt").expect("read schema");
+    let symbol = symbol.trim();
+    fs::write(out.join("generated.rs"), format!("pub fn {symbol}() {{}}\n")).expect("write generated");
+}
+"#,
+    )
+    .expect("write build.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let initial_epoch = service.workspace_epoch();
+    let before = query_world_stamp(&mut service);
+
+    fs::write(root.join("README.md"), "notes\n").expect("write unrelated file");
+
+    let after = query_world_stamp(&mut service);
+    assert_eq!(
+        before, after,
+        "unrelated files should not invalidate a build script with explicit rerun-if-changed inputs"
+    );
+    assert_eq!(
+        service.workspace_epoch(),
+        initial_epoch,
+        "unrelated files should not force a workspace reload when build inputs are explicit"
+    );
+}
+
+#[test]
 fn workspace_service_exposes_world_stamp_on_supported_runs() {
     let root = temp_workspace_root("world_stamp_smoke");
     fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");

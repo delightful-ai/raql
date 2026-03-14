@@ -35,7 +35,8 @@ pub struct WorkspaceService {
     core_host: Option<DeterministicRaHost>,
     tracked_files: BTreeSet<PathBuf>,
     scan_roots: BTreeSet<PathBuf>,
-    auxiliary_build_inputs: BTreeMap<PathBuf, WatchedFileState>,
+    build_script_rerun_paths: BTreeSet<PathBuf>,
+    auxiliary_build_inputs: BTreeMap<PathBuf, Option<WatchedFileState>>,
     workspace_epoch: u64,
     content_revision: u64,
 }
@@ -63,7 +64,9 @@ impl WorkspaceService {
             loaded.manifest_path.as_path(),
             loaded.workspace_root.as_path(),
         );
-        let auxiliary_build_inputs = auxiliary_build_input_state(&scan_roots, &tracked_files)?;
+        let build_script_rerun_paths = build_script_rerun_paths(&tracked_files)?;
+        let auxiliary_build_inputs =
+            auxiliary_build_input_state(&build_script_rerun_paths, &tracked_files)?;
         Ok(Self {
             manifest_path: loaded.manifest_path,
             workspace_root: loaded.workspace_root,
@@ -73,6 +76,7 @@ impl WorkspaceService {
             core_host: None,
             tracked_files,
             scan_roots,
+            build_script_rerun_paths,
             auxiliary_build_inputs,
             workspace_epoch: 0,
             content_revision: 0,
@@ -93,6 +97,10 @@ impl WorkspaceService {
 
     pub fn supported_capabilities(&self) -> CapabilitySet {
         day_one_supported_capabilities()
+    }
+
+    pub fn sync(&mut self) -> Result<(), RaHostInitError> {
+        self.sync_workspace()
     }
 
     pub(crate) fn supports_extern_predicate(&self, predicate: &str) -> bool {
@@ -135,7 +143,8 @@ impl WorkspaceService {
     }
 
     fn sync_workspace(&mut self) -> Result<(), RaHostInitError> {
-        let auxiliary_build_inputs = auxiliary_build_input_state(&self.scan_roots, &self.tracked_files)?;
+        let auxiliary_build_inputs =
+            auxiliary_build_input_state(&self.build_script_rerun_paths, &self.tracked_files)?;
         if auxiliary_build_inputs != self.auxiliary_build_inputs {
             return self.reload_full();
         }
@@ -162,7 +171,7 @@ impl WorkspaceService {
             if !changed {
                 continue;
             }
-            if path_requires_reload(path.as_path()) {
+            if path_requires_reload(path.as_path(), &self.build_script_rerun_paths) {
                 let _ = self.vfs.take_changes();
                 return self.reload_full();
             }
@@ -202,7 +211,9 @@ impl WorkspaceService {
         } = loaded;
         let (tracked_files, scan_roots) =
             tracked_workspace_state(&vfs, manifest_path.as_path(), workspace_root.as_path());
-        let auxiliary_build_inputs = auxiliary_build_input_state(&scan_roots, &tracked_files)?;
+        let build_script_rerun_paths = build_script_rerun_paths(&tracked_files)?;
+        let auxiliary_build_inputs =
+            auxiliary_build_input_state(&build_script_rerun_paths, &tracked_files)?;
         self.manifest_path = manifest_path;
         self.workspace_root = workspace_root;
         self.analysis_host = AnalysisHost::with_database(db);
@@ -211,6 +222,7 @@ impl WorkspaceService {
         self.core_host = None;
         self.tracked_files = tracked_files;
         self.scan_roots = scan_roots;
+        self.build_script_rerun_paths = build_script_rerun_paths;
         self.auxiliary_build_inputs = auxiliary_build_inputs;
         self.workspace_epoch = self.workspace_epoch.saturating_add(1);
         self.content_revision = self.content_revision.saturating_add(1);
@@ -567,22 +579,48 @@ fn scan_relevant_files(
     Ok(files)
 }
 
-fn auxiliary_build_input_state(
-    roots: &BTreeSet<PathBuf>,
+fn build_script_rerun_paths(
     tracked_files: &BTreeSet<PathBuf>,
-) -> Result<BTreeMap<PathBuf, WatchedFileState>, RaHostInitError> {
-    if !tracked_files
+) -> Result<BTreeSet<PathBuf>, RaHostInitError> {
+    let mut watched = BTreeSet::new();
+    for build_script in tracked_files
         .iter()
-        .any(|path| path.file_name().and_then(|value| value.to_str()) == Some("build.rs"))
+        .filter(|path| path.file_name().and_then(|value| value.to_str()) == Some("build.rs"))
     {
-        return Ok(BTreeMap::new());
-    }
-
-    let mut files = BTreeMap::new();
-    for root in roots {
-        if root.exists() {
-            scan_auxiliary_build_inputs(root.as_path(), tracked_files, &mut files)?;
+        watched.insert(build_script.clone());
+        let package_root = build_script
+            .parent()
+            .ok_or_else(|| RaHostInitError::WorkspaceLoad {
+                manifest: build_script.display().to_string(),
+                details: "build.rs path has no parent directory".to_string(),
+            })?;
+        let declared = declared_rerun_if_changed_paths(build_script.as_path())?;
+        if declared.is_empty() {
+            watched.insert(package_root.to_path_buf());
+            scan_all_files(package_root, &mut watched)?;
+            continue;
         }
+        for declared_path in declared {
+            let watched_path = package_root.join(&declared_path);
+            watched.insert(watched_path.clone());
+            if watched_path.is_dir() {
+                scan_all_files(watched_path.as_path(), &mut watched)?;
+            }
+        }
+    }
+    Ok(watched)
+}
+
+fn auxiliary_build_input_state(
+    watched_paths: &BTreeSet<PathBuf>,
+    tracked_files: &BTreeSet<PathBuf>,
+) -> Result<BTreeMap<PathBuf, Option<WatchedFileState>>, RaHostInitError> {
+    let mut files = BTreeMap::new();
+    for path in watched_paths {
+        if tracked_files.contains(path) {
+            continue;
+        }
+        files.insert(path.clone(), watched_path_state(path.as_path())?);
     }
     Ok(files)
 }
@@ -615,11 +653,7 @@ fn scan_dir(dir: &Path, out: &mut BTreeSet<PathBuf>) -> Result<(), RaHostInitErr
     Ok(())
 }
 
-fn scan_auxiliary_build_inputs(
-    dir: &Path,
-    tracked_files: &BTreeSet<PathBuf>,
-    out: &mut BTreeMap<PathBuf, WatchedFileState>,
-) -> Result<(), RaHostInitError> {
+fn scan_all_files(dir: &Path, out: &mut BTreeSet<PathBuf>) -> Result<(), RaHostInitError> {
     let entries = fs::read_dir(dir).map_err(|err| RaHostInitError::WorkspaceLoad {
         manifest: dir.display().to_string(),
         details: err.to_string(),
@@ -637,15 +671,20 @@ fn scan_auxiliary_build_inputs(
             if matches!(name, "target" | ".git" | ".jj") {
                 continue;
             }
-            scan_auxiliary_build_inputs(path.as_path(), tracked_files, out)?;
+            out.insert(path.clone());
+            scan_all_files(path.as_path(), out)?;
             continue;
         }
-        if tracked_files.contains(&path) {
-            continue;
-        }
-        out.insert(path.clone(), watched_file_state(path.as_path())?);
+        out.insert(path);
     }
     Ok(())
+}
+
+fn watched_path_state(path: &Path) -> Result<Option<WatchedFileState>, RaHostInitError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(watched_file_state(path)?))
 }
 
 fn watched_file_state(path: &Path) -> Result<WatchedFileState, RaHostInitError> {
@@ -662,6 +701,26 @@ fn watched_file_state(path: &Path) -> Result<WatchedFileState, RaHostInitError> 
         len: metadata.len(),
         modified_unix_nanos,
     })
+}
+
+fn declared_rerun_if_changed_paths(build_script: &Path) -> Result<Vec<PathBuf>, RaHostInitError> {
+    let text = fs::read_to_string(build_script).map_err(|err| RaHostInitError::WorkspaceLoad {
+        manifest: build_script.display().to_string(),
+        details: err.to_string(),
+    })?;
+    let mut paths = Vec::new();
+    for segment in text.split("cargo:rerun-if-changed=").skip(1) {
+        let candidate = segment
+            .chars()
+            .take_while(|ch| !matches!(ch, '"' | '\n' | '\r'))
+            .collect::<String>();
+        let candidate = candidate.trim();
+        if candidate.is_empty() || candidate.contains('{') || candidate.contains('}') {
+            continue;
+        }
+        paths.push(PathBuf::from(candidate));
+    }
+    Ok(paths)
 }
 
 fn is_relevant_workspace_file(path: &Path) -> bool {
@@ -701,7 +760,13 @@ fn scan_root_seed(path: &Path) -> bool {
             == Some(".cargo"))
 }
 
-fn path_requires_reload(path: &Path) -> bool {
+fn path_requires_reload(path: &Path, build_script_rerun_paths: &BTreeSet<PathBuf>) -> bool {
+    if path.file_name().and_then(|value| value.to_str()) == Some("build.rs") {
+        return true;
+    }
+    if build_script_rerun_paths.contains(path) {
+        return true;
+    }
     !path.extension().is_some_and(|ext| ext == "rs")
 }
 
