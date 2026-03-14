@@ -1,10 +1,13 @@
 use camino::Utf8PathBuf;
 use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::RuntimeValue;
-use raql_host_ra::{RaHostInitError, test_support::WorkspaceService};
 use raql_syntax::parse_program;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate as raql_host_ra;
+use crate::RaHostInitError;
+use crate::workspace_service::WorkspaceService;
 
 fn temp_workspace_root(label: &str) -> Utf8PathBuf {
     let stamp = SystemTime::now()

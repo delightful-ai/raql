@@ -30,10 +30,10 @@ pub mod daemon {
     pub use super::workspace_service::resolve_workspace_root;
 }
 
-#[doc(hidden)]
-pub mod test_support {
-    pub use super::workspace_service::WorkspaceService;
-}
+#[cfg(test)]
+mod capability_gating_tests;
+#[cfg(test)]
+mod workspace_service_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Mutability {
