@@ -286,6 +286,49 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "beta").
 }
 
 #[test]
+fn workspace_service_surfaces_generated_build_symbols() {
+    let root = temp_workspace_root("generated_symbols");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub fn caller() {
+    generated_fn();
+}
+"#,
+    )
+    .expect("write lib.rs");
+    fs::write(
+        root.join("build.rs"),
+        r#"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    fs::write(out.join("generated.rs"), "pub fn generated_fn() {}\n").expect("write generated");
+}
+"#,
+    )
+    .expect("write build.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl generated(Name: string).
+generated(Name) :- def(D), def_name(D, Name), contains(Name, "generated_fn").
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(result.relations.get("generated").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("generated_fn".to_string())])
+    }));
+}
+
+#[test]
 fn workspace_service_exposes_world_stamp_on_supported_runs() {
     let root = temp_workspace_root("world_stamp_smoke");
     fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");
