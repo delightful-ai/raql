@@ -27,13 +27,19 @@ pub use raql_host::{
     ScalarInputKey, SpanCoord, SpanId, SpanKey, StableHandle, TypeRefId, WorldStamp,
 };
 pub use raql_ir::{ScalarValue, StableId};
-// TODO(ra-daemon-cutover): stop re-exporting WorkspaceService from the crate
-// root once the daemon owns the supported execution boundary end-to-end.
-#[doc(hidden)]
-pub use workspace_service::{WorkspaceService, resolve_workspace_root};
 
 pub mod legacy {
     pub use super::LegacyRaHostRuntime;
+}
+
+pub mod daemon {
+    pub use super::workspace_service::WorkspaceService as DaemonWorkspace;
+    pub use super::workspace_service::resolve_workspace_root;
+}
+
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::workspace_service::WorkspaceService;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

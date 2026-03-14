@@ -7,9 +7,8 @@ use raql_host::{
     SpanId, SpanKey, StableHandle, TypeRefId, WorldStamp,
 };
 
-use crate::{
-    RaHostError, ScalarValue, StableId, WorkspaceService, runtime_value_stable_key_with_runtime,
-};
+use crate::workspace_service::WorkspaceService;
+use crate::{RaHostError, ScalarValue, StableId, runtime_value_stable_key_with_runtime};
 
 pub struct LazyRaRuntime<'a> {
     service: Rc<RefCell<&'a mut WorkspaceService>>,

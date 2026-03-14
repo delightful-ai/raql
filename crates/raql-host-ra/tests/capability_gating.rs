@@ -1,7 +1,7 @@
 use camino::Utf8PathBuf;
 use raql_compiler::{plan, required_extern_capabilities, resolve, typecheck};
 use raql_host::MissingCapabilitiesError;
-use raql_host_ra::WorkspaceService;
+use raql_host_ra::test_support::WorkspaceService;
 use raql_syntax::{parse_program, parse_program_from_file};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};

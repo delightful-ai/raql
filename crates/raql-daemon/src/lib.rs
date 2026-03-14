@@ -14,7 +14,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use raql_compiler::{PlannedProgram, plan, required_extern_capabilities, resolve, typecheck};
 use raql_engine::{EvalResult, RuntimeValue};
 use raql_host::MissingCapabilitiesError;
-use raql_host_ra::{WorkspaceService, resolve_workspace_root};
+use raql_host_ra::daemon::{DaemonWorkspace, resolve_workspace_root};
 use raql_protocol::{
     DaemonEvent, DaemonRequest, DaemonState, ErrorEvent, PROTOCOL_VERSION, PlanSummary,
     ProtocolValue, RelationRows, RunNote, RunRequest, RunResult, SessionEvent,
@@ -166,7 +166,7 @@ impl DaemonClient {
 }
 
 pub fn serve(socket_path: &Path, workspace_root: &Path) -> Result<(), DaemonError> {
-    let mut session = WorkspaceService::from_workspace_root(workspace_root)
+    let mut session = DaemonWorkspace::from_workspace_root(workspace_root)
         .map_err(|err| DaemonError::Message(format!("failed to initialize rust-analyzer runtime from `{}`: {err}", workspace_root.display())))?;
     if socket_path.exists() {
         let _ = std::fs::remove_file(socket_path);
@@ -187,7 +187,7 @@ pub fn serve(socket_path: &Path, workspace_root: &Path) -> Result<(), DaemonErro
 
 fn handle_connection(
     stream: UnixStream,
-    session: &mut WorkspaceService,
+    session: &mut DaemonWorkspace,
     cold: bool,
 ) -> Result<(), DaemonError> {
     let mut writer = BufWriter::new(stream.try_clone()?);
@@ -206,7 +206,7 @@ fn handle_connection(
 
 fn handle_connection_impl(
     reader: &mut BufReader<UnixStream>,
-    session: &mut WorkspaceService,
+    session: &mut DaemonWorkspace,
     cold: bool,
     writer: &mut BufWriter<UnixStream>,
 ) -> Result<(), DaemonError> {
@@ -225,7 +225,7 @@ fn handle_connection_impl(
 }
 fn handle_run(
     run: RunRequest,
-    session: &mut WorkspaceService,
+    session: &mut DaemonWorkspace,
     cold: bool,
     writer: &mut BufWriter<UnixStream>,
 ) -> Result<(), DaemonError> {
