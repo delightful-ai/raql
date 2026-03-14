@@ -1,5 +1,6 @@
 use std::fs;
 use std::process::Command;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -85,6 +86,69 @@ hit(Name) :- def(D), is_fn(D), def_name(D, Name), contains(Name, "alpha").
     );
     let second_stdout = String::from_utf8_lossy(&second.stdout);
     assert!(second_stdout.contains("daemon: warm"), "stdout={second_stdout}");
+}
+
+#[test]
+fn concurrent_cold_starts_share_one_daemon_startup() {
+    let work = temp_dir("daemon_concurrent_cold_start");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl hit(Name: string).
+hit(Name) :- def(D), is_fn(D), def_name(D, Name), contains(Name, "alpha").
+"#,
+    )
+    .expect("write query");
+
+    let run = |query: std::path::PathBuf, workspace: std::path::PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_raql"))
+            .args([
+                "lang",
+                "run",
+                query.to_str().expect("utf8 query"),
+                "--rust-file",
+                workspace.to_str().expect("utf8 workspace"),
+                "--include-dir",
+                env!("CARGO_MANIFEST_DIR"),
+            ])
+            .output()
+            .expect("run raql")
+    };
+
+    let first_query = query.clone();
+    let first_workspace = workspace.clone();
+    let second_query = query.clone();
+    let second_workspace = workspace.clone();
+    let first = thread::spawn(move || run(first_query, first_workspace));
+    let second = thread::spawn(move || run(second_query, second_workspace));
+    let first = first.join().expect("first join");
+    let second = second.join().expect("second join");
+
+    assert!(
+        first.status.success(),
+        "first concurrent run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "second concurrent run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert!(combined.contains("daemon: cold"), "stdout={combined}");
+    assert!(combined.contains("daemon: warm"), "stdout={combined}");
 }
 
 #[test]

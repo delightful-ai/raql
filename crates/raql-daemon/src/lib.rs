@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::{fs::OpenOptions, io::ErrorKind};
 use std::thread;
 use std::time::Duration;
@@ -35,11 +35,19 @@ pub enum DaemonError {
 pub fn socket_path_for_workspace(workspace_root: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workspace_root.to_string_lossy().hash(&mut hasher);
-    std::env::temp_dir().join(format!("raql-daemon-{:016x}.sock", hasher.finish()))
+    std::env::temp_dir().join(format!(
+        "raql-daemon-v{}-{:016x}.sock",
+        PROTOCOL_VERSION,
+        hasher.finish()
+    ))
 }
 
 fn spawn_lock_path_for_socket(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("sock.lock")
+}
+
+fn startup_log_path_for_socket(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("sock.startup.log")
 }
 
 pub fn spawn_or_connect(current_exe: &Path, rust_input: &Path) -> Result<DaemonClient, DaemonError> {
@@ -54,11 +62,17 @@ pub fn spawn_or_connect(current_exe: &Path, rust_input: &Path) -> Result<DaemonC
         return Ok(DaemonClient { stream });
     }
     let lock_path = spawn_lock_path_for_socket(&socket_path);
+    let startup_log_path = startup_log_path_for_socket(&socket_path);
     if let Some(_lock) = try_acquire_spawn_lock(&lock_path)? {
         if let Ok(stream) = UnixStream::connect(&socket_path) {
             return Ok(DaemonClient { stream });
         }
-        let child = Command::new(current_exe)
+        let stderr = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&startup_log_path)?;
+        let mut child = Command::new(current_exe)
             .arg("__daemon-serve")
             .arg("--workspace-root")
             .arg(&workspace_root)
@@ -66,24 +80,75 @@ pub fn spawn_or_connect(current_exe: &Path, rust_input: &Path) -> Result<DaemonC
             .arg(&socket_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()?;
-        drop(child);
+        let connected = wait_for_connect(
+            &socket_path,
+            Some(startup_log_path.as_path()),
+            Some(&mut child),
+        );
+        if connected.is_ok() {
+            let _ = std::fs::remove_file(&startup_log_path);
+        }
+        return connected;
     }
-    wait_for_connect(&socket_path)
+    wait_for_connect(&socket_path, Some(startup_log_path.as_path()), None)
 }
 
-fn wait_for_connect(socket_path: &Path) -> Result<DaemonClient, DaemonError> {
-    for _ in 0..50 {
+fn wait_for_connect(
+    socket_path: &Path,
+    startup_log_path: Option<&Path>,
+    mut child: Option<&mut Child>,
+) -> Result<DaemonClient, DaemonError> {
+    for _ in 0..200 {
+        if let Some(child) = child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            return Err(DaemonError::Message(connection_failure_message(
+                socket_path,
+                startup_log_path,
+                Some(status),
+            )));
+        }
         match UnixStream::connect(socket_path) {
             Ok(stream) => return Ok(DaemonClient { stream }),
             Err(_) => thread::sleep(Duration::from_millis(100)),
         }
     }
-    Err(DaemonError::Message(format!(
-        "failed to connect to daemon socket `{}`",
-        socket_path.display()
+    Err(DaemonError::Message(connection_failure_message(
+        socket_path,
+        startup_log_path,
+        None,
     )))
+}
+
+fn connection_failure_message(
+    socket_path: &Path,
+    startup_log_path: Option<&Path>,
+    child_status: Option<ExitStatus>,
+) -> String {
+    let mut message = format!("failed to connect to daemon socket `{}`", socket_path.display());
+    if let Some(status) = child_status {
+        message.push_str(format!("; daemon exited with status {status}").as_str());
+    }
+    if let Some(log_path) = startup_log_path
+        && let Ok(log) = std::fs::read_to_string(log_path)
+    {
+        let trimmed = log.trim();
+        if !trimmed.is_empty() {
+            let tail = trimmed
+                .lines()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            message.push_str(format!("; startup log: {tail}").as_str());
+        }
+    }
+    message
 }
 
 struct SpawnLock {
@@ -356,5 +421,45 @@ fn protocol_value(value: RuntimeValue) -> ProtocolValue {
         RuntimeValue::List(items) => {
             ProtocolValue::List(items.into_iter().map(protocol_value).collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PROTOCOL_VERSION, connection_failure_message, socket_path_for_workspace,
+        startup_log_path_for_socket,
+    };
+    use std::fs;
+
+    #[test]
+    fn socket_path_for_workspace_is_protocol_versioned() {
+        let workspace = std::env::temp_dir().join("raql-daemon-versioned-socket");
+        let socket = socket_path_for_workspace(workspace.as_path());
+        let name = socket
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("socket file name");
+        assert!(
+            name.contains(&format!("v{PROTOCOL_VERSION}")),
+            "socket path should encode protocol version; name={name}"
+        );
+    }
+
+    #[test]
+    fn connection_failure_message_includes_startup_log_contents() {
+        let temp = std::env::temp_dir().join(format!("raql-daemon-log-test-{}", std::process::id()));
+        let socket = temp.join("daemon.sock");
+        let log = startup_log_path_for_socket(socket.as_path());
+        if let Some(parent) = log.parent() {
+            fs::create_dir_all(parent).expect("create log parent");
+        }
+        fs::write(&log, "io error: Operation not permitted\nbind failed\n")
+            .expect("write startup log");
+
+        let message = connection_failure_message(socket.as_path(), Some(log.as_path()), None);
+        assert!(message.contains("failed to connect to daemon socket"), "message={message}");
+        assert!(message.contains("Operation not permitted"), "message={message}");
+        assert!(message.contains("bind failed"), "message={message}");
     }
 }
