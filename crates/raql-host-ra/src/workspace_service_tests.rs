@@ -149,6 +149,28 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "omega").
     assert!(second.relations.get("hit").is_some_and(|rows| {
         rows.contains(&vec![RuntimeValue::String("omega".to_string())])
     }));
+    assert!(
+        !second.relations.get("hit").is_some_and(|rows| {
+            rows.contains(&vec![RuntimeValue::String("alpha".to_string())])
+        }),
+        "incremental refresh should drop stale defs after source rewrite"
+    );
+
+    let stale_planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl hit(Name: string).
+hit(Name) :- def(D), def_name(D, Name), contains(Name, "alpha").
+"#,
+    );
+    let stale = service.run_planned(&stale_planned).expect("stale query run");
+    assert!(
+        stale.relations.get("hit").is_none_or(|rows| rows.is_empty()),
+        "stale alpha defs should disappear after incremental rewrite; rows={:?}",
+        stale.relations.get("hit")
+    );
     assert_eq!(
         service.workspace_epoch(),
         initial_epoch,

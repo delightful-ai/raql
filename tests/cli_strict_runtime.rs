@@ -102,6 +102,53 @@ fn lang_run_surfaces_daemon_side_query_failures() {
 }
 
 #[test]
+fn lang_run_surfaces_unsupported_capability_failures() {
+    let work = temp_dir("unsupported_capability");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+
+    let program = work.join("unsupported.raql");
+    fs::write(
+        &program,
+        r#"
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.decl hit().
+hit() :- call_edge(_, _, _, _).
+"#,
+    )
+    .expect("write unsupported query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+        .args([
+            "lang",
+            "run",
+            program.to_str().expect("utf8 query path"),
+            "--rust-file",
+            workspace.to_str().expect("utf8 workspace path"),
+        ])
+        .output()
+        .expect("run raql binary");
+
+    assert!(
+        !output.status.success(),
+        "unsupported capabilities should exit non-zero; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("call_edge"),
+        "stderr should name the unsupported capability; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("unsupported") || stderr.contains("missing"),
+        "stderr should describe explicit capability rejection; stderr={stderr}"
+    );
+}
+
+#[test]
 fn dev_run_direct_is_not_a_supported_cli_command() {
     let work = temp_dir("dev_run_direct_removed");
     let query = work.join("query.raql");

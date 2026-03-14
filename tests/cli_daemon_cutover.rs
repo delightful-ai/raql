@@ -234,3 +234,65 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "beta").
     assert!(second_stdout.contains("daemon: warm"), "stdout={second_stdout}");
     assert!(second_stdout.contains("beta"), "stdout={second_stdout}");
 }
+
+#[test]
+fn lang_run_refreshes_visible_defs_after_incremental_source_edits() {
+    let work = temp_dir("incremental_refresh");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+    fs::write(workspace.join("src/lib.rs"), "pub fn alpha_only_marker() {}\n").expect("write initial lib.rs");
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl visible(Name: string).
+visible(Name) :- def(D), is_fn(D), def_name(D, Name).
+"#,
+    )
+    .expect("write query");
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_raql"))
+            .args([
+                "lang",
+                "run",
+                query.to_str().expect("utf8 query"),
+                "--rust-file",
+                workspace.to_str().expect("utf8 workspace"),
+                "--include-dir",
+                env!("CARGO_MANIFEST_DIR"),
+            ])
+            .output()
+            .expect("run raql")
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "first daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first_stdout.contains("daemon: cold"), "stdout={first_stdout}");
+    assert!(first_stdout.contains("alpha_only_marker"), "stdout={first_stdout}");
+
+    fs::write(workspace.join("src/lib.rs"), "pub fn omega_only_marker() {}\n").expect("rewrite lib.rs");
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "second daemon-backed run should succeed after source edit; stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second_stdout.contains("daemon: warm"), "stdout={second_stdout}");
+    assert!(second_stdout.contains("omega_only_marker"), "stdout={second_stdout}");
+    assert!(
+        !second_stdout.contains("alpha_only_marker"),
+        "warm daemon run should not retain stale defs after incremental edit; stdout={second_stdout}"
+    );
+}
