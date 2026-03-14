@@ -5,9 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
 
-use ide::{Analysis, AnalysisHost};
 use line_index::LineIndex;
 use raql_engine::{EngineHostError, EngineHostView, HostValueKind, RuntimeValue};
 use raql_host::HostRuntime;
@@ -20,17 +18,12 @@ mod workspace_loader;
 mod capability;
 mod lazy_runtime;
 mod workspace_service;
-mod workspace_snapshot;
 
 pub use raql_host::{
     CallId, CapabilityId, CapabilitySet, DefId, ImplId, NodeId, RefId, RuntimeScalarOptions,
     ScalarInputKey, SpanCoord, SpanId, SpanKey, StableHandle, TypeRefId, WorldStamp,
 };
 pub use raql_ir::{ScalarValue, StableId};
-
-pub mod legacy {
-    pub use super::LegacyRaHostRuntime;
-}
 
 pub mod daemon {
     pub use super::workspace_service::WorkspaceService as DaemonWorkspace;
@@ -1668,291 +1661,6 @@ impl DeterministicRaHost {
     }
 }
 
-/// rust-analyzer-backed runtime adapter with explicit workspace reload,
-/// delegating host-contract behavior to [`DeterministicRaHost`].
-// TODO(ra-daemon-cutover): move this eager snapshot runtime into an explicit
-// internal/legacy module and remove it once the remaining legacy tests and
-// bring-up workflows are migrated onto daemon-backed helpers.
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct LegacyRaHostRuntime {
-    analysis: Analysis,
-    host: DeterministicRaHost,
-    _proc_macro_client: Option<Box<dyn workspace_loader::ProcMacroClientHandle>>,
-    workspace_root: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
-}
-
-impl LegacyRaHostRuntime {
-    pub(crate) fn new(analysis: Analysis, world_stamp: impl Into<WorldStamp>) -> Self {
-        let mut host = DeterministicRaHost::new();
-        host.set_world_stamp(world_stamp);
-        Self {
-            analysis,
-            host,
-            _proc_macro_client: None,
-            workspace_root: None,
-            manifest_path: None,
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn from_workspace_root(root: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_workspace_root(root.as_ref())?;
-        Self::from_loaded_workspace(loaded)
-    }
-
-    #[doc(hidden)]
-    pub fn from_workspace_root_no_deps(root: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_workspace_root_no_deps(root.as_ref())?;
-        Self::from_loaded_workspace(loaded)
-    }
-
-    #[doc(hidden)]
-    pub fn from_manifest_path(manifest: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_manifest_path(manifest.as_ref())?;
-        Self::from_loaded_workspace(loaded)
-    }
-
-    #[doc(hidden)]
-    pub fn from_manifest_path_no_deps(
-        manifest: impl AsRef<Path>,
-    ) -> Result<Self, RaHostInitError> {
-        let loaded = workspace_loader::load_from_manifest_path_no_deps(manifest.as_ref())?;
-        Self::from_loaded_workspace(loaded)
-    }
-
-    fn from_loaded_workspace(
-        loaded: workspace_loader::LoadedWorkspace,
-    ) -> Result<Self, RaHostInitError> {
-        let workspace_loader::LoadedWorkspace {
-            manifest_path,
-            workspace_root,
-            fast_mode,
-            db,
-            vfs,
-            init_notes,
-            proc_macro_client,
-        } = loaded;
-        let host =
-            workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path(), fast_mode)?;
-        let world_stamp =
-            HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
-                details: err.to_string(),
-            })?;
-        let analysis = AnalysisHost::with_database(db).analysis();
-        let mut runtime = Self::new(analysis, world_stamp);
-        runtime.host = host;
-        runtime._proc_macro_client = proc_macro_client;
-        runtime.workspace_root = Some(workspace_root.clone());
-        runtime.manifest_path = Some(manifest_path);
-        for note in init_notes {
-            runtime.host.record_runtime_note(note);
-        }
-        Ok(runtime)
-    }
-
-    fn analysis(&self) -> &Analysis {
-        &self.analysis
-    }
-
-    fn host(&self) -> &DeterministicRaHost {
-        &self.host
-    }
-
-    fn host_mut(&mut self) -> &mut DeterministicRaHost {
-        &mut self.host
-    }
-
-    pub fn analysis_status_ok(&self) -> bool {
-        self.analysis().status(None).is_ok()
-    }
-
-    #[doc(hidden)]
-    pub fn reload_now(&mut self) -> Result<(), RaHostInitError> {
-        let loaded = self.load_workspace_for_reload()?;
-        self.apply_loaded_workspace(loaded)?;
-        Ok(())
-    }
-
-    fn load_workspace_for_reload(
-        &self,
-    ) -> Result<workspace_loader::LoadedWorkspace, RaHostInitError> {
-        if let Some(manifest_path) = self.manifest_path.as_ref() {
-            return workspace_loader::load_from_manifest_path(manifest_path.as_path());
-        }
-        if let Some(workspace_root) = self.workspace_root.as_ref() {
-            return workspace_loader::load_from_workspace_root(workspace_root.as_path());
-        }
-        Err(RaHostInitError::SemanticBuild {
-            details: "runtime reload unavailable without workspace initialization context"
-                .to_string(),
-        })
-    }
-
-    fn apply_loaded_workspace(
-        &mut self,
-        loaded: workspace_loader::LoadedWorkspace,
-    ) -> Result<(), RaHostInitError> {
-        let runtime_scalar_options = self.host.runtime_scalar_options;
-        let scalar_inputs = self.host.scalar_inputs.clone();
-        let stable_overrides = self.host.stable_overrides.clone();
-        let control_max_depth = self.host.control_max_depth;
-        let runtime_notes = self.host.runtime_notes.clone();
-
-        let workspace_loader::LoadedWorkspace {
-            manifest_path,
-            workspace_root,
-            fast_mode,
-            db,
-            vfs,
-            init_notes,
-            proc_macro_client,
-        } = loaded;
-
-        let mut host =
-            workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path(), fast_mode)?;
-        let _ = HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
-            details: err.to_string(),
-        })?;
-        host.runtime_scalar_options = runtime_scalar_options;
-        host.scalar_inputs = scalar_inputs;
-        host.stable_overrides = stable_overrides;
-        host.control_max_depth = control_max_depth;
-        host.runtime_notes = runtime_notes;
-        for note in init_notes {
-            host.record_runtime_note(note);
-        }
-
-        self.analysis = AnalysisHost::with_database(db).analysis();
-        self.host = host;
-        self._proc_macro_client = proc_macro_client;
-        self.workspace_root = Some(workspace_root.clone());
-        self.manifest_path = Some(manifest_path);
-        Ok(())
-    }
-
-    pub fn insert_handle(&mut self, def: DefId, handle: impl Into<StableHandle>) {
-        self.host_mut().insert_handle(def, handle);
-    }
-
-    pub fn insert_type(&mut self, type_ref: TypeRefId, shape: TypeShape) {
-        self.host_mut().insert_type(type_ref, shape);
-    }
-
-    pub fn insert_span(&mut self, span: SpanId, key: SpanKey) {
-        self.host_mut().insert_span(span, key);
-    }
-
-    pub fn insert_node(
-        &mut self,
-        node: NodeId,
-        kind: NodeKind,
-        span: SpanId,
-        parent: Option<NodeId>,
-    ) {
-        self.host_mut().insert_node(node, kind, span, parent);
-    }
-
-    pub fn set_world_stamp(&mut self, stamp: impl Into<WorldStamp>) {
-        self.host_mut().set_world_stamp(stamp);
-    }
-
-    pub fn set_runtime_scalar_options(&mut self, options: RuntimeScalarOptions) {
-        self.host_mut().set_runtime_scalar_options(options);
-    }
-
-    pub fn insert_scalar_input(&mut self, key: ScalarInputKey, value: ScalarValue) {
-        self.host_mut().insert_scalar_input(key, value);
-    }
-
-    pub fn insert_stable_id_override(
-        &mut self,
-        namespace: impl Into<String>,
-        logical_name: impl Into<String>,
-        id: StableId,
-    ) {
-        self.host_mut()
-            .insert_stable_id_override(namespace, logical_name, id);
-    }
-
-    pub fn intern_typeref_from_token<T: fmt::Debug>(&mut self, token: &T) -> TypeRefId {
-        self.host_mut().intern_typeref_from_token(token)
-    }
-
-    pub fn intern_node_from_syntax_ptr(&mut self, node: SyntaxNodePtr) -> NodeId {
-        self.host_mut().intern_node_from_syntax_ptr(node)
-    }
-
-    pub fn intern_ref_from_token<T: fmt::Debug>(&mut self, token: &T) -> RefId {
-        self.host_mut().intern_ref_from_token(token)
-    }
-
-    pub fn intern_span_from_text(
-        &mut self,
-        file_id: EditionedFileId,
-        rel_path: impl Into<Box<str>>,
-        source_text: &str,
-        range: TextRange,
-    ) -> Result<SpanId, RaHostError> {
-        self.host_mut()
-            .intern_span_from_text(file_id, rel_path, source_text, range)
-    }
-
-    pub fn parse_rust_and_intern_root_node(&mut self, text: &str, edition: Edition) -> NodeId {
-        self.host_mut()
-            .parse_rust_and_intern_root_node(text, edition)
-    }
-}
-
-impl HostRuntime for LegacyRaHostRuntime {
-    type Error = RaHostError;
-
-    fn stable_id(&self, namespace: &str, logical_name: &str) -> Result<StableId, Self::Error> {
-        self.host().stable_id(namespace, logical_name)
-    }
-
-    fn world_stamp(&self) -> Result<WorldStamp, Self::Error> {
-        self.host().world_stamp()
-    }
-
-    fn handle(&self, def: DefId) -> Result<StableHandle, Self::Error> {
-        self.host().handle(def)
-    }
-
-    fn span_key(&self, span: SpanId) -> Result<SpanKey, Self::Error> {
-        self.host().span_key(span)
-    }
-
-    fn typeref_id(&self, type_ref: TypeRefId) -> Result<StableHandle, Self::Error> {
-        Ok(self.host().typeref_id(type_ref))
-    }
-
-    fn node_id(&self, node: NodeId) -> Result<StableHandle, Self::Error> {
-        Ok(self.host().node_id(node))
-    }
-
-    fn call_id(&self, call: CallId) -> Result<StableHandle, Self::Error> {
-        self.host().call_id(call)
-    }
-
-    fn ref_id(&self, r#ref: RefId) -> Result<StableHandle, Self::Error> {
-        self.host().ref_id(r#ref)
-    }
-
-    fn impl_id(&self, r#impl: ImplId) -> Result<StableHandle, Self::Error> {
-        self.host().impl_id(r#impl)
-    }
-
-    fn runtime_scalar_options(&self) -> Result<RuntimeScalarOptions, Self::Error> {
-        self.host().runtime_scalar_options()
-    }
-
-    fn scalar_input(&self, key: &ScalarInputKey) -> Result<Option<ScalarValue>, Self::Error> {
-        self.host().scalar_input(key)
-    }
-}
-
 impl EngineHostView for DeterministicRaHost {
     fn world_stamp(&mut self) -> String {
         match HostRuntime::world_stamp(self) {
@@ -1982,45 +1690,6 @@ impl EngineHostView for DeterministicRaHost {
         predicate: &str,
     ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
         self.extern_relation_rows_for_predicate_result(predicate)
-            .map_err(|error| {
-                EngineHostError::new(
-                    "ra_host.extern_relation_rows_for_predicate",
-                    error.to_string(),
-                )
-            })
-    }
-}
-
-impl EngineHostView for LegacyRaHostRuntime {
-    fn world_stamp(&mut self) -> String {
-        match HostRuntime::world_stamp(self) {
-            Ok(stamp) => stamp.as_str().to_string(),
-            Err(err) => format!("ra-host:error:{err}"),
-        }
-    }
-
-    fn stable_key(&mut self, value: &RuntimeValue) -> String {
-        let resolution = runtime_value_stable_key_with_runtime(self, value);
-        for note in resolution.runtime_notes {
-            self.host_mut().record_runtime_note(note);
-        }
-        resolution.key
-    }
-
-    fn take_runtime_notes(&mut self) -> Vec<String> {
-        self.host_mut().drain_runtime_notes()
-    }
-
-    fn set_control_max_depth(&mut self, depth: i64) {
-        self.host_mut().set_control_max_depth(depth.max(0) as u32);
-    }
-
-    fn extern_relation_rows(
-        &mut self,
-        predicate: &str,
-    ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
-        self.host_mut()
-            .extern_relation_rows_for_predicate_result(predicate)
             .map_err(|error| {
                 EngineHostError::new(
                     "ra_host.extern_relation_rows_for_predicate",
@@ -2544,40 +2213,11 @@ fn coord_leq(a: SpanCoord, b: SpanCoord) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{DeterministicRaHost, RaHostError, LegacyRaHostRuntime};
+    use super::{DeterministicRaHost, RaHostError};
     use raql_engine::{EngineHostView, HostValueKind, RuntimeValue};
-    use raql_host::{HostRuntime, RuntimeScalarOptions, ScalarInputKey, WorldStamp};
+    use raql_host::{HostRuntime, RuntimeScalarOptions, ScalarInputKey};
     use raql_ir::{ScalarValue, StableId};
-    use span::{TextRange, TextSize};
-
-    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_workspace(package_name: &str, lib_rs: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "raql-host-ra-lib-test-{package_name}-{}-{:#x}",
-            std::process::id(),
-            TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("src")).expect("create temp workspace src dir");
-        fs::write(
-            root.join("Cargo.toml"),
-            format!(
-                r#"[package]
-name = "{package_name}"
-version = "0.0.0"
-edition = "2021"
-"#
-            ),
-        )
-        .expect("write temp Cargo.toml");
-        fs::write(root.join("src/lib.rs"), lib_rs).expect("write temp src/lib.rs");
-        root
-    }
 
     fn injected_lookup_error() -> RaHostError {
         RaHostError::InvalidSpanRange {
@@ -2672,35 +2312,6 @@ edition = "2021"
                 .into_iter()
                 .collect()
         }
-    }
-
-    #[test]
-    fn ra_runtime_exposes_analysis_snapshot() {
-        let root = temp_workspace("runtime_snapshot", "pub fn marker() -> i32 { 1 }\n");
-        let runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
-        assert!(
-            runtime
-                .world_stamp()
-                .expect("stamp")
-                .as_str()
-                .starts_with("ra-workspace:")
-        );
-        assert!(runtime.analysis_status_ok());
-    }
-
-    #[test]
-    fn span_registration_uses_ra_span_text_range() {
-        let root = temp_workspace("span_registration", "pub fn marker() {}\n");
-        let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
-        let file = span::EditionedFileId::current_edition(vfs::FileId::from_raw(0));
-        let range = TextRange::new(TextSize::from(0), TextSize::from(9));
-        let span = runtime
-            .intern_span_from_text(file, "src/main.rs", "fn main() {\n  let x = 1;\n}\n", range)
-            .expect("span");
-        let key = runtime.span_key(span).expect("span key");
-        assert_eq!(key.rel_path(), "src/main.rs");
-        assert_eq!(key.start().line(), 0);
-        assert_eq!(key.end().line(), 0);
     }
 
     #[test]
@@ -2899,44 +2510,4 @@ edition = "2021"
         assert!(key.rel_path().contains("/fallback/"));
     }
 
-    #[test]
-    fn scalar_options_and_inputs_are_reported() {
-        let root = temp_workspace("scalar_options", "pub fn marker() {}\n");
-        let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
-        runtime.set_runtime_scalar_options(
-            RuntimeScalarOptions::new()
-                .with_path_limit(7)
-                .with_path_max_depth(11)
-                .with_max_iters(256),
-        );
-        runtime.set_world_stamp(WorldStamp::new("cfg:test"));
-
-        let source = StableId::new(9);
-        let key = ScalarInputKey::new(source, "path_limit");
-        runtime.insert_scalar_input(key.clone(), ScalarValue::I64(7));
-
-        assert_eq!(
-            runtime.runtime_scalar_options().expect("opts").path_limit(),
-            Some(7)
-        );
-        assert_eq!(
-            runtime.scalar_input(&key).expect("scalar"),
-            Some(ScalarValue::I64(7))
-        );
-        assert_eq!(runtime.world_stamp().expect("stamp").as_str(), "cfg:test");
-    }
-
-    #[test]
-    fn reload_now_fails_without_workspace_initialization_context() {
-        let root = temp_workspace("reload_missing_context", "pub fn marker() {}\n");
-        let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
-        runtime.workspace_root = None;
-        runtime.manifest_path = None;
-
-        let err = runtime
-            .reload_now()
-            .expect_err("reload should fail without context");
-        assert!(matches!(err, super::RaHostInitError::SemanticBuild { .. }));
-        assert!(err.to_string().contains("reload unavailable"));
-    }
 }
