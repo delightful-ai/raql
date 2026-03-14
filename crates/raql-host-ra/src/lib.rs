@@ -17,13 +17,24 @@ use syntax::{AstNode, Edition, SourceFile, SyntaxNodePtr};
 use thiserror::Error;
 
 mod workspace_loader;
+mod capability;
+mod lazy_runtime;
+mod workspace_service;
 mod workspace_snapshot;
 
 pub use raql_host::{
-    CallId, DefId, ImplId, NodeId, RefId, RuntimeScalarOptions, ScalarInputKey, SpanCoord, SpanId,
-    SpanKey, StableHandle, TypeRefId, WorldStamp,
+    CallId, CapabilityId, CapabilitySet, DefId, ImplId, NodeId, RefId, RuntimeScalarOptions,
+    ScalarInputKey, SpanCoord, SpanId, SpanKey, StableHandle, TypeRefId, WorldStamp,
 };
 pub use raql_ir::{ScalarValue, StableId};
+// TODO(ra-daemon-cutover): stop re-exporting WorkspaceService from the crate
+// root once the daemon owns the supported execution boundary end-to-end.
+#[doc(hidden)]
+pub use workspace_service::{WorkspaceService, resolve_workspace_root};
+
+pub mod legacy {
+    pub use super::LegacyRaHostRuntime;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Mutability {
@@ -113,6 +124,8 @@ pub struct EnclosingControl {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RaHostError {
+    #[error("workspace service initialization failed: {details}")]
+    InitFailure { details: String },
     #[error(
         "span range {start}..{end} is invalid for source text of {len} bytes (source: {rel_path})"
     )]
@@ -132,6 +145,14 @@ pub enum RaHostInitError {
     WorkspaceLoad { manifest: String, details: String },
     #[error("failed to build semantic workspace snapshot: {details}")]
     SemanticBuild { details: String },
+}
+
+impl From<RaHostInitError> for RaHostError {
+    fn from(value: RaHostInitError) -> Self {
+        Self::InitFailure {
+            details: value.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1643,8 +1664,12 @@ impl DeterministicRaHost {
 
 /// rust-analyzer-backed runtime adapter with explicit workspace reload,
 /// delegating host-contract behavior to [`DeterministicRaHost`].
+// TODO(ra-daemon-cutover): move this eager snapshot runtime into an explicit
+// internal/legacy module and remove it once the remaining legacy tests and
+// bring-up workflows are migrated onto daemon-backed helpers.
+#[doc(hidden)]
 #[derive(Debug)]
-pub struct RaHostRuntime {
+pub struct LegacyRaHostRuntime {
     analysis: Analysis,
     host: DeterministicRaHost,
     _proc_macro_client: Option<Box<dyn workspace_loader::ProcMacroClientHandle>>,
@@ -1652,7 +1677,7 @@ pub struct RaHostRuntime {
     manifest_path: Option<PathBuf>,
 }
 
-impl RaHostRuntime {
+impl LegacyRaHostRuntime {
     pub(crate) fn new(analysis: Analysis, world_stamp: impl Into<WorldStamp>) -> Self {
         let mut host = DeterministicRaHost::new();
         host.set_world_stamp(world_stamp);
@@ -1665,13 +1690,29 @@ impl RaHostRuntime {
         }
     }
 
+    #[doc(hidden)]
     pub fn from_workspace_root(root: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
         let loaded = workspace_loader::load_from_workspace_root(root.as_ref())?;
         Self::from_loaded_workspace(loaded)
     }
 
+    #[doc(hidden)]
+    pub fn from_workspace_root_no_deps(root: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
+        let loaded = workspace_loader::load_from_workspace_root_no_deps(root.as_ref())?;
+        Self::from_loaded_workspace(loaded)
+    }
+
+    #[doc(hidden)]
     pub fn from_manifest_path(manifest: impl AsRef<Path>) -> Result<Self, RaHostInitError> {
         let loaded = workspace_loader::load_from_manifest_path(manifest.as_ref())?;
+        Self::from_loaded_workspace(loaded)
+    }
+
+    #[doc(hidden)]
+    pub fn from_manifest_path_no_deps(
+        manifest: impl AsRef<Path>,
+    ) -> Result<Self, RaHostInitError> {
+        let loaded = workspace_loader::load_from_manifest_path_no_deps(manifest.as_ref())?;
         Self::from_loaded_workspace(loaded)
     }
 
@@ -1681,12 +1722,14 @@ impl RaHostRuntime {
         let workspace_loader::LoadedWorkspace {
             manifest_path,
             workspace_root,
+            fast_mode,
             db,
             vfs,
             init_notes,
             proc_macro_client,
         } = loaded;
-        let host = workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
+        let host =
+            workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path(), fast_mode)?;
         let world_stamp =
             HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
                 details: err.to_string(),
@@ -1719,6 +1762,7 @@ impl RaHostRuntime {
         self.analysis().status(None).is_ok()
     }
 
+    #[doc(hidden)]
     pub fn reload_now(&mut self) -> Result<(), RaHostInitError> {
         let loaded = self.load_workspace_for_reload()?;
         self.apply_loaded_workspace(loaded)?;
@@ -1753,6 +1797,7 @@ impl RaHostRuntime {
         let workspace_loader::LoadedWorkspace {
             manifest_path,
             workspace_root,
+            fast_mode,
             db,
             vfs,
             init_notes,
@@ -1760,7 +1805,7 @@ impl RaHostRuntime {
         } = loaded;
 
         let mut host =
-            workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path())?;
+            workspace_snapshot::build_host_snapshot(&db, &vfs, workspace_root.as_path(), fast_mode)?;
         let _ = HostRuntime::world_stamp(&host).map_err(|err| RaHostInitError::SemanticBuild {
             details: err.to_string(),
         })?;
@@ -1854,7 +1899,7 @@ impl RaHostRuntime {
     }
 }
 
-impl HostRuntime for RaHostRuntime {
+impl HostRuntime for LegacyRaHostRuntime {
     type Error = RaHostError;
 
     fn stable_id(&self, namespace: &str, logical_name: &str) -> Result<StableId, Self::Error> {
@@ -1940,7 +1985,7 @@ impl EngineHostView for DeterministicRaHost {
     }
 }
 
-impl EngineHostView for RaHostRuntime {
+impl EngineHostView for LegacyRaHostRuntime {
     fn world_stamp(&mut self) -> String {
         match HostRuntime::world_stamp(self) {
             Ok(stamp) => stamp.as_str().to_string(),
@@ -2040,6 +2085,7 @@ fn fallback_def_handle(def: DefId) -> StableHandle {
 
 fn error_provenance(error: &RaHostError) -> String {
     match error {
+        RaHostError::InitFailure { details } => format!("init_failure:{details}"),
         RaHostError::InvalidSpanRange {
             rel_path,
             start,
@@ -2283,6 +2329,7 @@ fn stable_key_hint(kind: HostValueKind, id: u64) -> String {
 
 fn runtime_error_source_hint(error: &RaHostError) -> String {
     match error {
+        RaHostError::InitFailure { details } => format!("workspace service error: {details}"),
         RaHostError::InvalidSpanRange {
             rel_path,
             start,
@@ -2495,7 +2542,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{DeterministicRaHost, RaHostError, RaHostRuntime};
+    use super::{DeterministicRaHost, RaHostError, LegacyRaHostRuntime};
     use raql_engine::{EngineHostView, HostValueKind, RuntimeValue};
     use raql_host::{HostRuntime, RuntimeScalarOptions, ScalarInputKey, WorldStamp};
     use raql_ir::{ScalarValue, StableId};
@@ -2624,7 +2671,7 @@ edition = "2021"
     #[test]
     fn ra_runtime_exposes_analysis_snapshot() {
         let root = temp_workspace("runtime_snapshot", "pub fn marker() -> i32 { 1 }\n");
-        let runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
+        let runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
         assert!(
             runtime
                 .world_stamp()
@@ -2638,7 +2685,7 @@ edition = "2021"
     #[test]
     fn span_registration_uses_ra_span_text_range() {
         let root = temp_workspace("span_registration", "pub fn marker() {}\n");
-        let mut runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
+        let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
         let file = span::EditionedFileId::current_edition(vfs::FileId::from_raw(0));
         let range = TextRange::new(TextSize::from(0), TextSize::from(9));
         let span = runtime
@@ -2849,7 +2896,7 @@ edition = "2021"
     #[test]
     fn scalar_options_and_inputs_are_reported() {
         let root = temp_workspace("scalar_options", "pub fn marker() {}\n");
-        let mut runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
+        let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
         runtime.set_runtime_scalar_options(
             RuntimeScalarOptions::new()
                 .with_path_limit(7)
@@ -2876,7 +2923,7 @@ edition = "2021"
     #[test]
     fn reload_now_fails_without_workspace_initialization_context() {
         let root = temp_workspace("reload_missing_context", "pub fn marker() {}\n");
-        let mut runtime = RaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
+        let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_path()).expect("runtime");
         runtime.workspace_root = None;
         runtime.manifest_path = None;
 

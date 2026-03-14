@@ -2,11 +2,16 @@ use camino::Utf8PathBuf;
 use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::{EvalStatus, RuntimeValue, execute};
 use raql_host::{DefId, NodeId, SpanCoord, SpanId, SpanKey, TypeRefId};
-use raql_host_ra::{GenericArg, NodeKind, RaHostRuntime, TypeShape};
+use raql_host_ra::legacy::LegacyRaHostRuntime;
+use raql_host_ra::{GenericArg, NodeKind, TypeShape};
 use raql_ir::StableId;
 use raql_syntax::parse_program;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// TODO(ra-daemon-cutover): migrate this file off the eager direct runtime and
+// onto explicit daemon-backed or host-fixture coverage, then remove the legacy
+// runtime dependency entirely.
 
 fn temp_workspace_root(label: &str) -> Utf8PathBuf {
     let stamp = SystemTime::now()
@@ -38,7 +43,7 @@ edition = "2021"
 #[test]
 fn engine_dispatches_required_ra_extern_predicates() {
     let root = temp_workspace_root("extern_rows");
-    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
 
     let tr = TypeRefId::new(StableId::new(0x100));
     let arg = TypeRefId::new(StableId::new(0x101));
@@ -117,9 +122,9 @@ node_row(RelPath, Kind) :-
     }));
 }
 
-fn seeded_runtime_for_enclosing_control() -> RaHostRuntime {
+fn seeded_runtime_for_enclosing_control() -> LegacyRaHostRuntime {
     let root = temp_workspace_root("enclosing_control");
-    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
 
     let query_span = SpanId::new(StableId::new(0x500));
     let expr_span = SpanId::new(StableId::new(0x501));

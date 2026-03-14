@@ -94,6 +94,86 @@ impl From<String> for WorldStamp {
     }
 }
 
+/// Stable identifier for a backend capability exposed to the planner/runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CapabilityId(Box<str>);
+
+impl CapabilityId {
+    /// Creates a new capability identifier.
+    pub fn new(value: impl Into<Box<str>>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the capability identifier as text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for CapabilityId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for CapabilityId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Supported/required capability collection.
+pub type CapabilitySet = std::collections::BTreeSet<CapabilityId>;
+
+/// Planning-time error raised when a query requires unsupported backend capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported rust-analyzer runtime capabilities: {missing}")]
+pub struct MissingCapabilitiesError {
+    missing: String,
+}
+
+impl MissingCapabilitiesError {
+    /// Returns an error when `required - supported` is non-empty.
+    pub fn from_required_and_supported(
+        required: impl IntoIterator<Item = CapabilityId>,
+        supported: CapabilitySet,
+    ) -> Result<(), Self> {
+        let missing = required
+            .into_iter()
+            .filter(|cap| !supported.contains(cap))
+            .map(|cap| cap.as_str().to_string())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(Self {
+            missing: missing.join(", "),
+        })
+    }
+}
+
+/// Returns whether the extern is runtime-scalar input state injected by the engine.
+pub fn is_runtime_scalar_input_predicate(predicate: &str) -> bool {
+    matches!(
+        predicate,
+        "path_limit" | "path_max_depth" | "control_max_depth" | "opt_max_iters"
+    )
+}
+
+/// Returns whether the extern is implemented directly inside the engine.
+pub fn is_engine_managed_extern(predicate: &str) -> bool {
+    matches!(
+        predicate,
+        "contains"
+            | "starts_with"
+            | "fmt"
+            | "coalesce"
+            | "witness_path"
+            | "path_hop"
+            | "world_stamp"
+    )
+}
+
 macro_rules! stable_entity_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*

@@ -11,8 +11,9 @@ use petgraph::{
     algo::toposort,
     graph::{DiGraph, NodeIndex},
 };
+use raql_host::{is_engine_managed_extern, is_runtime_scalar_input_predicate};
 use raql_syntax::{
-    AggregateName, AstPhase, Constraint, DeclAttr, DeclarationKind, Directive, Expr, Goal,
+    AggregateName, AstPhase, Atom, Constraint, DeclAttr, DeclarationKind, Directive, Expr, Goal,
     ModeDirection, Program, RelOp, Rule, Spanned, SrcSpan, Stmt, Term, TypeAst,
 };
 use thiserror::Error;
@@ -344,6 +345,104 @@ impl PlannedProgram {
     pub fn sccs(&self) -> &[SccPlan] {
         &self.sccs
     }
+}
+
+pub fn required_extern_capabilities(program: &PlannedProgram) -> BTreeSet<String> {
+    let mut required = BTreeSet::new();
+    let root_file = program
+        .source_map()
+        .files()
+        .first()
+        .map(|file| file.id());
+    let mut agenda = VecDeque::new();
+    let mut seen_predicates = BTreeSet::new();
+
+    for rule in program.planned_rules() {
+        if root_file.is_some_and(|file| rule.typed_rule().rule().span.file != file) {
+            continue;
+        }
+        agenda.push_back(rule.head_predicate().to_string());
+    }
+
+    if let Some(root_file) = root_file {
+        for (name, decl) in program.predicates() {
+            if decl.span.file == root_file && !decl.attrs().contains(&DeclAttr::Extern) {
+                agenda.push_back(name.clone());
+            }
+        }
+    } else {
+        for rule in program.planned_rules() {
+            agenda.push_back(rule.head_predicate().to_string());
+        }
+    }
+
+    while let Some(predicate) = agenda.pop_front() {
+        if !seen_predicates.insert(predicate.clone()) {
+            continue;
+        }
+        for rule in program
+            .planned_rules()
+            .iter()
+            .filter(|rule| rule.head_predicate() == predicate)
+        {
+            collect_required_from_goals(program, rule.typed_rule().goals(), &mut required, &mut agenda);
+        }
+    }
+    required
+}
+
+fn collect_required_from_goals<'a>(
+    program: &PlannedProgram,
+    goals: impl Iterator<Item = &'a Spanned<Goal>>,
+    required: &mut BTreeSet<String>,
+    agenda: &mut VecDeque<String>,
+) {
+    for goal in goals {
+        match &goal.value {
+            Goal::Atom(atom) => collect_required_from_atom(program, atom, required, agenda),
+            Goal::Not(not_goal) => {
+                collect_required_from_atom(program, &not_goal.atom.value, required, agenda)
+            }
+            Goal::Aggregate(aggregate) => {
+                collect_required_from_goals(program, aggregate.goals.iter(), required, agenda);
+            }
+            Goal::ChooseTopK(choose) => {
+                collect_required_from_goals(program, choose.goals.iter(), required, agenda);
+            }
+            Goal::Disjunction(group) => {
+                for branch in &group.branches {
+                    collect_required_from_goals(program, branch.iter(), required, agenda);
+                }
+            }
+            Goal::Constraint(_) => {}
+        }
+    }
+}
+
+fn collect_required_from_atom(
+    program: &PlannedProgram,
+    atom: &Atom,
+    required: &mut BTreeSet<String>,
+    agenda: &mut VecDeque<String>,
+) {
+    let name = atom.name.value.as_str();
+    let Some(decl) = program.predicate_decl(name) else {
+        return;
+    };
+    if !decl.attrs().contains(&DeclAttr::Extern) {
+        if program
+            .planned_rules()
+            .iter()
+            .any(|rule| rule.head_predicate() == name)
+        {
+            agenda.push_back(name.to_string());
+        }
+        return;
+    }
+    if is_engine_managed_extern(name) || is_runtime_scalar_input_predicate(name) {
+        return;
+    }
+    required.insert(name.to_string());
 }
 
 #[derive(Debug, Clone)]
@@ -933,6 +1032,7 @@ pub fn typecheck(mut resolved: ResolvedProgram) -> Result<TypedProgram, DiagBund
     }
 
     validate_graph_edge_contract(&resolved.predicates, &mut diagnostics);
+    validate_reserved_engine_contracts(&resolved.predicates, &mut diagnostics);
 
     for (pred, sigs) in &resolved.modes {
         if let Some(decl) = resolved.predicates.get(pred) {
@@ -1047,6 +1147,122 @@ fn validate_graph_edge_contract(
             .with_help("use the exact required schema from spec §11.2"),
         );
     }
+}
+
+fn validate_reserved_engine_contracts(
+    predicates: &BTreeMap<String, PredicateDecl>,
+    diagnostics: &mut DiagBundle,
+) {
+    for (name, predicate) in predicates {
+        match name.as_str() {
+            "contains" => validate_reserved_predicate_shape(
+                predicate,
+                Some(DeclarationKind::Relation),
+                &[CompilerType::String, CompilerType::String],
+                diagnostics,
+                "`contains/2` must be `.decl contains(Haystack: string, Needle: string) extern.`",
+            ),
+            "starts_with" => validate_reserved_predicate_shape(
+                predicate,
+                Some(DeclarationKind::Relation),
+                &[CompilerType::String, CompilerType::String],
+                diagnostics,
+                "`starts_with/2` must be `.decl starts_with(S: string, Prefix: string) extern.`",
+            ),
+            "fmt" => validate_reserved_predicate_shape(
+                predicate,
+                Some(DeclarationKind::Relation),
+                &[
+                    CompilerType::String,
+                    CompilerType::List(Box::new(CompilerType::String)),
+                    CompilerType::String,
+                ],
+                diagnostics,
+                "`fmt/3` must be `.decl fmt(Format: string, Args: list<string>, Out: string) extern.`",
+            ),
+            "witness_path" => validate_reserved_predicate_shape(
+                predicate,
+                Some(DeclarationKind::Relation),
+                &[
+                    CompilerType::String,
+                    CompilerType::Named("Def".to_string()),
+                    CompilerType::Named("Def".to_string()),
+                    CompilerType::Named("Path".to_string()),
+                ],
+                diagnostics,
+                "`witness_path/4` must be `.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.`",
+            ),
+            "path_hop" => validate_reserved_predicate_shape(
+                predicate,
+                Some(DeclarationKind::Relation),
+                &[
+                    CompilerType::Named("Path".to_string()),
+                    CompilerType::Int,
+                    CompilerType::Named("Def".to_string()),
+                    CompilerType::Named("Def".to_string()),
+                    CompilerType::String,
+                    CompilerType::Named("Span".to_string()),
+                ],
+                diagnostics,
+                "`path_hop/6` must be `.decl path_hop(P: Path, Seq: int, From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.`",
+            ),
+            "world_stamp" => validate_reserved_predicate_shape(
+                predicate,
+                Some(DeclarationKind::Function),
+                &[CompilerType::String],
+                diagnostics,
+                "`world_stamp/1` must be `.func world_stamp(Stamp: string) extern.`",
+            ),
+            "path_limit" | "path_max_depth" | "control_max_depth" => {
+                validate_reserved_predicate_shape(
+                    predicate,
+                    None,
+                    &[CompilerType::Int],
+                    diagnostics,
+                    &format!("`{name}/1` must use exactly one `int` scalar argument"),
+                );
+            }
+            "opt_max_iters" => validate_reserved_predicate_shape(
+                predicate,
+                None,
+                &[CompilerType::Option(Box::new(CompilerType::Int))],
+                diagnostics,
+                "`opt_max_iters/1` must use exactly one `option<int>` scalar argument",
+            ),
+            "coalesce" => {
+                if predicate.kind != DeclarationKind::Function || predicate.args.len() != 3 {
+                    diagnostics.push(
+                        CompilerDiagnostic::error(
+                            "RAQL0406",
+                            "`coalesce/3` is reserved and must be `.func coalesce(Opt: option<T>, Default: T, Out: T) extern.`",
+                            Some(predicate.span),
+                        )
+                        .with_help("use the reserved engine-managed `coalesce/3` signature"),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_reserved_predicate_shape(
+    predicate: &PredicateDecl,
+    expected_kind: Option<DeclarationKind>,
+    expected_args: &[CompilerType],
+    diagnostics: &mut DiagBundle,
+    message: &str,
+) {
+    let shape_ok = expected_kind.is_none_or(|kind| predicate.kind == kind)
+        && predicate.args.len() == expected_args.len()
+        && predicate.args.iter().zip(expected_args.iter()).all(|(lhs, rhs)| lhs == rhs);
+    if shape_ok {
+        return;
+    }
+    diagnostics.push(
+        CompilerDiagnostic::error("RAQL0406", message, Some(predicate.span))
+            .with_help("use the reserved engine-managed schema exactly"),
+    );
 }
 
 pub fn plan(typed: TypedProgram) -> Result<PlannedProgram, DiagBundle> {

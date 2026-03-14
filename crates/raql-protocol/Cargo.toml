@@ -1,5 +1,5 @@
 [package]
-name = "raql-host"
+name = "raql-protocol"
 version = "0.0.0"
 edition = "2024"
 
@@ -7,5 +7,4 @@ edition = "2024"
 doctest = false
 
 [dependencies]
-raql-ir = { path = "../raql-ir" }
-thiserror.workspace = true
+serde.workspace = true

@@ -1,3 +1,5 @@
-fn main() {
-    println!("raql-cli stub");
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    raql_cli::main_entry()
 }

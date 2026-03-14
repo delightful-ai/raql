@@ -1,0 +1,38 @@
+.include "std.raql".
+
+.decl site(Caller: Def, Callee: Def, Dispatch: DispatchKind).
+site(Caller, Callee, Dispatch) :-
+  call_edge(Caller, Callee, Site, Dispatch),
+  span_allowed(Site).
+
+.decl callee_dispatch_counts(
+  Callee: Def,
+  Direct: int,
+  ThroughTrait: int,
+  Dyn: int,
+  Closure: int,
+  FnPtr: int,
+  Total: int
+).
+callee_dispatch_counts(Callee, Direct, ThroughTrait, Dyn, Closure, FnPtr, Total) :-
+  site(_, Callee, _),
+  Direct = count(C : site(C, Callee, DispatchKind::DIRECT)),
+  ThroughTrait = count(C : site(C, Callee, DispatchKind::THROUGH_TRAIT)),
+  Dyn = count(C : site(C, Callee, DispatchKind::DYN)),
+  Closure = count(C : site(C, Callee, DispatchKind::CLOSURE)),
+  FnPtr = count(C : site(C, Callee, DispatchKind::FN_POINTER)),
+  Total = count(C : site(C, Callee, _)).
+
+.decl dispatch_hotspots(
+  CalleePath: string,
+  TotalSites: int,
+  Direct: int,
+  ThroughTrait: int,
+  Dyn: int,
+  Closure: int,
+  FnPtr: int
+) output.
+dispatch_hotspots(CalleePath, TotalSites, Direct, ThroughTrait, Dyn, Closure, FnPtr) :-
+  callee_dispatch_counts(Callee, Direct, ThroughTrait, Dyn, Closure, FnPtr, TotalSites),
+  TotalSites >= 5,
+  def_path(Callee, CalleePath).

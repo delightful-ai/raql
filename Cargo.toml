@@ -13,6 +13,9 @@ members = [
   "crates/raql-ir",
   "crates/raql-host",
   "crates/raql-host-ra",
+  "crates/raql-cli",
+  "crates/raql-protocol",
+  "crates/raql-daemon",
 ]
 default-members = [
   ".",
@@ -22,10 +25,12 @@ default-members = [
   "crates/raql-ir",
   "crates/raql-host",
   "crates/raql-host-ra",
+  "crates/raql-cli",
+  "crates/raql-protocol",
+  "crates/raql-daemon",
 ]
 
 [workspace.dependencies]
-# crates.io utilities
 camino                   = "1.2.1"
 bitflags                 = "2.6.0"
 chumsky                  = "0.9.3"
@@ -43,8 +48,9 @@ smol_str                 = "0.3.2"
 text-size                = "1.1.1"
 thiserror                = "1.0.64"
 line-index               = "0.1.2"
+serde                    = { version = "1.0", features = ["derive"] }
+serde_json               = "1.0"
 
-# rust-analyzer crates (upstream main workspace)
 ide                      = { package = "ide", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 ide-db                   = { package = "ide-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 hir                      = { package = "hir", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
@@ -56,12 +62,4 @@ load-cargo               = { package = "load-cargo", git = "https://github.com/r
 project-model            = { package = "project-model", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 
 [dependencies]
-clap.workspace = true
-camino.workspace = true
-miette.workspace = true
-
-raql-syntax = { path = "crates/raql-syntax" }
-raql-compiler = { path = "crates/raql-compiler" }
-raql-engine = { path = "crates/raql-engine" }
-raql-host = { path = "crates/raql-host" }
-raql-host-ra = { path = "crates/raql-host-ra" }
+raql-cli = { path = "crates/raql-cli" }

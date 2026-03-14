@@ -9,6 +9,7 @@ doctest = false
 [dependencies]
 raql-ir = { path = "../raql-ir" }
 raql-syntax = { path = "../raql-syntax" }
+raql-host = { path = "../raql-host" }
 
 rustc-hash.workspace = true
 smallvec.workspace = true

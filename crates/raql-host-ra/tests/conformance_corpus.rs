@@ -6,9 +6,13 @@ use std::process::Command;
 use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::{EngineHostView, EvalStatus, execute};
 use raql_host::HostRuntime;
-use raql_host_ra::RaHostRuntime;
+use raql_host_ra::legacy::LegacyRaHostRuntime;
 use raql_syntax::parse_program;
 use serde::Deserialize;
+
+// TODO(ra-daemon-cutover): migrate corpus execution away from the eager direct
+// runtime so conformance exercises the same daemon-backed boundary as supported
+// user execution.
 
 #[derive(Debug, Deserialize)]
 struct CorpusManifest {
@@ -104,7 +108,7 @@ fn conformance_corpus_runtime_gate() {
 
     for case in &manifest.case {
         let workspace = resolve_case_workspace(case, &repo_root, &cache_root);
-        let mut runtime = RaHostRuntime::from_workspace_root(workspace.as_path()).unwrap_or_else(|err| {
+        let mut runtime = LegacyRaHostRuntime::from_workspace_root(workspace.as_path()).unwrap_or_else(|err| {
             panic!(
                 "failed to initialize conformance case `{}` at `{}`: {err}",
                 case.name,

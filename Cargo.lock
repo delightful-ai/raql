@@ -1761,13 +1761,21 @@ dependencies = [
 name = "raql"
 version = "0.1.0"
 dependencies = [
+ "raql-cli",
+]
+
+[[package]]
+name = "raql-cli"
+version = "0.0.0"
+dependencies = [
  "camino",
  "clap",
- "miette",
  "raql-compiler",
+ "raql-daemon",
  "raql-engine",
  "raql-host",
  "raql-host-ra",
+ "raql-protocol",
  "raql-syntax",
 ]
 
@@ -1781,10 +1789,26 @@ dependencies = [
  "index_vec",
  "miette",
  "petgraph 0.6.5",
+ "raql-host",
  "raql-ir",
  "raql-syntax",
  "rustc-hash 1.1.0",
  "smallvec",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "raql-daemon"
+version = "0.0.0"
+dependencies = [
+ "camino",
+ "raql-compiler",
+ "raql-engine",
+ "raql-host",
+ "raql-host-ra",
+ "raql-protocol",
+ "raql-syntax",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 
@@ -1807,6 +1831,7 @@ name = "raql-host"
 version = "0.0.0"
 dependencies = [
  "raql-ir",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1843,6 +1868,13 @@ dependencies = [
  "miette",
  "rustc-hash 1.1.0",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "raql-protocol"
+version = "0.0.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

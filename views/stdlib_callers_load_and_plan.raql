@@ -1,0 +1,20 @@
+.include "std.raql".
+
+.decl target(T: Def).
+target(T) :-
+  def_name(T, "load_and_plan"),
+  is_fn(T).
+
+.decl caller_stats(Caller: Def, Sites: int, Direct: int, ThroughTrait: int, Dyn: int).
+caller_stats(Caller, Sites, Direct, ThroughTrait, Dyn) :-
+  target(Target),
+  caller(Target, Caller, _, _),
+  Sites = count(S : caller(Target, Caller, S, _)),
+  Direct = count(S : caller(Target, Caller, S, DispatchKind::DIRECT)),
+  ThroughTrait = count(S : caller(Target, Caller, S, DispatchKind::THROUGH_TRAIT)),
+  Dyn = count(S : caller(Target, Caller, S, DispatchKind::DYN)).
+
+.decl caller_report(CallerPath: string, Sites: int, Direct: int, ThroughTrait: int, Dyn: int) output.
+caller_report(CallerPath, Sites, Direct, ThroughTrait, Dyn) :-
+  caller_stats(Caller, Sites, Direct, ThroughTrait, Dyn),
+  def_path(Caller, CallerPath).

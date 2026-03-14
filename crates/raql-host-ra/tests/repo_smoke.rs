@@ -2,10 +2,14 @@ use camino::Utf8PathBuf;
 use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::{EvalStatus, RuntimeValue, execute};
 use raql_host::HostRuntime;
-use raql_host_ra::RaHostRuntime;
+use raql_host_ra::legacy::LegacyRaHostRuntime;
 use raql_syntax::{IncludeLoader, parse_program};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// TODO(ra-daemon-cutover): migrate these snapshot smoke tests to the supported
+// daemon-backed/runtime-service surface and delete the eager direct-runtime
+// path they currently exercise.
 
 fn repo_root() -> Utf8PathBuf {
     let manifest_dir = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -64,7 +68,7 @@ pub fn caller() {
 "#,
     );
 
-    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     assert!(runtime.analysis_status_ok());
     let stamp = HostRuntime::world_stamp(&runtime)
         .expect("world stamp")
@@ -153,7 +157,7 @@ has_edge() :- call_edge(_, _, _, _).
     let planned = plan(typed).expect("plan");
 
     let mut runtime =
-        RaHostRuntime::from_workspace_root(workspace_root.as_std_path()).expect("runtime");
+        LegacyRaHostRuntime::from_workspace_root(workspace_root.as_std_path()).expect("runtime");
     let result = execute(&planned, &mut runtime);
 
     if result.status != EvalStatus::Ok {
@@ -234,7 +238,7 @@ hit() :-
     let typed = typecheck(resolved).expect("typecheck");
     let planned = plan(typed).expect("plan");
 
-    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     let result = execute(&planned, &mut runtime);
 
     if result.status != EvalStatus::Ok {
@@ -329,7 +333,7 @@ has_module_edge() :-
     let typed = typecheck(resolved).expect("typecheck");
     let planned = plan(typed).expect("plan");
 
-    let mut runtime = RaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
+    let mut runtime = LegacyRaHostRuntime::from_workspace_root(root.as_std_path()).expect("runtime");
     let result = execute(&planned, &mut runtime);
 
     if result.status != EvalStatus::Ok {

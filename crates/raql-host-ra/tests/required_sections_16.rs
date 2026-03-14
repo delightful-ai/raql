@@ -342,6 +342,9 @@ fn invalid_span_range_includes_source_path_context() {
             assert_eq!(rel_path.as_ref(), "src/failing.rs");
             assert_eq!((*start, *end, *len), (0, 8, 3));
         }
+        RaHostError::InitFailure { details } => {
+            panic!("unexpected init failure variant: {details}");
+        }
     }
     assert!(err.to_string().contains("src/failing.rs"));
 }

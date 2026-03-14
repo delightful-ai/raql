@@ -40,10 +40,11 @@ pub(crate) fn build_host_snapshot(
     db: &RootDatabase,
     vfs: &vfs::Vfs,
     workspace_root: &Path,
+    fast_mode: bool,
 ) -> Result<DeterministicRaHost, RaHostInitError> {
     let sema = Semantics::new(db);
     let analysis = AnalysisHost::with_database(db.clone()).analysis();
-    let files = collect_local_files(db, vfs, workspace_root, &sema)?;
+    let files = collect_local_files(db, vfs, workspace_root)?;
     let semantic_identity = compute_semantic_identity(db, workspace_root);
 
     let mut host = DeterministicRaHost::new();
@@ -58,6 +59,7 @@ pub(crate) fn build_host_snapshot(
         sema,
         analysis,
         files,
+        fast_mode,
         host,
         def_path_by_id: BTreeMap::new(),
         def_ranges_by_file: BTreeMap::new(),
@@ -68,11 +70,12 @@ pub(crate) fn build_host_snapshot(
         processed_impls: HashSet::new(),
         typeref_by_key: BTreeMap::new(),
     };
-
     run_snapshot_extraction(|| {
         hir::attach_db(db, || {
             builder.extract_defs_and_types();
-            builder.extract_usages_via_definition_search();
+            if !fast_mode {
+                builder.extract_usages_via_definition_search();
+            }
             builder.extract_calls_and_nodes();
         });
     })?;
@@ -194,6 +197,7 @@ struct SnapshotBuilder<'db> {
     sema: Semantics<'db, RootDatabase>,
     analysis: Analysis,
     files: BTreeMap<FileId, LocalFile>,
+    fast_mode: bool,
     host: DeterministicRaHost,
     def_path_by_id: BTreeMap<DefId, String>,
     def_ranges_by_file: BTreeMap<FileId, Vec<(TextRange, DefId)>>,
@@ -629,6 +633,14 @@ impl<'db> SnapshotBuilder<'db> {
             .map(|(id, file)| (*id, file.editioned_file_id))
             .collect::<Vec<_>>();
 
+        if self.fast_mode {
+            for (file_id, editioned) in files {
+                let source = self.sema.parse(editioned);
+                self.extract_synthetic_callable_edges(file_id, &source);
+            }
+            return;
+        }
+
         for (file_id, editioned) in files.iter().copied() {
             let source = self.sema.parse(editioned);
             self.extract_nodes_for_file(file_id, &source);
@@ -763,6 +775,7 @@ impl<'db> SnapshotBuilder<'db> {
                 callable.kind(),
                 local.rel_path.as_str(),
                 call.syntax().text_range(),
+                self.fast_mode,
             ) else {
                 continue;
             };
@@ -776,11 +789,30 @@ impl<'db> SnapshotBuilder<'db> {
         kind: CallableKind<'db>,
         rel_path: &str,
         site: TextRange,
+        include_direct: bool,
     ) -> Option<(DefId, DispatchKind)> {
         match kind {
-            CallableKind::Function(_)
-            | CallableKind::TupleStruct(_)
-            | CallableKind::TupleEnumVariant(_) => None,
+            CallableKind::Function(function) => {
+                if !include_direct {
+                    return None;
+                }
+                self.register_module_def(ModuleDef::Function(function), false)
+                    .map(|callee| (callee, DispatchKind::Direct))
+            }
+            CallableKind::TupleStruct(strukt) => {
+                if !include_direct {
+                    return None;
+                }
+                self.register_module_def(ModuleDef::Adt(Adt::Struct(strukt)), false)
+                    .map(|callee| (callee, DispatchKind::Direct))
+            }
+            CallableKind::TupleEnumVariant(variant) => {
+                if !include_direct {
+                    return None;
+                }
+                self.register_module_def(ModuleDef::Variant(variant), false)
+                    .map(|callee| (callee, DispatchKind::Direct))
+            }
             CallableKind::Closure(_) => Some((
                 self.synthetic_call_def("callable_closure", rel_path, site),
                 DispatchKind::Closure,
@@ -1796,7 +1828,6 @@ fn collect_local_files(
     db: &RootDatabase,
     vfs: &vfs::Vfs,
     workspace_root: &Path,
-    sema: &Semantics<'_, RootDatabase>,
 ) -> Result<BTreeMap<FileId, LocalFile>, RaHostInitError> {
     #[derive(Debug)]
     struct FileCandidate {
@@ -1838,10 +1869,16 @@ fn collect_local_files(
         }
 
         let abs_path = Path::new(candidate.abs_path.as_str());
+        if !abs_path.starts_with(workspace_root) && is_cached_external_dependency_path(abs_path) {
+            continue;
+        }
 
         let rel_path = normalize_snapshot_path(workspace_root, abs_path, candidate.is_library);
+        if is_non_primary_target_path(rel_path.as_str()) {
+            continue;
+        }
         let text = db.file_text(candidate.file_id).text(db).to_string();
-        let editioned = sema.attach_first_edition(candidate.file_id);
+        let editioned = EditionedFileId::current_edition_guess_origin(db, candidate.file_id);
 
         files.insert(
             candidate.file_id,
@@ -1872,10 +1909,15 @@ fn selected_source_root_ids(
 
     for krate in Crate::all(db) {
         let root_path = vfs.file_path(krate.root_file(db));
-        let in_workspace = root_path
-            .as_path()
-            .is_some_and(|path| Path::new(path.as_str()).starts_with(workspace_root));
-        if krate.origin(db).is_local() || in_workspace {
+        let in_workspace = root_path.as_path().is_some_and(|path| {
+            let root_path = Path::new(path.as_str());
+            root_path.starts_with(workspace_root)
+        });
+        let local_non_cached = root_path.as_path().is_some_and(|path| {
+            let root_path = Path::new(path.as_str());
+            krate.origin(db).is_local() && !is_cached_external_dependency_path(root_path)
+        });
+        if in_workspace || local_non_cached {
             if selected_crates.insert(krate) {
                 queue.push_back(krate);
             }
@@ -1885,6 +1927,9 @@ fn selected_source_root_ids(
     while let Some(krate) = queue.pop_front() {
         for dep in krate.dependencies(db) {
             if dep.krate.origin(db).is_lang() {
+                continue;
+            }
+            if !include_dependency_crate(dep.krate, db, vfs, workspace_root) {
                 continue;
             }
             if selected_crates.insert(dep.krate) {
@@ -1905,6 +1950,40 @@ fn selected_source_root_ids(
         .into_iter()
         .map(|krate| db.file_source_root(krate.root_file(db)).source_root_id(db))
         .collect()
+}
+
+fn include_dependency_crate(
+    krate: Crate,
+    db: &RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+) -> bool {
+    let Some(root_path) = vfs.file_path(krate.root_file(db)).as_path() else {
+        return false;
+    };
+    let root_path = Path::new(root_path.as_str());
+    if root_path.starts_with(workspace_root) {
+        return true;
+    }
+    !is_cached_external_dependency_path(root_path)
+}
+
+fn is_cached_external_dependency_path(path: &Path) -> bool {
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        let cargo_home = Path::new(cargo_home.as_os_str());
+        if path.starts_with(cargo_home) {
+            return true;
+        }
+    }
+    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME") {
+        let rustup_home = Path::new(rustup_home.as_os_str());
+        if path.starts_with(rustup_home) {
+            return true;
+        }
+    }
+
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    normalized.contains("/registry/src/") || normalized.contains("/git/checkouts/")
 }
 
 fn normalize_rel_path(workspace_root: &Path, file_path: &Path) -> String {
@@ -1955,6 +2034,18 @@ fn normalize_snapshot_path(workspace_root: &Path, file_path: &Path, is_library: 
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string())
     )
+}
+
+fn is_non_primary_target_path(path: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "/tests/",
+        "tests/",
+        "/examples/",
+        "examples/",
+        "/benches/",
+        "benches/",
+    ];
+    MARKERS.iter().any(|marker| path == *marker || path.starts_with(marker) || path.contains(marker))
 }
 
 fn short_path_hash(path: &Path) -> String {

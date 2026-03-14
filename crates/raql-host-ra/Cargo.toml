@@ -10,6 +10,7 @@ doctest = false
 raql-host = { path = "../raql-host" }
 raql-ir = { path = "../raql-ir" }
 raql-engine = { path = "../raql-engine" }
+raql-compiler = { path = "../raql-compiler" }
 
 # rust-analyzer crates
 ide.workspace = true
@@ -26,6 +27,7 @@ project-model.workspace = true
 line-index.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
+camino.workspace = true
 
 [dev-dependencies]
 raql-syntax = { path = "../raql-syntax" }

@@ -1,5 +1,5 @@
 [package]
-name = "raql-cli"
+name = "raql-daemon"
 version = "0.0.0"
 edition = "2024"
 
@@ -7,13 +7,13 @@ edition = "2024"
 doctest = false
 
 [dependencies]
+camino.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
 raql-syntax = { path = "../raql-syntax" }
 raql-compiler = { path = "../raql-compiler" }
 raql-engine = { path = "../raql-engine" }
 raql-host = { path = "../raql-host" }
 raql-host-ra = { path = "../raql-host-ra" }
-raql-daemon = { path = "../raql-daemon" }
 raql-protocol = { path = "../raql-protocol" }
-
-clap.workspace = true
-camino.workspace = true

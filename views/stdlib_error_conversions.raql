@@ -1,0 +1,14 @@
+.include "std.raql".
+
+.decl conversion_pair(Src: Def, Dst: Def, Count: int).
+conversion_pair(Src, Dst, Count) :-
+  converts(Src, Dst, Site, _),
+  span_allowed(Site),
+  Count = count(S : converts(Src, Dst, S, _), span_allowed(S)).
+
+.decl conversion_report(SrcPath: string, DstPath: string, Count: int) output.
+conversion_report(SrcPath, DstPath, Count) :-
+  conversion_pair(Src, Dst, Count),
+  Count >= 2,
+  def_path(Src, SrcPath),
+  def_path(Dst, DstPath).
