@@ -17,14 +17,14 @@ use raql_host::{
     CapabilityId, CapabilitySet, MissingCapabilitiesError, is_engine_managed_extern,
     is_runtime_scalar_input_predicate,
 };
-use syntax::ast::HasName;
+use syntax::ast::{HasGenericArgs, HasName};
 use syntax::{ast, AstNode, Edition};
 use vfs::{AbsPathBuf, VfsPath};
 
 use crate::capability::{day_one_supported_capabilities, supports_day_one_capability};
 use crate::lazy_runtime::LazyRaRuntime;
 use crate::workspace_loader;
-use crate::{DefId, DefKind, DeterministicRaHost, RaHostInitError, WorldStamp};
+use crate::{DefId, DefKind, DeterministicRaHost, GenericArg, Mutability, RaHostInitError, TypeShape, WorldStamp};
 
 #[derive(Debug)]
 pub struct WorkspaceService {
@@ -290,6 +290,7 @@ impl<'db> CoreFactsBuilder<'db> {
             };
             match def {
                 ModuleDef::Module(child) => self.visit_module(child, module_test),
+                ModuleDef::Function(function) => self.register_function_types(def_id, function),
                 ModuleDef::Adt(adt) => self.process_adt(adt, def_id),
                 ModuleDef::Trait(trait_def) => {
                     for assoc in trait_def.items(self.db) {
@@ -300,6 +301,7 @@ impl<'db> CoreFactsBuilder<'db> {
                                 continue;
                             };
                             self.host.insert_trait_method(def_id, method_def);
+                            self.register_function_types(method_def, function);
                         }
                     }
                 }
@@ -335,12 +337,13 @@ impl<'db> CoreFactsBuilder<'db> {
                     let Some(name) = field.name().map(|name| name.text().to_string()) else {
                         continue;
                     };
-                    self.insert_field_name(owner_def, name.as_str());
+                    self.insert_field(owner_def, name.as_str(), field.ty());
                 }
             }
             Some(ast::FieldList::TupleFieldList(fields)) => {
-                for (index, _field) in fields.fields().enumerate() {
-                    self.insert_field_name(owner_def, index.to_string().as_str());
+                for (index, field) in fields.fields().enumerate() {
+                    let name = index.to_string();
+                    self.insert_field(owner_def, name.as_str(), field.ty());
                 }
             }
             None => {}
@@ -358,11 +361,11 @@ impl<'db> CoreFactsBuilder<'db> {
             let Some(name) = field.name().map(|name| name.text().to_string()) else {
                 continue;
             };
-            self.insert_field_name(owner_def, name.as_str());
+            self.insert_field(owner_def, name.as_str(), field.ty());
         }
     }
 
-    fn insert_field_name(&mut self, owner_def: DefId, name: &str) {
+    fn insert_field(&mut self, owner_def: DefId, name: &str, _ty_ast: Option<ast::Type>) {
         let owner_path = self
             .def_path_by_id
             .get(&owner_def)
@@ -428,12 +431,189 @@ impl<'db> CoreFactsBuilder<'db> {
                     let Some(method_def) = self.register_module_def(ModuleDef::Function(function), false) else {
                         continue;
                     };
+                    self.register_function_types(method_def, function);
                     if let Some(owner) = self_ty_def {
                         self.host.insert_method(owner, method_def);
                     }
                 }
             }
         }
+    }
+
+    fn register_function_types(&mut self, function_def: DefId, function: hir::Function) {
+        let source_ty = function
+            .source(self.db)
+            .and_then(|source| source.value.ret_type())
+            .and_then(|ret| ret.ty());
+        let function_path = self
+            .def_path_by_id
+            .get(&function_def)
+            .cloned()
+            .unwrap_or_else(|| format!("fn:{:#018x}", function_def.stable_id().as_u64()));
+        let return_ty = function
+            .async_ret_type(self.db)
+            .unwrap_or_else(|| function.ret_type(self.db));
+        let return_ref = self.lower_type(
+            format!("fn_return:{function_path}").as_str(),
+            return_ty.clone(),
+            source_ty.as_ref(),
+        );
+        let error_def = self.result_error_def(return_ty);
+        self.host.set_fn_return_type(function_def, Some(return_ref));
+        self.host.set_fn_error_type(function_def, error_def);
+    }
+
+    fn result_error_def(&mut self, ty: hir::Type) -> Option<DefId> {
+        let head = ty.as_adt()?;
+        let path = ModuleDef::Adt(head).canonical_path(self.db, Edition::CURRENT)?;
+        if !(matches!(
+            path.as_str(),
+            "std::result::Result" | "core::result::Result" | "result::Result"
+        ) || path.ends_with("::Result"))
+        {
+            return None;
+        }
+        let err_ty = ty.type_arguments().nth(1)?;
+        if let Some(adt) = err_ty.as_adt() {
+            return Some(self.register_adt_def(adt));
+        }
+        err_ty
+            .as_type_param(self.db)
+            .map(|param| self.register_type_param_def(param, "fn_error"))
+    }
+
+    fn lower_type(
+        &mut self,
+        key: &str,
+        ty: hir::Type,
+        source_ty: Option<&ast::Type>,
+    ) -> crate::TypeRefId {
+        let type_ref = self.host.intern_typeref_from_token(&format!("ty:{key}"));
+        let normalized_source = source_ty.cloned().map(normalize_type_ast);
+        let shape = if ty.is_unknown() {
+            TypeShape::Unknown
+        } else if let Some((inner, mutability)) = ty.as_reference() {
+            let inner_ast = normalized_source.as_ref().and_then(ref_inner_type);
+            TypeShape::Ref {
+                mutability: map_mutability(mutability),
+                inner: self.lower_type(format!("{key}/ref").as_str(), inner, inner_ast.as_ref()),
+            }
+        } else if ty.is_raw_ptr() {
+            let inner = ty
+                .remove_raw_ptr()
+                .expect("raw pointer types should expose inner type");
+            let (ptr_mutability, inner_ast) = normalized_source
+                .as_ref()
+                .map(ptr_parts)
+                .unwrap_or((Mutability::Shared, None));
+            TypeShape::Ptr {
+                mutability: ptr_mutability,
+                inner: self.lower_type(format!("{key}/ptr").as_str(), inner, inner_ast.as_ref()),
+            }
+        } else if ty.is_tuple() {
+            let item_asts = normalized_source.as_ref().map(tuple_item_asts).unwrap_or_default();
+            TypeShape::Tuple(
+                ty.tuple_fields(self.db)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let child_ast = item_asts.get(index);
+                        self.lower_type(format!("{key}/tuple/{index}").as_str(), item, child_ast)
+                    })
+                    .collect(),
+            )
+        } else if let Some(inner) = ty.as_slice() {
+            let inner_ast = normalized_source.as_ref().and_then(slice_inner_type);
+            TypeShape::Slice(self.lower_type(
+                format!("{key}/slice").as_str(),
+                inner,
+                inner_ast.as_ref(),
+            ))
+        } else if let Some(param) = ty.as_type_param(self.db) {
+            TypeShape::Param(self.register_type_param_def(param, key))
+        } else if ty.is_never() {
+            TypeShape::Prim("!".to_string())
+        } else if let Some(builtin) = ty.as_builtin() {
+            TypeShape::Prim(builtin.name().as_str().to_string())
+        } else if let Some(adt) = ty.as_adt() {
+            let arg_asts = normalized_source
+                .as_ref()
+                .map(path_type_arg_asts)
+                .unwrap_or_default();
+            TypeShape::App {
+                head: self.register_adt_def(adt),
+                args: ty
+                    .type_arguments()
+                    .enumerate()
+                    .map(|(index, arg)| {
+                        GenericArg::Type(self.lower_type(
+                            format!("{key}/arg/{index}").as_str(),
+                            arg,
+                            arg_asts.get(index),
+                        ))
+                    })
+                    .collect(),
+            }
+        } else {
+            TypeShape::Unknown
+        };
+        self.host.insert_type(type_ref, shape);
+        type_ref
+    }
+
+    fn register_adt_def(&mut self, adt: Adt) -> DefId {
+        if let Some(def_id) = self.register_module_def(ModuleDef::Adt(adt), false) {
+            return def_id;
+        }
+        let name = ModuleDef::Adt(adt)
+            .name(self.db)
+            .map(|name| name.display(self.db, Edition::CURRENT).to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let raw_path = ModuleDef::Adt(adt)
+            .canonical_path(self.db, Edition::CURRENT)
+            .unwrap_or_else(|| format!("external::{name}"));
+        let path = adt
+            .module(self.db)
+            .krate(self.db)
+            .display_name(self.db)
+            .map(|crate_name| crate_name.to_string())
+            .filter(|crate_name| {
+                raw_path != *crate_name && !raw_path.starts_with(format!("{crate_name}::").as_str())
+            })
+            .map(|crate_name| format!("{crate_name}::{raw_path}"))
+            .unwrap_or(raw_path);
+        let def_id = self
+            .host
+            .intern_def_from_token(format!("def:adt:{path}").as_str());
+        if !self.def_path_by_id.contains_key(&def_id) {
+            let kind = match adt {
+                Adt::Struct(_) => DefKind::Struct,
+                Adt::Enum(_) => DefKind::Enum,
+                Adt::Union(_) => DefKind::Union,
+            };
+            self.host
+                .insert_synthetic_def(def_id, name.as_str(), kind, path.as_str());
+            self.host.mark_public(def_id, true);
+            self.host.mark_in_test(def_id, false);
+            self.def_path_by_id.insert(def_id, path);
+        }
+        def_id
+    }
+
+    fn register_type_param_def(&mut self, param: hir::TypeParam, key: &str) -> DefId {
+        let name = param.name(self.db).display(self.db, Edition::CURRENT).to_string();
+        let path = format!("type_param::{key}::{name}");
+        let def_id = self
+            .host
+            .intern_def_from_token(format!("def:type_param:{path}").as_str());
+        if !self.def_path_by_id.contains_key(&def_id) {
+            self.host
+                .insert_synthetic_def(def_id, name.as_str(), DefKind::Other, path.as_str());
+            self.host.mark_public(def_id, false);
+            self.host.mark_in_test(def_id, false);
+            self.def_path_by_id.insert(def_id, path);
+        }
+        def_id
     }
 
     fn register_impl_def(&mut self, impl_def: Impl) -> Option<DefId> {
@@ -688,6 +868,74 @@ fn tracked_workspace_state(
         }
     }
     (tracked_files, scan_roots)
+}
+
+fn normalize_type_ast(ty: ast::Type) -> ast::Type {
+    match ty {
+        ast::Type::ParenType(paren) => paren.ty().map(normalize_type_ast).unwrap_or(ast::Type::ParenType(paren)),
+        other => other,
+    }
+}
+
+fn map_mutability(mutability: hir::Mutability) -> Mutability {
+    match mutability {
+        hir::Mutability::Mut => Mutability::Mut,
+        hir::Mutability::Shared => Mutability::Shared,
+    }
+}
+
+fn ref_inner_type(ty: &ast::Type) -> Option<ast::Type> {
+    match ty {
+        ast::Type::RefType(inner) => inner.ty().map(normalize_type_ast),
+        _ => None,
+    }
+}
+
+fn ptr_parts(ty: &ast::Type) -> (Mutability, Option<ast::Type>) {
+    match ty {
+        ast::Type::PtrType(ptr) => (
+            if ptr.mut_token().is_some() {
+                Mutability::Mut
+            } else {
+                Mutability::Shared
+            },
+            ptr.ty().map(normalize_type_ast),
+        ),
+        _ => (Mutability::Shared, None),
+    }
+}
+
+fn tuple_item_asts(ty: &ast::Type) -> Vec<ast::Type> {
+    match ty {
+        ast::Type::TupleType(tuple) => tuple.fields().map(normalize_type_ast).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn slice_inner_type(ty: &ast::Type) -> Option<ast::Type> {
+    match ty {
+        ast::Type::SliceType(slice) => slice.ty().map(normalize_type_ast),
+        _ => None,
+    }
+}
+
+fn path_type_arg_asts(ty: &ast::Type) -> Vec<ast::Type> {
+    match ty {
+        ast::Type::PathType(path_ty) => path_ty
+            .path()
+            .and_then(|path| path.segment())
+            .and_then(|segment| segment.generic_arg_list())
+            .map(|args| {
+                args.generic_args()
+                    .filter_map(|arg| match arg {
+                        ast::GenericArg::TypeArg(ty_arg) => ty_arg.ty().map(normalize_type_ast),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 fn scan_relevant_files(

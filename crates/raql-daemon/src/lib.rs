@@ -323,6 +323,7 @@ fn serve_with_timeouts(
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(request_timeout))?;
                 let served_request = handle_connection(stream, &mut session, cold)?;
                 if served_request {

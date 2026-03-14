@@ -168,3 +168,48 @@ hit() :-
     MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
         .expect("structure/trait capabilities should be supported in the daemon runtime");
 }
+
+#[test]
+fn type_surface_capabilities_are_supported_on_the_daemon_runtime() {
+    let root = temp_workspace_root("type_surface_supported");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.type Mutability = { IMM, MUT }.
+.func fn_error_type(F: Def, Err: option<Def>) extern.
+.func fn_return_type(F: Def, TR: TypeRef) extern.
+.decl ty_app(TR: TypeRef, Head: Def) extern.
+.decl ty_arg(TR: TypeRef, Index: int, Arg: TypeRef) extern.
+.decl ty_ref(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
+.decl ty_ptr(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
+.decl ty_tuple(TR: TypeRef, Index: int, Elem: TypeRef) extern.
+.decl ty_slice(TR: TypeRef, Elem: TypeRef) extern.
+.decl ty_param(TR: TypeRef, Param: Def) extern.
+.decl ty_prim(TR: TypeRef, Name: string) extern.
+.decl ty_unknown(TR: TypeRef) extern.
+.func typeref_id(TR: TypeRef, H: string) extern.
+.decl hit().
+hit() :-
+  fn_error_type(_, _),
+  fn_return_type(_, _),
+  ty_app(_, _),
+  ty_arg(_, _, _),
+  ty_ref(_, _, _),
+  ty_ptr(_, _, _),
+  ty_tuple(_, _, _),
+  ty_slice(_, _),
+  ty_param(_, _),
+  ty_prim(_, _),
+  ty_unknown(_),
+  typeref_id(_, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+        .expect("type-surface capabilities should be supported in the daemon runtime");
+}

@@ -421,6 +421,18 @@ impl DeterministicRaHost {
         );
     }
 
+    pub fn insert_synthetic_def(
+        &mut self,
+        def: DefId,
+        name: impl Into<Box<str>>,
+        kind: DefKind,
+        path: impl Into<String>,
+    ) {
+        let path = path.into();
+        self.insert_def(def, name, kind, fallback_def_span(def), path.clone());
+        self.insert_handle(def, format!("def://{path}"));
+    }
+
     pub fn set_method_owner(&mut self, method: DefId, owner: Option<DefId>) {
         self.ensure_def_record_mut(method).method_owner = owner;
     }

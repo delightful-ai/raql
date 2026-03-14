@@ -582,3 +582,85 @@ from_hit(SrcName, DstName) :- def(Src), def_name(Src, "NameError"), from_impl(Sr
         "stdout={stdout}"
     );
 }
+
+#[test]
+fn lang_run_supports_type_surface_queries_on_the_daemon_path() {
+    let work = temp_dir("daemon_type_surface");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"
+pub struct Wrapper<T>(pub T);
+pub struct Item;
+pub struct Oops;
+
+pub fn make_wrapper(item: Item) -> Wrapper<Item> { Wrapper(item) }
+pub fn borrow_item(item: &mut Item) -> &mut Item { item }
+pub fn raw_item(item: *const Item) -> *const Item { item }
+pub fn tuple_item() -> (Item, i32) { (Item, 1) }
+pub fn slice_item(items: &[Item]) -> &[Item] { items }
+pub fn generic_item<T>(value: T) -> T { value }
+pub fn parse_item() -> Result<Item, Oops> { Err(Oops) }
+pub fn opaque_array() -> [i32; 4] { [0; 4] }
+"#,
+    )
+    .expect("write lib.rs");
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl app_hit(Path: string).
+.decl arg_hit(Path: string).
+.decl ref_hit(Name: string).
+.decl ptr_hit(Name: string).
+.decl tuple_prim_hit(Name: string).
+.decl slice_hit(Name: string).
+.decl param_hit(Name: string).
+.decl error_hit(Name: string).
+.decl unknown_hit(Key: string).
+app_hit(Path) :- def(F), def_name(F, "make_wrapper"), fn_return_type(F, TR), type_head_path(TR, Path).
+arg_hit(Path) :- def(F), def_name(F, "make_wrapper"), fn_return_type(F, TR), ty_arg(TR, 0, Arg), type_head_path(Arg, Path).
+ref_hit(Name) :- def(F), def_name(F, "borrow_item"), fn_return_type(F, TR), ty_ref(TR, Mutability::MUT, Inner), type_head_def(Inner, Head), def_name(Head, Name).
+ptr_hit(Name) :- def(F), def_name(F, "raw_item"), fn_return_type(F, TR), ty_ptr(TR, Mutability::IMM, Inner), type_head_def(Inner, Head), def_name(Head, Name).
+tuple_prim_hit(Name) :- def(F), def_name(F, "tuple_item"), fn_return_type(F, TR), ty_tuple(TR, 1, Elem), ty_prim(Elem, Name).
+slice_hit(Name) :- def(F), def_name(F, "slice_item"), fn_return_type(F, TR), ty_ref(TR, Mutability::IMM, RefInner), ty_slice(RefInner, Elem), type_head_def(Elem, Head), def_name(Head, Name).
+param_hit(Name) :- def(F), def_name(F, "generic_item"), fn_return_type(F, TR), ty_param(TR, Param), def_name(Param, Name).
+error_hit(Name) :- def(F), def_name(F, "parse_item"), fn_error_type(F, some(Err)), def_name(Err, Name).
+unknown_hit(Key) :- def(F), def_name(F, "opaque_array"), fn_return_type(F, TR), ty_unknown(TR), typeref_id(TR, Key).
+"#,
+    )
+    .expect("write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+        .args([
+            "lang",
+            "run",
+            query.to_str().expect("utf8 query"),
+            "--rust-file",
+            workspace.to_str().expect("utf8 workspace"),
+            "--include-dir",
+            env!("CARGO_MANIFEST_DIR"),
+        ])
+        .output()
+        .expect("run raql");
+
+    assert!(
+        output.status.success(),
+        "daemon-backed type query should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("app_hit(\"Wrapper\")"), "stdout={stdout}");
+    assert!(stdout.contains("arg_hit(\"Item\")"), "stdout={stdout}");
+    assert!(stdout.contains("ref_hit(\"Item\")"), "stdout={stdout}");
+    assert!(stdout.contains("ptr_hit(\"Item\")"), "stdout={stdout}");
+    assert!(stdout.contains("tuple_prim_hit(\"i32\")"), "stdout={stdout}");
+    assert!(stdout.contains("slice_hit(\"Item\")"), "stdout={stdout}");
+    assert!(stdout.contains("param_hit(\"T\")"), "stdout={stdout}");
+    assert!(stdout.contains("error_hit(\"Oops\")"), "stdout={stdout}");
+    assert!(stdout.contains("unknown_hit("), "stdout={stdout}");
+}

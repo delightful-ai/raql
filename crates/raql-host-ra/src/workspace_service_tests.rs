@@ -337,6 +337,117 @@ from_hit(SrcName, DstName) :- def(Src), def_name(Src, "NameError"), from_impl(Sr
 }
 
 #[test]
+fn workspace_service_supports_type_surface_rows() {
+    let root = temp_workspace_root("type_surface_rows");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Wrapper<T>(pub T);
+pub struct Item;
+pub struct Oops;
+
+pub fn make_wrapper(item: Item) -> Wrapper<Item> { Wrapper(item) }
+pub fn borrow_item(item: &mut Item) -> &mut Item { item }
+pub fn raw_item(item: *const Item) -> *const Item { item }
+pub fn tuple_item() -> (Item, i32) { (Item, 1) }
+pub fn slice_item(items: &[Item]) -> &[Item] { items }
+pub fn generic_item<T>(value: T) -> T { value }
+pub fn parse_item() -> Result<Item, Oops> { Err(Oops) }
+pub fn opaque_array() -> [i32; 4] { [0; 4] }
+"#,
+    )
+    .expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.type Mutability = { IMM, MUT }.
+.decl def(D: Def) extern.
+.mode def(-Def).
+.func def_name(D: Def, Name: string) extern.
+.mode def_name(+Def, -string).
+.func def_path(D: Def, Path: string) extern.
+.mode def_path(+Def, -string).
+.func fn_error_type(F: Def, Err: option<Def>) extern.
+.mode fn_error_type(+Def, -option<Def>).
+.func fn_return_type(F: Def, TR: TypeRef) extern.
+.mode fn_return_type(+Def, -TypeRef).
+.decl ty_app(TR: TypeRef, Head: Def) extern.
+.mode ty_app(+TypeRef, -Def).
+.decl ty_arg(TR: TypeRef, Index: int, Arg: TypeRef) extern.
+.mode ty_arg(+TypeRef, -int, -TypeRef).
+.decl ty_ref(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
+.mode ty_ref(+TypeRef, -Mutability, -TypeRef).
+.decl ty_ptr(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
+.mode ty_ptr(+TypeRef, -Mutability, -TypeRef).
+.decl ty_tuple(TR: TypeRef, Index: int, Elem: TypeRef) extern.
+.mode ty_tuple(+TypeRef, -int, -TypeRef).
+.decl ty_slice(TR: TypeRef, Elem: TypeRef) extern.
+.mode ty_slice(+TypeRef, -TypeRef).
+.decl ty_param(TR: TypeRef, Param: Def) extern.
+.mode ty_param(+TypeRef, -Def).
+.decl ty_prim(TR: TypeRef, Name: string) extern.
+.mode ty_prim(+TypeRef, -string).
+.decl ty_unknown(TR: TypeRef) extern.
+.mode ty_unknown(+TypeRef).
+.func typeref_id(TR: TypeRef, H: string) extern.
+.mode typeref_id(+TypeRef, -string).
+.decl app_hit(Path: string).
+.decl arg_hit(Path: string).
+.decl ref_hit(Name: string).
+.decl ptr_hit(Name: string).
+.decl tuple_prim_hit(Name: string).
+.decl slice_hit(Name: string).
+.decl param_hit(Name: string).
+.decl error_hit(Name: string).
+.decl unknown_hit(Key: string).
+.decl return_key_hit(Key: string).
+app_hit(Path) :- def(F), def_name(F, "make_wrapper"), fn_return_type(F, TR), ty_app(TR, Head), def_path(Head, Path).
+arg_hit(Path) :- def(F), def_name(F, "make_wrapper"), fn_return_type(F, TR), ty_arg(TR, 0, Arg), ty_app(Arg, Head), def_path(Head, Path).
+ref_hit(Name) :- def(F), def_name(F, "borrow_item"), fn_return_type(F, TR), ty_ref(TR, Mutability::MUT, Inner), ty_app(Inner, Head), def_name(Head, Name).
+ptr_hit(Name) :- def(F), def_name(F, "raw_item"), fn_return_type(F, TR), ty_ptr(TR, Mutability::IMM, Inner), ty_app(Inner, Head), def_name(Head, Name).
+tuple_prim_hit(Name) :- def(F), def_name(F, "tuple_item"), fn_return_type(F, TR), ty_tuple(TR, 1, Elem), ty_prim(Elem, Name).
+slice_hit(Name) :- def(F), def_name(F, "slice_item"), fn_return_type(F, TR), ty_ref(TR, Mutability::IMM, RefInner), ty_slice(RefInner, Elem), ty_app(Elem, Head), def_name(Head, Name).
+param_hit(Name) :- def(F), def_name(F, "generic_item"), fn_return_type(F, TR), ty_param(TR, Param), def_name(Param, Name).
+error_hit(Name) :- def(F), def_name(F, "parse_item"), fn_error_type(F, some(Err)), def_name(Err, Name).
+unknown_hit(Key) :- def(F), def_name(F, "opaque_array"), fn_return_type(F, TR), ty_unknown(TR), typeref_id(TR, Key).
+return_key_hit(Key) :- def(F), def_name(F, "make_wrapper"), fn_return_type(F, TR), typeref_id(TR, Key).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(result.relations.get("app_hit").is_some_and(|rows| {
+        rows.iter().any(|row| row.first().is_some_and(|value| {
+            matches!(value, RuntimeValue::String(path) if path == "Wrapper" || path.ends_with("::Wrapper"))
+        }))
+    }));
+    assert!(result.relations.get("arg_hit").is_some_and(|rows| {
+        rows.iter().any(|row| row.first().is_some_and(|value| {
+            matches!(value, RuntimeValue::String(path) if path == "Item" || path.ends_with("::Item"))
+        }))
+    }));
+    assert!(result.relations.get("ref_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("Item".to_string())])
+    }));
+    assert!(result.relations.get("ptr_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("Item".to_string())])
+    }));
+    assert!(result.relations.get("tuple_prim_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("i32".to_string())])
+    }));
+    assert!(result.relations.get("slice_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("Item".to_string())])
+    }));
+    assert!(result.relations.get("param_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("T".to_string())])
+    }));
+    assert!(result.relations.get("error_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("Oops".to_string())])
+    }));
+    assert!(result.relations.get("unknown_hit").is_some_and(|rows| !rows.is_empty()));
+    assert!(result.relations.get("return_key_hit").is_some_and(|rows| !rows.is_empty()));
+}
+
+#[test]
 fn workspace_service_world_stamp_is_stable_when_workspace_is_unchanged() {
     let root = temp_workspace_root("world_stamp_stable");
     fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");
