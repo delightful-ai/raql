@@ -1,7 +1,7 @@
 use camino::Utf8PathBuf;
 use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::RuntimeValue;
-use raql_host_ra::WorkspaceService;
+use raql_host_ra::{RaHostInitError, WorkspaceService};
 use raql_syntax::parse_program;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,12 +38,85 @@ fn plan_query(src: &str) -> raql_compiler::PlannedProgram {
     plan(typed).expect("plan")
 }
 
+fn query_world_stamp(service: &mut WorkspaceService) -> String {
+    let planned = plan_query(
+        r#"
+.func world_stamp(Stamp: string) extern.
+.decl stamp(Stamp: string).
+stamp(Stamp) :- world_stamp(Stamp).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run world_stamp query");
+    result
+        .relations
+        .get("stamp")
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.first())
+        .and_then(|value| match value {
+            RuntimeValue::String(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("world_stamp row")
+}
+
+#[test]
+fn workspace_service_init_fails_without_workspace_manifest() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "raql_host_ra_workspace_service_init_missing_{}_{}",
+        std::process::id(),
+        stamp
+    ));
+    fs::create_dir_all(&root).expect("create temp dir");
+    fs::write(root.join("standalone.rs"), "fn main() {}\n").expect("write standalone.rs");
+
+    let err = WorkspaceService::from_workspace_root(root.as_path()).expect_err("must fail");
+    let RaHostInitError::WorkspaceNotFound { details, .. } = err else {
+        panic!("expected workspace-not-found error");
+    };
+    assert!(
+        !details.trim().is_empty(),
+        "workspace-not-found error should include cause details"
+    );
+}
+
+#[test]
+fn workspace_service_init_succeeds_from_manifest_path() {
+    let root = temp_workspace_root("manifest_path_init");
+    fs::write(root.join("src/lib.rs"), "pub fn via_manifest() {}\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_manifest_path(root.join("Cargo.toml").as_std_path())
+        .expect("service from manifest path");
+    let stamp = query_world_stamp(&mut service);
+    assert!(stamp.starts_with("ra-workspace:"), "stamp={stamp}");
+
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl hit().
+hit() :- def(D), def_name(D, "via_manifest").
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(
+        result
+            .relations
+            .get("hit")
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}
+
 #[test]
 fn workspace_service_tracks_incremental_rust_file_edits() {
     let root = temp_workspace_root("incremental");
     fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");
 
-    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let mut service =
+        WorkspaceService::from_manifest_path(root.join("Cargo.toml").as_std_path()).expect("service");
     let initial_epoch = service.workspace_epoch();
     let planned = plan_query(
         r#"
@@ -79,6 +152,83 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "omega").
         "same-file Rust edits should remain incremental rather than forcing a full reload"
     );
     assert!(service.content_revision() > 0, "content revision should advance after source edit");
+}
+
+#[test]
+fn workspace_service_world_stamp_changes_when_local_file_content_changes() {
+    let root = temp_workspace_root("world_stamp_local_change");
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let mut service =
+        WorkspaceService::from_manifest_path(root.join("Cargo.toml").as_std_path()).expect("service");
+    let before = query_world_stamp(&mut service);
+
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 2 }\n").expect("rewrite lib.rs");
+    let after = query_world_stamp(&mut service);
+
+    assert_ne!(before, after);
+}
+
+#[test]
+fn workspace_service_world_stamp_changes_when_manifest_configuration_changes() {
+    let root = temp_workspace_root("world_stamp_manifest_change");
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let epoch_before = service.workspace_epoch();
+    let stamp_before = query_world_stamp(&mut service);
+
+    let manifest = root.join("Cargo.toml");
+    let mut manifest_text = fs::read_to_string(manifest.as_std_path()).expect("read Cargo.toml");
+    manifest_text.push_str(
+        r#"
+[features]
+default = []
+extra = []
+"#,
+    );
+    fs::write(manifest.as_std_path(), manifest_text).expect("rewrite Cargo.toml");
+
+    let stamp_after = query_world_stamp(&mut service);
+    assert_ne!(stamp_before, stamp_after);
+    assert!(
+        service.workspace_epoch() > epoch_before,
+        "manifest changes should force a workspace reload"
+    );
+}
+
+#[test]
+fn workspace_service_world_stamp_is_stable_when_workspace_is_unchanged() {
+    let root = temp_workspace_root("world_stamp_stable");
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let first = query_world_stamp(&mut service);
+    let second = query_world_stamp(&mut service);
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn workspace_service_reports_manifest_removal_on_next_run() {
+    let root = temp_workspace_root("manifest_removal");
+    fs::write(root.join("src/lib.rs"), "pub fn marker() {}\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    fs::remove_file(root.join("Cargo.toml").as_std_path()).expect("remove Cargo.toml");
+
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.decl hit().
+hit() :- def(D).
+"#,
+    );
+    let err = service.run_planned(&planned).expect_err("run should fail");
+    assert!(
+        err.to_string().contains("workspace"),
+        "expected workspace load failure after manifest removal; err={err}"
+    );
 }
 
 #[test]
