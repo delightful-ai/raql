@@ -34,6 +34,8 @@ pub enum DaemonError {
 
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 600_000;
 const IDLE_TIMEOUT_ENV: &str = "RAQL_DAEMON_IDLE_TIMEOUT_MS";
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
+const REQUEST_TIMEOUT_ENV: &str = "RAQL_DAEMON_REQUEST_TIMEOUT_MS";
 const ACCEPT_POLL_INTERVAL_MS: u64 = 50;
 
 pub fn socket_path_for_workspace(workspace_root: &Path) -> PathBuf {
@@ -235,6 +237,20 @@ impl DaemonClient {
 }
 
 pub fn serve(socket_path: &Path, workspace_root: &Path) -> Result<(), DaemonError> {
+    serve_with_timeouts(
+        socket_path,
+        workspace_root,
+        idle_shutdown_timeout(),
+        request_read_timeout(),
+    )
+}
+
+fn serve_with_timeouts(
+    socket_path: &Path,
+    workspace_root: &Path,
+    idle_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<(), DaemonError> {
     let mut session = DaemonWorkspace::from_workspace_root(workspace_root)
         .map_err(|err| DaemonError::Message(format!("failed to initialize rust-analyzer runtime from `{}`: {err}", workspace_root.display())))?;
     if socket_path.exists() {
@@ -245,13 +261,13 @@ pub fn serve(socket_path: &Path, workspace_root: &Path) -> Result<(), DaemonErro
     let _socket_guard = SocketGuard {
         path: socket_path.to_path_buf(),
     };
-    let idle_timeout = idle_shutdown_timeout();
     let poll_interval = Duration::from_millis(ACCEPT_POLL_INTERVAL_MS);
     let mut last_activity = Instant::now();
     let mut cold = true;
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                stream.set_read_timeout(Some(request_timeout))?;
                 let served_request = handle_connection(stream, &mut session, cold)?;
                 if served_request {
                     cold = false;
@@ -309,7 +325,16 @@ fn handle_connection_impl(
     writer: &mut BufWriter<UnixStream>,
 ) -> Result<bool, DaemonError> {
     let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    let n = match reader.read_line(&mut line) {
+        Ok(n) => n,
+        Err(err)
+            if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+                && line.is_empty() =>
+        {
+            return Ok(false);
+        }
+        Err(err) => return Err(err.into()),
+    };
     if n == 0 {
         return Ok(false);
     }
@@ -471,16 +496,32 @@ fn idle_shutdown_timeout_from_raw(raw: Option<&str>) -> Duration {
         .unwrap_or_else(|| Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS))
 }
 
+fn request_read_timeout() -> Duration {
+    let configured = std::env::var(REQUEST_TIMEOUT_ENV).ok();
+    request_read_timeout_from_raw(configured.as_deref())
+}
+
+fn request_read_timeout_from_raw(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_IDLE_TIMEOUT_MS, PROTOCOL_VERSION, connection_failure_message,
-        handle_connection, idle_shutdown_timeout_from_raw, socket_path_for_workspace,
+        DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, DaemonClient, PROTOCOL_VERSION,
+        connection_failure_message, handle_connection, idle_shutdown_timeout_from_raw,
+        request_read_timeout_from_raw, serve_with_timeouts, socket_path_for_workspace,
         startup_log_path_for_socket,
     };
+    use camino::Utf8PathBuf;
     use raql_host_ra::daemon::DaemonWorkspace;
+    use raql_protocol::DaemonEvent;
     use std::fs;
     use std::os::unix::net::UnixStream;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_workspace_root(label: &str) -> std::path::PathBuf {
@@ -568,5 +609,76 @@ edition = "2021"
             !served,
             "connect-and-close without a request should not advance warm or idle accounting"
         );
+    }
+
+    #[test]
+    fn request_read_timeout_uses_default_and_rejects_zero() {
+        assert_eq!(
+            request_read_timeout_from_raw(None),
+            std::time::Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            request_read_timeout_from_raw(Some("0")),
+            std::time::Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            request_read_timeout_from_raw(Some("200")),
+            std::time::Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn half_open_client_times_out_without_blocking_next_request() {
+        let root = temp_workspace_root("half_open_timeout");
+        let query = root.join("query.raql");
+        fs::write(&query, ".decl ping().\nping().\n").expect("write query");
+        let socket = std::env::temp_dir().join(format!(
+            "raql-daemon-half-open-{}_{}.sock",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        let server_root = root.clone();
+        let server_socket = socket.clone();
+        let server = thread::spawn(move || {
+            serve_with_timeouts(
+                server_socket.as_path(),
+                server_root.as_path(),
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(100),
+            )
+        });
+
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(socket.exists(), "daemon socket should appear");
+
+        let blocker = UnixStream::connect(&socket).expect("connect blocker");
+        thread::sleep(std::time::Duration::from_millis(150));
+
+        let mut client = DaemonClient {
+            stream: UnixStream::connect(&socket).expect("connect client"),
+        };
+        let events = client
+            .run(
+                &Utf8PathBuf::from_path_buf(query.clone()).expect("utf8 query"),
+                &[],
+            )
+            .expect("run query");
+        assert!(
+            events.iter().any(|event| matches!(event, DaemonEvent::Result(_))),
+            "expected a terminal result after half-open client timeout; events={events:?}"
+        );
+
+        drop(blocker);
+        let server_result = server.join().expect("join server");
+        assert!(server_result.is_ok(), "server should exit cleanly; result={server_result:?}");
     }
 }
