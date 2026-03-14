@@ -223,6 +223,120 @@ extra = []
 }
 
 #[test]
+fn workspace_service_supports_semantic_search_rows() {
+    let root = temp_workspace_root("semantic_search");
+    fs::write(root.join("src/lib.rs"), "pub fn alpha_marker() {}\npub fn omega_marker() {}\n")
+        .expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl search(Q: string, D: Def, Score: int) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl hit(Name: string).
+hit(Name) :- search("alpha", D, _Score), def_name(D, Name).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(result.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("alpha_marker".to_string())])
+    }));
+}
+
+#[test]
+fn workspace_service_supports_structure_and_trait_rows() {
+    let root = temp_workspace_root("structure_trait_rows");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub trait Greeter {
+    fn greet(&self);
+}
+
+pub struct Person {
+    pub name: String,
+    age: u32,
+}
+
+pub enum Choice {
+    First,
+    Second,
+}
+
+pub struct NameError;
+pub struct AgeError;
+
+impl Greeter for Person {
+    fn greet(&self) {}
+}
+
+impl From<NameError> for AgeError {
+    fn from(_: NameError) -> Self {
+        AgeError
+    }
+}
+"#,
+    )
+    .expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.mode def(-Def).
+.func def_name(D: Def, Name: string) extern.
+.mode def_name(+Def, -string).
+.decl field(Owner: Def, Name: string, Ty: TypeRef) extern.
+.mode field(+Def, -string, -TypeRef).
+.decl variant(Enum: Def, Name: string, VariantDef: Def) extern.
+.mode variant(+Def, -string, -Def).
+.decl method(Owner: Def, Method: Def) extern.
+.mode method(+Def, -Def).
+.decl trait_method(Owner: Def, Method: Def) extern.
+.mode trait_method(+Def, -Def).
+.decl implements(Type: Def, Trait: Def, ImplDef: Def) extern.
+.mode implements(+Def, -Def, -Def).
+.decl from_impl(Src: Def, Dst: Def, ImplDef: Def) extern.
+.mode from_impl(+Def, -Def, -Def).
+.decl field_hit(Name: string).
+.decl variant_hit(Name: string).
+.decl method_hit(Name: string).
+.decl trait_method_hit(Name: string).
+.decl impl_hit(Name: string).
+.decl from_hit(SrcName: string, DstName: string).
+field_hit(Name) :- def(Person), def_name(Person, "Person"), field(Person, Name, _).
+variant_hit(Name) :- def(Choice), def_name(Choice, "Choice"), variant(Choice, Name, _).
+method_hit(Name) :- def(Person), def_name(Person, "Person"), method(Person, Method), def_name(Method, Name).
+trait_method_hit(Name) :- def(Greeter), def_name(Greeter, "Greeter"), trait_method(Greeter, Method), def_name(Method, Name).
+impl_hit(Name) :- def(Person), def_name(Person, "Person"), implements(Person, Trait, _), def_name(Trait, Name).
+from_hit(SrcName, DstName) :- def(Src), def_name(Src, "NameError"), from_impl(Src, Dst, _), def_name(Src, SrcName), def_name(Dst, DstName).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(result.relations.get("field_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("name".to_string())])
+    }));
+    assert!(result.relations.get("variant_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("First".to_string())])
+    }));
+    assert!(result.relations.get("method_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("greet".to_string())])
+    }));
+    assert!(result.relations.get("trait_method_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("greet".to_string())])
+    }));
+    assert!(result.relations.get("impl_hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("Greeter".to_string())])
+    }));
+    assert!(result.relations.get("from_hit").is_some_and(|rows| {
+        rows.contains(&vec![
+            RuntimeValue::String("NameError".to_string()),
+            RuntimeValue::String("AgeError".to_string()),
+        ])
+    }));
+}
+
+#[test]
 fn workspace_service_world_stamp_is_stable_when_workspace_is_unchanged() {
     let root = temp_workspace_root("world_stamp_stable");
     fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");

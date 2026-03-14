@@ -444,3 +444,141 @@ extra = []
         "session metadata should reflect the executed post-reload revision; stdout={third_stdout}"
     );
 }
+
+#[test]
+fn lang_run_supports_semantic_search_on_the_daemon_path() {
+    let work = temp_dir("daemon_search");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "pub fn alpha_search_marker() {}\npub fn omega_search_marker() {}\n",
+    )
+    .expect("write lib.rs");
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl hit(Name: string).
+hit(Name) :- search("alpha", D, _Score), def_name(D, Name).
+"#,
+    )
+    .expect("write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+        .args([
+            "lang",
+            "run",
+            query.to_str().expect("utf8 query"),
+            "--rust-file",
+            workspace.to_str().expect("utf8 workspace"),
+            "--include-dir",
+            env!("CARGO_MANIFEST_DIR"),
+        ])
+        .output()
+        .expect("run raql");
+
+    assert!(
+        output.status.success(),
+        "daemon-backed search query should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hit(\"alpha_search_marker\")"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn lang_run_supports_structure_and_trait_queries_on_the_daemon_path() {
+    let work = temp_dir("daemon_structure_trait");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"
+pub trait Greeter {
+    fn greet(&self);
+}
+
+pub struct Person {
+    pub name: String,
+    age: u32,
+}
+
+pub enum Choice {
+    First,
+    Second,
+}
+
+pub struct NameError;
+pub struct AgeError;
+
+impl Greeter for Person {
+    fn greet(&self) {}
+}
+
+impl From<NameError> for AgeError {
+    fn from(_: NameError) -> Self {
+        AgeError
+    }
+}
+"#,
+    )
+    .expect("write lib.rs");
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl field_hit(Name: string).
+.decl variant_hit(Name: string).
+.decl method_hit(Name: string).
+.decl trait_method_hit(Name: string).
+.decl impl_hit(Name: string).
+.decl from_hit(SrcName: string, DstName: string).
+field_hit(Name) :- def(Person), def_name(Person, "Person"), field(Person, Name, _).
+variant_hit(Name) :- def(Choice), def_name(Choice, "Choice"), variant(Choice, Name, _).
+method_hit(Name) :- def(Person), def_name(Person, "Person"), method(Person, Method), def_name(Method, Name).
+trait_method_hit(Name) :- def(Greeter), def_name(Greeter, "Greeter"), trait_method(Greeter, Method), def_name(Method, Name).
+impl_hit(Name) :- def(Person), def_name(Person, "Person"), implements(Person, Trait, _), def_name(Trait, Name).
+from_hit(SrcName, DstName) :- def(Src), def_name(Src, "NameError"), from_impl(Src, Dst, _), def_name(Src, SrcName), def_name(Dst, DstName).
+"#,
+    )
+    .expect("write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_raql"))
+        .args([
+            "lang",
+            "run",
+            query.to_str().expect("utf8 query"),
+            "--rust-file",
+            workspace.to_str().expect("utf8 workspace"),
+            "--include-dir",
+            env!("CARGO_MANIFEST_DIR"),
+        ])
+        .output()
+        .expect("run raql");
+
+    assert!(
+        output.status.success(),
+        "daemon-backed structure query should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("field_hit(\"name\")"), "stdout={stdout}");
+    assert!(stdout.contains("variant_hit(\"First\")"), "stdout={stdout}");
+    assert!(stdout.contains("method_hit(\"greet\")"), "stdout={stdout}");
+    assert!(stdout.contains("trait_method_hit(\"greet\")"), "stdout={stdout}");
+    assert!(stdout.contains("impl_hit(\"Greeter\")"), "stdout={stdout}");
+    assert!(
+        stdout.contains("from_hit(\"NameError\", \"AgeError\")"),
+        "stdout={stdout}"
+    );
+}

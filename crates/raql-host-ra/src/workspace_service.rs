@@ -17,7 +17,8 @@ use raql_host::{
     CapabilityId, CapabilitySet, MissingCapabilitiesError, is_engine_managed_extern,
     is_runtime_scalar_input_predicate,
 };
-use syntax::{AstNode, Edition};
+use syntax::ast::HasName;
+use syntax::{ast, AstNode, Edition};
 use vfs::{AbsPathBuf, VfsPath};
 
 use crate::capability::{day_one_supported_capabilities, supports_day_one_capability};
@@ -272,10 +273,12 @@ struct CoreFactsBuilder<'db> {
 
 impl<'db> CoreFactsBuilder<'db> {
     fn populate(&mut self) {
-        for krate in hir::Crate::all(self.db) {
-            self.visit_module(krate.root_module(self.db), false);
-        }
-        self.extract_impls();
+        hir::attach_db(self.db, || {
+            for krate in hir::Crate::all(self.db) {
+                self.visit_module(krate.root_module(self.db), false);
+            }
+            self.extract_impls();
+        });
     }
 
     fn visit_module(&mut self, module: Module, inherited_test: bool) {
@@ -287,7 +290,7 @@ impl<'db> CoreFactsBuilder<'db> {
             };
             match def {
                 ModuleDef::Module(child) => self.visit_module(child, module_test),
-                ModuleDef::Adt(adt) => self.process_adt(adt),
+                ModuleDef::Adt(adt) => self.process_adt(adt, def_id),
                 ModuleDef::Trait(trait_def) => {
                     for assoc in trait_def.items(self.db) {
                         if let AssocItem::Function(function) = assoc {
@@ -305,13 +308,70 @@ impl<'db> CoreFactsBuilder<'db> {
         }
     }
 
-    fn process_adt(&mut self, adt: Adt) {
+    fn process_adt(&mut self, adt: Adt, owner_def: DefId) {
         self.local_adts.push(adt);
-        if let Adt::Enum(enum_) = adt {
-            for variant in enum_.variants(self.db) {
-                let _ = self.register_module_def(ModuleDef::Variant(variant), false);
+        match adt {
+            Adt::Struct(strukt) => self.insert_struct_fields(owner_def, strukt),
+            Adt::Union(union) => self.insert_union_fields(owner_def, union),
+            Adt::Enum(enum_) => {
+                for variant in enum_.variants(self.db) {
+                    let Some(variant_def) = self.register_module_def(ModuleDef::Variant(variant), false) else {
+                        continue;
+                    };
+                    let variant_name = variant.name(self.db).display(self.db, Edition::CURRENT).to_string();
+                    self.host.insert_variant(owner_def, variant_name, variant_def);
+                }
             }
         }
+    }
+
+    fn insert_struct_fields(&mut self, owner_def: DefId, strukt: hir::Struct) {
+        let Some(source) = strukt.source(self.db) else {
+            return;
+        };
+        match source.value.field_list() {
+            Some(ast::FieldList::RecordFieldList(fields)) => {
+                for field in fields.fields() {
+                    let Some(name) = field.name().map(|name| name.text().to_string()) else {
+                        continue;
+                    };
+                    self.insert_field_name(owner_def, name.as_str());
+                }
+            }
+            Some(ast::FieldList::TupleFieldList(fields)) => {
+                for (index, _field) in fields.fields().enumerate() {
+                    self.insert_field_name(owner_def, index.to_string().as_str());
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn insert_union_fields(&mut self, owner_def: DefId, union: hir::Union) {
+        let Some(source) = union.source(self.db) else {
+            return;
+        };
+        let Some(fields) = source.value.record_field_list() else {
+            return;
+        };
+        for field in fields.fields() {
+            let Some(name) = field.name().map(|name| name.text().to_string()) else {
+                continue;
+            };
+            self.insert_field_name(owner_def, name.as_str());
+        }
+    }
+
+    fn insert_field_name(&mut self, owner_def: DefId, name: &str) {
+        let owner_path = self
+            .def_path_by_id
+            .get(&owner_def)
+            .map(String::as_str)
+            .unwrap_or("unknown_owner");
+        let type_ref = self
+            .host
+            .intern_typeref_from_token(&format!("field:{owner_path}:{name}"));
+        self.host.insert_field(owner_def, name.to_string(), type_ref);
     }
 
     fn extract_impls(&mut self) {
@@ -328,10 +388,41 @@ impl<'db> CoreFactsBuilder<'db> {
             impls.extend(Impl::all_for_trait(self.db, trait_));
         }
         for impl_def in impls {
+            let impl_record_def = self.register_impl_def(impl_def);
             let self_ty_def = impl_def
                 .self_ty(self.db)
                 .as_adt()
                 .and_then(|adt| self.register_module_def(ModuleDef::Adt(adt), false));
+            if let (Some(owner), Some(trait_def), Some(impl_record)) = (
+                self_ty_def,
+                impl_def
+                    .trait_(self.db)
+                    .and_then(|trait_| self.register_module_def(ModuleDef::Trait(trait_), false)),
+                impl_record_def,
+            ) {
+                self.host.insert_implements(owner, trait_def, impl_record);
+            }
+            let is_from_impl = impl_def
+                .trait_(self.db)
+                .is_some_and(|trait_| {
+                    ModuleDef::Trait(trait_)
+                        .canonical_path(self.db, Edition::CURRENT)
+                        .is_some_and(|path| path.ends_with("::From"))
+                        || trait_.name(self.db).display(self.db, Edition::CURRENT).to_string() == "From"
+                });
+            if is_from_impl
+                && let (Some(dst), Some(impl_record), Some(src)) = (
+                    self_ty_def,
+                    impl_record_def,
+                    impl_def
+                        .trait_ref(self.db)
+                        .and_then(|trait_ref| trait_ref.get_type_argument(1))
+                        .and_then(|src_ty| src_ty.to_type(self.db).as_adt())
+                        .and_then(|adt| self.register_module_def(ModuleDef::Adt(adt), false)),
+                )
+            {
+                self.host.insert_from_impl(src, dst, impl_record);
+            }
             for assoc in impl_def.items(self.db) {
                 if let AssocItem::Function(function) = assoc {
                     let Some(method_def) = self.register_module_def(ModuleDef::Function(function), false) else {
@@ -343,6 +434,43 @@ impl<'db> CoreFactsBuilder<'db> {
                 }
             }
         }
+    }
+
+    fn register_impl_def(&mut self, impl_def: Impl) -> Option<DefId> {
+        let source = impl_def.source(self.db)?;
+        let editioned = source.file_id.original_file(self.db);
+        let local = self.files.get(&editioned.file_id(self.db))?;
+        let rel_path = local.rel_path.clone();
+        let range = source.value.syntax().text_range();
+        let span = self
+            .host
+            .intern_span_from_text(
+                editioned.editioned_file_id(self.db),
+                rel_path.clone(),
+                local.text.as_str(),
+                range,
+            )
+            .ok()?;
+        let path = format!(
+            "impl::{rel_path}:{}..{}",
+            u32::from(range.start()),
+            u32::from(range.end())
+        );
+        let def_id = self.host.intern_def_from_token(
+            format!(
+                "def:Impl:{rel_path}:{}..{}",
+                u32::from(range.start()),
+                u32::from(range.end())
+            )
+            .as_str(),
+        );
+        self.host.insert_def(def_id, "impl", DefKind::Impl, span, path.as_str());
+        self.host.insert_handle(def_id, format!("def://{path}"));
+        self.host.mark_public(def_id, false);
+        self.host
+            .mark_in_test(def_id, rel_path.starts_with("tests/") || rel_path.contains("/tests/"));
+        self.def_path_by_id.insert(def_id, path);
+        Some(def_id)
     }
 
     fn register_module_def(&mut self, def: ModuleDef, in_test: bool) -> Option<DefId> {

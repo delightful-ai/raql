@@ -1061,38 +1061,131 @@ impl DeterministicRaHost {
             .unwrap_or_else(|| fallback_fn_return_typeref(function))
     }
 
+    fn insert_search_term(
+        rows: &mut BTreeMap<(String, DefId), i64>,
+        query: impl Into<String>,
+        def: DefId,
+        score: i64,
+    ) {
+        let query = query.into();
+        if query.is_empty() {
+            return;
+        }
+        rows.entry((query, def))
+            .and_modify(|existing| *existing = (*existing).max(score))
+            .or_insert(score);
+    }
+
+    fn insert_search_term_with_lowercase(
+        rows: &mut BTreeMap<(String, DefId), i64>,
+        query: &str,
+        def: DefId,
+        score: i64,
+    ) {
+        Self::insert_search_term(rows, query.to_string(), def, score);
+        let lower = query.to_ascii_lowercase();
+        if lower != query {
+            Self::insert_search_term(rows, lower, def, score.saturating_sub(5));
+        }
+    }
+
+    fn insert_search_prefixes(
+        rows: &mut BTreeMap<(String, DefId), i64>,
+        query: &str,
+        def: DefId,
+        score: i64,
+    ) {
+        let mut prefix = String::new();
+        for ch in query.chars() {
+            prefix.push(ch);
+            if prefix.len() >= 2 {
+                Self::insert_search_term_with_lowercase(rows, prefix.as_str(), def, score);
+            }
+        }
+    }
+
+    fn identifier_words(term: &str) -> BTreeSet<String> {
+        #[derive(Copy, Clone, Eq, PartialEq)]
+        enum CharClass {
+            Lower,
+            Upper,
+            Digit,
+            Other,
+        }
+
+        fn classify(ch: char) -> CharClass {
+            if ch.is_ascii_lowercase() {
+                CharClass::Lower
+            } else if ch.is_ascii_uppercase() {
+                CharClass::Upper
+            } else if ch.is_ascii_digit() {
+                CharClass::Digit
+            } else {
+                CharClass::Other
+            }
+        }
+
+        let mut words = BTreeSet::new();
+        let mut current = String::new();
+        let mut previous = CharClass::Other;
+        for ch in term.chars() {
+            let class = classify(ch);
+            if matches!(class, CharClass::Other) {
+                if current.len() >= 2 {
+                    words.insert(current.clone());
+                }
+                current.clear();
+                previous = CharClass::Other;
+                continue;
+            }
+            let boundary = !current.is_empty()
+                && matches!(
+                    (previous, class),
+                    (CharClass::Lower, CharClass::Upper)
+                        | (CharClass::Digit, CharClass::Lower | CharClass::Upper)
+                        | (CharClass::Lower | CharClass::Upper, CharClass::Digit)
+                );
+            if boundary {
+                if current.len() >= 2 {
+                    words.insert(current.clone());
+                }
+                current.clear();
+            }
+            current.push(ch.to_ascii_lowercase());
+            previous = class;
+        }
+        if current.len() >= 2 {
+            words.insert(current);
+        }
+        words
+    }
+
     fn search_rows(&self) -> Vec<Vec<RuntimeValue>> {
-        let mut rows = BTreeSet::new();
+        let mut rows = BTreeMap::new();
         for record in &self.search_records {
-            rows.insert((record.key.to_string(), record.def, record.score));
+            Self::insert_search_term(&mut rows, record.key.to_string(), record.def, record.score);
         }
         for def in self.known_defs() {
             let name = self.def_name_for(def);
             let path = self.def_path_for(def);
-            let mut keys = BTreeSet::new();
-            keys.insert(name.clone());
-            keys.insert(name.to_lowercase());
-            keys.insert(path.clone());
-            keys.insert(path.to_lowercase());
+            Self::insert_search_term_with_lowercase(&mut rows, name.as_str(), def, 100);
+            Self::insert_search_prefixes(&mut rows, name.as_str(), def, 90);
+            Self::insert_search_term_with_lowercase(&mut rows, path.as_str(), def, 88);
             for segment in path.split("::").filter(|segment| !segment.is_empty()) {
-                keys.insert(segment.to_string());
-                keys.insert(segment.to_lowercase());
+                Self::insert_search_term_with_lowercase(&mut rows, segment, def, 85);
+                Self::insert_search_prefixes(&mut rows, segment, def, 78);
+                for word in Self::identifier_words(segment) {
+                    Self::insert_search_term_with_lowercase(&mut rows, word.as_str(), def, 82);
+                    Self::insert_search_prefixes(&mut rows, word.as_str(), def, 74);
+                }
             }
-            for key in keys {
-                let score = if key == name {
-                    100
-                } else if key.eq_ignore_ascii_case(name.as_str()) {
-                    95
-                } else if path.contains(key.as_str()) {
-                    85
-                } else {
-                    70
-                };
-                rows.insert((key, def, score));
+            for word in Self::identifier_words(name.as_str()) {
+                Self::insert_search_term_with_lowercase(&mut rows, word.as_str(), def, 95);
+                Self::insert_search_prefixes(&mut rows, word.as_str(), def, 86);
             }
         }
         rows.into_iter()
-            .map(|(key, def, score)| {
+            .map(|((key, def), score)| {
                 vec![
                     RuntimeValue::String(key),
                     rv_def(def),

@@ -115,3 +115,56 @@ seed().
         "include-only entrypoint should not inherit unreachable included capabilities; required={required:?}"
     );
 }
+
+#[test]
+fn search_capability_is_supported_on_the_daemon_runtime() {
+    let root = temp_workspace_root("search_supported");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.decl search(Q: string, D: Def, Score: int) extern.
+.decl hit(D: Def, Score: int).
+hit(D, Score) :- search("caller", D, Score).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+        .expect("search should be supported in the daemon runtime");
+}
+
+#[test]
+fn structure_and_trait_capabilities_are_supported_on_the_daemon_runtime() {
+    let root = temp_workspace_root("structure_trait_supported");
+    let service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let src = r#"
+.decl field(Owner: Def, Name: string, Ty: TypeRef) extern.
+.decl variant(Enum: Def, Name: string, VariantDef: Def) extern.
+.decl method(Owner: Def, Method: Def) extern.
+.decl trait_method(Owner: Def, Method: Def) extern.
+.decl implements(Type: Def, Trait: Def, ImplDef: Def) extern.
+.decl from_impl(Src: Def, Dst: Def, ImplDef: Def) extern.
+.decl hit().
+hit() :-
+  field(_, _, _),
+  variant(_, _, _),
+  method(_, _),
+  trait_method(_, _),
+  implements(_, _, _),
+  from_impl(_, _, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let planned = plan(typed).expect("plan");
+    let required = required_extern_capabilities(&planned)
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    MissingCapabilitiesError::from_required_and_supported(required, service.supported_capabilities())
+        .expect("structure/trait capabilities should be supported in the daemon runtime");
+}

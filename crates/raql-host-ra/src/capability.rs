@@ -2,11 +2,18 @@ use raql_host::{CapabilityId, CapabilitySet};
 
 const DAY_ONE_SUPPORTED_CAPABILITIES: &[&str] = &[
     "def",
+    "search",
     "def_name",
     "def_kind",
     "def_span",
     "def_path",
     "method_of",
+    "field",
+    "variant",
+    "method",
+    "trait_method",
+    "implements",
+    "from_impl",
     "span_allowed",
     "is_public",
     "in_test",
