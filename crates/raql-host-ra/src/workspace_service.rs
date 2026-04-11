@@ -20,7 +20,7 @@ use raql_host::{
     SpanCoord, SpanKey, is_engine_managed_extern, is_runtime_scalar_input_predicate,
 };
 use hir::import_map::AssocSearchMode;
-use syntax::ast::{HasGenericArgs, HasModuleItem, HasName};
+use syntax::ast::{HasGenericArgs, HasName};
 use syntax::{ast, AstNode, Edition};
 use vfs::{AbsPathBuf, VfsPath};
 
@@ -415,10 +415,9 @@ impl WorkspaceService {
         &mut self,
         request: &ExternLookupRequest,
     ) -> Result<Vec<Vec<ExternLookupValue>>, RaHostInitError> {
-        // TODO(ra-native-audit): exact-name lookup still falls back to tracked-file text scans,
-        // path-prefix crate guessing, and RA AST walks over candidate files. Replace this with an
-        // RA/HIR-native exact-name provider so cold def seeds stop depending on raw filesystem
-        // reads and ad hoc candidate narrowing.
+        // TODO(ra-native-audit): exact-name lookup is now RA-native, but it still does a full
+        // local-module fallback walk after the world symbol index misses. Push this into a real
+        // DefProvider with query-shaped caching instead of keeping the traversal inline here.
         let mut requested_name = None::<&str>;
         let mut def_filter = None::<DefId>;
         for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
@@ -461,498 +460,6 @@ impl WorkspaceService {
         let Some(requested_name) = requested_name else {
             return Ok(Vec::new());
         };
-
-        fn push_named_ast_def(
-            rows: &mut BTreeSet<Vec<ExternLookupValue>>,
-            id_host: &mut DeterministicRaHost,
-            lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-            lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-            requested_name: &str,
-            def_filter: Option<DefId>,
-            rel_path: &str,
-            file_id: span::EditionedFileId,
-            source_text: &str,
-            kind: DefKind,
-            name: &str,
-            range: syntax::TextRange,
-            path: Option<Box<str>>,
-            entity: Option<RaEntity>,
-        ) {
-            if name != requested_name {
-                return;
-            }
-            let Some(span_key) = lookup_span_key_from_text(rel_path, source_text, range) else {
-                return;
-            };
-            let Ok(span) = id_host.intern_span_from_text(file_id, rel_path, source_text, range)
-            else {
-                return;
-            };
-            let token = format!(
-                "lookup_def:{kind:?}:{rel_path}:{}..{}",
-                u32::from(range.start()),
-                u32::from(range.end())
-            );
-            let def_id = id_host.intern_def_from_token(token.as_str());
-            if def_filter.is_some_and(|expected| expected != def_id) {
-                return;
-            }
-            lookup_defs.insert(
-                def_id,
-                LookupDefRecord {
-                    name: name.to_string().into_boxed_str(),
-                    kind,
-                    span,
-                    path,
-                    entity,
-                    ra_span: Some(RaSpan { file_id, range }),
-                },
-            );
-            lookup_spans.insert(span, span_key);
-            rows.insert(vec![
-                ExternLookupValue::Host(ExternLookupHostValue::new(
-                    ExternLookupHostValueKind::Def,
-                    def_id.stable_id(),
-                )),
-                ExternLookupValue::String(name.to_string().into_boxed_str()),
-            ]);
-        }
-
-        fn push_named_function_def(
-            sema: &hir::Semantics<'_, ide::RootDatabase>,
-            rows: &mut BTreeSet<Vec<ExternLookupValue>>,
-            id_host: &mut DeterministicRaHost,
-            lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-            lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-            requested_name: &str,
-            def_filter: Option<DefId>,
-            rel_path: &str,
-            file_id: span::EditionedFileId,
-            source_text: &str,
-            kind: DefKind,
-            function_item: ast::Fn,
-        ) {
-            let Some(name) = function_item.name() else {
-                return;
-            };
-            if name.text().as_str() != requested_name {
-                return;
-            }
-            let entity = sema.to_def(&function_item).map(|function| RaEntity::ModuleDef(ModuleDef::Function(function)));
-            push_named_ast_def(
-                rows,
-                id_host,
-                lookup_defs,
-                lookup_spans,
-                requested_name,
-                def_filter,
-                rel_path,
-                file_id,
-                source_text,
-                kind,
-                name.text().as_str(),
-                function_item.syntax().text_range(),
-                None,
-                entity,
-            );
-        }
-
-        fn collect_named_assoc_defs(
-            sema: &hir::Semantics<'_, ide::RootDatabase>,
-            item: ast::AssocItem,
-            rows: &mut BTreeSet<Vec<ExternLookupValue>>,
-            id_host: &mut DeterministicRaHost,
-            lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-            lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-            requested_name: &str,
-            def_filter: Option<DefId>,
-            rel_path: &str,
-            file_id: span::EditionedFileId,
-            source_text: &str,
-        ) {
-            if let ast::AssocItem::Fn(function_item) = item {
-                push_named_function_def(
-                    sema,
-                    rows,
-                    id_host,
-                    lookup_defs,
-                    lookup_spans,
-                    requested_name,
-                    def_filter,
-                    rel_path,
-                    file_id,
-                    source_text,
-                    DefKind::Method,
-                    function_item,
-                );
-            }
-        }
-
-        fn collect_named_defs_from_item(
-            sema: &hir::Semantics<'_, ide::RootDatabase>,
-            item: ast::Item,
-            rows: &mut BTreeSet<Vec<ExternLookupValue>>,
-            id_host: &mut DeterministicRaHost,
-            lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-            lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-            requested_name: &str,
-            def_filter: Option<DefId>,
-            rel_path: &str,
-            file_id: span::EditionedFileId,
-            source_text: &str,
-        ) {
-            match item {
-                ast::Item::Fn(function_item) => {
-                    push_named_function_def(
-                        sema,
-                        rows,
-                        id_host,
-                        lookup_defs,
-                        lookup_spans,
-                        requested_name,
-                        def_filter,
-                        rel_path,
-                        file_id,
-                        source_text,
-                        DefKind::Fn,
-                        function_item,
-                    );
-                }
-                ast::Item::Struct(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Struct,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                }
-                ast::Item::Union(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Union,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                }
-                ast::Item::Enum(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Enum,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                    if let Some(variant_list) = it.variant_list() {
-                        for variant in variant_list.variants() {
-                            if let Some(name) = variant.name() {
-                                push_named_ast_def(
-                                    rows,
-                                    id_host,
-                                    lookup_defs,
-                                    lookup_spans,
-                                    requested_name,
-                                    def_filter,
-                                    rel_path,
-                                    file_id,
-                                    source_text,
-                                    DefKind::Variant,
-                                    name.text().as_str(),
-                                    variant.syntax().text_range(),
-                                    None,
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                }
-                ast::Item::Trait(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Trait,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                    if let Some(item_list) = it.assoc_item_list() {
-                        for child in item_list.assoc_items() {
-                            collect_named_assoc_defs(
-                                sema,
-                                child,
-                                rows,
-                                id_host,
-                                lookup_defs,
-                                lookup_spans,
-                                requested_name,
-                                def_filter,
-                                rel_path,
-                                file_id,
-                                source_text,
-                            );
-                        }
-                    }
-                }
-                ast::Item::Module(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Mod,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                    if let Some(item_list) = it.item_list() {
-                        for child in item_list.items() {
-                            collect_named_defs_from_item(
-                                sema,
-                                child,
-                                rows,
-                                id_host,
-                                lookup_defs,
-                                lookup_spans,
-                                requested_name,
-                                def_filter,
-                                rel_path,
-                                file_id,
-                                source_text,
-                            );
-                        }
-                    }
-                }
-                ast::Item::Impl(it) => {
-                    if let Some(item_list) = it.assoc_item_list() {
-                        for child in item_list.assoc_items() {
-                            collect_named_assoc_defs(
-                                sema,
-                                child,
-                                rows,
-                                id_host,
-                                lookup_defs,
-                                lookup_spans,
-                                requested_name,
-                                def_filter,
-                                rel_path,
-                                file_id,
-                                source_text,
-                            );
-                        }
-                    }
-                }
-                ast::Item::MacroRules(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Macro,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                }
-                ast::Item::MacroDef(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Macro,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                }
-                ast::Item::TypeAlias(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::TypeAlias,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                }
-                ast::Item::Const(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Const,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                }
-                ast::Item::Static(it) => {
-                    if let Some(name) = it.name() {
-                        push_named_ast_def(
-                            rows,
-                            id_host,
-                            lookup_defs,
-                            lookup_spans,
-                            requested_name,
-                            def_filter,
-                            rel_path,
-                            file_id,
-                            source_text,
-                            DefKind::Static,
-                            name.text().as_str(),
-                            it.syntax().text_range(),
-                            None,
-                            None,
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn collect_named_functions_from_module(
-            db: &ide::RootDatabase,
-            vfs: &vfs::Vfs,
-            workspace_root: &Path,
-            module: hir::Module,
-            target_file: vfs::FileId,
-            requested_name: &str,
-            def_filter: Option<DefId>,
-            rows: &mut BTreeSet<Vec<ExternLookupValue>>,
-            id_host: &mut DeterministicRaHost,
-            lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-            lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-        ) {
-            let query_name =
-                ide_db::imports::import_assets::NameToImport::Exact(requested_name.to_string(), true);
-            let _ = ide_db::items_locator::items_with_name_in_module(
-                db,
-                module,
-                query_name,
-                ide_db::items_locator::AssocSearchMode::Include,
-                |item| {
-                    let ModuleDef::Function(function) = item.into_module_def() else {
-                        return std::ops::ControlFlow::<()>::Continue(());
-                    };
-                    let Some(source) = function.source(db) else {
-                        return std::ops::ControlFlow::<()>::Continue(());
-                    };
-                    let editioned = source.file_id.original_file(db);
-                    if editioned.file_id(db) != target_file {
-                        return std::ops::ControlFlow::<()>::Continue(());
-                    }
-                    let Some(def_id) = WorkspaceService::ensure_lookup_function_def(
-                        db,
-                        vfs,
-                        workspace_root,
-                        lookup_defs,
-                        lookup_spans,
-                        id_host,
-                        function,
-                    ) else {
-                        return std::ops::ControlFlow::<()>::Continue(());
-                    };
-                    if def_filter.is_some_and(|expected| expected != def_id) {
-                        return std::ops::ControlFlow::<()>::Continue(());
-                    }
-                    rows.insert(vec![
-                        ExternLookupValue::Host(ExternLookupHostValue::new(
-                            ExternLookupHostValueKind::Def,
-                            def_id.stable_id(),
-                        )),
-                        ExternLookupValue::String(requested_name.to_string().into_boxed_str()),
-                    ]);
-                    std::ops::ControlFlow::<()>::Continue(())
-                },
-            );
-        }
 
         let workspace_root = self.workspace_root.clone();
         let vfs = &self.vfs;
@@ -1014,126 +521,53 @@ impl WorkspaceService {
         if !symbol_rows.is_empty() {
             return Ok(symbol_rows.into_iter().collect());
         }
-        let scan_started = Instant::now();
-        let mut candidate_files = Vec::<(PathBuf, String)>::new();
-        for path in &self.tracked_files {
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let Ok(text) = fs::read_to_string(path) else {
-                continue;
-            };
-            if text.contains(requested_name) {
-                candidate_files.push((path.clone(), text));
-            }
-        }
-        trace_timing(
-            "workspace_service.lookup_def_name_rows.scan_candidates",
-            scan_started.elapsed(),
-        );
-        let resolve_started = Instant::now();
-        let mut ast_fallback_total = std::time::Duration::ZERO;
+        let fallback_started = Instant::now();
         let mut id_host = DeterministicRaHost::new();
         let mut rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-        hir::attach_db(db, || {
-            let sema = hir::Semantics::new(db);
-            for (path, text) in &candidate_files {
-                let rel_path = path
-                    .strip_prefix(workspace_root.as_path())
-                    .unwrap_or(path.as_path())
-                    .display()
-                    .to_string();
-                let Ok(utf8) = Utf8PathBuf::from_path_buf(path.clone()) else {
-                    continue;
-                };
-                let abs = AbsPathBuf::assert(utf8);
-                let vfs_path = VfsPath::from(abs);
-                let Some((file_id, excluded)) = vfs.file_id(&vfs_path) else {
-                    continue;
-                };
-                if matches!(excluded, vfs::FileExcluded::Yes) {
-                    continue;
-                }
-                let ast_fallback_started = Instant::now();
-                let editioned = base_db::EditionedFileId::current_edition_guess_origin(db, file_id);
-                let source = sema.parse(editioned);
-                for item in source.items() {
-                    collect_named_defs_from_item(
-                        &sema,
-                        item,
-                        &mut rows,
-                        &mut id_host,
-                        lookup_defs,
-                        lookup_spans,
-                        requested_name,
-                        def_filter,
-                        rel_path.as_str(),
-                        editioned.editioned_file_id(db),
-                        text.as_str(),
-                    );
-                }
-                ast_fallback_total += ast_fallback_started.elapsed();
+        for krate in hir::Crate::all(db)
+            .into_iter()
+            .filter(|krate| krate.origin(db).is_local())
+        {
+            let mut modules = vec![krate.root_module(db)];
+            while let Some(module) = modules.pop() {
+                let query_name =
+                    ide_db::imports::import_assets::NameToImport::Exact(requested_name.to_owned(), true);
+                let _ = ide_db::items_locator::items_with_name_in_module(
+                    db,
+                    module,
+                    query_name,
+                    ide_db::items_locator::AssocSearchMode::Include,
+                    |item| {
+                        let def = item.into_module_def();
+                        let Some(def_id) = Self::ensure_lookup_source_module_def(
+                            db,
+                            vfs,
+                            workspace_root.as_path(),
+                            lookup_defs,
+                            lookup_spans,
+                            &mut id_host,
+                            def,
+                        ) else {
+                            return std::ops::ControlFlow::<()>::Continue(());
+                        };
+                        if def_filter.is_some_and(|expected| expected != def_id) {
+                            return std::ops::ControlFlow::<()>::Continue(());
+                        }
+                        rows.insert(vec![
+                            ExternLookupValue::Host(ExternLookupHostValue::new(
+                                ExternLookupHostValueKind::Def,
+                                def_id.stable_id(),
+                            )),
+                            ExternLookupValue::String(requested_name.to_owned().into_boxed_str()),
+                        ]);
+                        std::ops::ControlFlow::<()>::Continue(())
+                    },
+                );
+                modules.extend(module.children(db));
             }
-        });
-        if std::env::var_os("RAQL_TRACE_TIMINGS").is_some() {
-            eprintln!(
-                "raql-timing workspace_service.lookup_def_name_rows.resolve_candidates_parts ast_fallback_ms={}",
-                ast_fallback_total.as_millis(),
-            );
         }
         trace_timing(
-            "workspace_service.lookup_def_name_rows.resolve_candidates",
-            resolve_started.elapsed(),
-        );
-        if !rows.is_empty() {
-            return Ok(rows.into_iter().collect());
-        }
-
-        let fallback_started = Instant::now();
-        let mut fallback_hir_ms = std::time::Duration::ZERO;
-        hir::attach_db(db, || {
-            for (path, _) in &candidate_files {
-                let Ok(utf8) = Utf8PathBuf::from_path_buf(path.clone()) else {
-                    continue;
-                };
-                let abs = AbsPathBuf::assert(utf8);
-                let vfs_path = VfsPath::from(abs);
-                let Some((file_id, excluded)) = vfs.file_id(&vfs_path) else {
-                    continue;
-                };
-                if matches!(excluded, vfs::FileExcluded::Yes) {
-                    continue;
-                }
-                let started = Instant::now();
-                for module in hir::Semantics::new(db).file_to_module_defs(file_id) {
-                    collect_named_functions_from_module(
-                        db,
-                        vfs,
-                        workspace_root.as_path(),
-                        module,
-                        file_id,
-                        requested_name,
-                        def_filter,
-                        &mut rows,
-                        &mut id_host,
-                        lookup_defs,
-                        lookup_spans,
-                    );
-                }
-                fallback_hir_ms += started.elapsed();
-                if !rows.is_empty() {
-                    break;
-                }
-            }
-        });
-        if std::env::var_os("RAQL_TRACE_TIMINGS").is_some() {
-            eprintln!(
-                "raql-timing workspace_service.lookup_def_name_rows.hir_fallback hir_ms={}",
-                fallback_hir_ms.as_millis(),
-            );
-        }
-        trace_timing(
-            "workspace_service.lookup_def_name_rows.hir_fallback.total",
+            "workspace_service.lookup_def_name_rows.module_fallback.total",
             fallback_started.elapsed(),
         );
         if !rows.is_empty() {
@@ -2070,45 +1504,102 @@ impl WorkspaceService {
         id_host: &mut DeterministicRaHost,
         function: hir::Function,
     ) -> Option<DefId> {
-        let source = function.source(db)?;
-        let editioned = source.file_id.original_file(db);
-        let local = Self::lookup_local_file(vfs, workspace_root, db, editioned.file_id(db))?;
-        let range = source.value.syntax().text_range();
-        let span_key =
-            lookup_span_key_from_text(local.rel_path.as_str(), local.text.as_str(), range)?;
-        let span = id_host
-            .intern_span_from_text(
-                editioned.editioned_file_id(db),
-                local.rel_path.clone(),
-                local.text.as_str(),
-                range,
-            )
-            .ok()?;
-        let kind = if function.has_self_param(db) {
-            DefKind::Method
-        } else {
-            DefKind::Fn
+        Self::ensure_lookup_source_module_def(
+            db,
+            vfs,
+            workspace_root,
+            lookup_defs,
+            lookup_spans,
+            id_host,
+            ModuleDef::Function(function),
+        )
+    }
+
+    fn ensure_lookup_source_module_def(
+        db: &ide::RootDatabase,
+        vfs: &vfs::Vfs,
+        workspace_root: &Path,
+        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+        id_host: &mut DeterministicRaHost,
+        def: ModuleDef,
+    ) -> Option<DefId> {
+        let (file_id, range) = match def {
+            ModuleDef::Module(module) => {
+                let range = module
+                    .declaration_source_range(db)
+                    .unwrap_or_else(|| module.definition_source_range(db));
+                (range.file_id.original_file(db).editioned_file_id(db), range.value)
+            }
+            ModuleDef::Function(function) => {
+                let source = function.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::Adt(adt) => {
+                let source = adt.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::Variant(variant) => {
+                let source = variant.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::Const(const_) => {
+                let source = const_.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::Static(static_) => {
+                let source = static_.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::Trait(trait_) => {
+                let source = trait_.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::TypeAlias(alias) => {
+                let source = alias.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::Macro(mac) => {
+                let source = mac.source(db)?;
+                (
+                    source.file_id.original_file(db).editioned_file_id(db),
+                    source.value.syntax().text_range(),
+                )
+            }
+            ModuleDef::BuiltinType(_) => return None,
         };
-        let path = canonical_function_path(db, function);
-        let token = format!("def:function:{path}");
-        let def_id = id_host.intern_def_from_token(token.as_str());
-        let name = function.name(db).display(db, Edition::CURRENT).to_string();
-        lookup_defs.insert(
-            def_id,
-            LookupDefRecord {
-                name: name.into_boxed_str(),
-                kind,
-                span,
-                path: Some(path.into_boxed_str()),
-                entity: Some(RaEntity::ModuleDef(ModuleDef::Function(function))),
-                ra_span: Some(RaSpan {
-                    file_id: editioned.editioned_file_id(db),
-                    range,
-                }),
-            },
-        );
-        lookup_spans.insert(span, span_key);
-        Some(def_id)
+        Self::ensure_lookup_symbol_module_def(
+            db,
+            vfs,
+            workspace_root,
+            lookup_defs,
+            lookup_spans,
+            id_host,
+            def,
+            file_id,
+            range,
+        )
     }
 
     fn def_kind_for_module_def(db: &ide::RootDatabase, def: ModuleDef) -> Option<DefKind> {
