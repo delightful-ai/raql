@@ -26,11 +26,7 @@ use vfs::{AbsPathBuf, VfsPath};
 
 use crate::capability::{day_one_supported_capabilities, supports_day_one_capability};
 use crate::lazy_runtime::LazyRaRuntime;
-use crate::provider::calls::{
-    CallLookupFilters, collect_lookup_call_edges_for_function, collect_lookup_callers_for_function,
-    dispatch_lookup_value, lookup_call_target_from_callable, lookup_callable_owner_def,
-    method_dispatch_kind, push_lookup_call_edge_row,
-};
+use crate::provider::calls::{lookup_call_edge_rows as provider_lookup_call_edge_rows, method_dispatch_kind};
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
     LocalFile, LookupDefRecord, RaEntity, canonical_function_path, def_kind_from_variant,
@@ -385,18 +381,7 @@ impl WorkspaceService {
         let result = execute(planned, &mut runtime);
         trace_timing("workspace_service.execute", execute_started.elapsed());
         trace_timing("workspace_service.run_planned.total", run_started.elapsed());
-        let rows = Some(vec![vec![
-            ExternLookupValue::Host(ExternLookupHostValue::new(
-                ExternLookupHostValueKind::Def,
-                def.stable_id(),
-            )),
-            ExternLookupValue::String(path),
-        ]]);
-        trace_timing(
-            "workspace_service.lookup_def_path_rows.total",
-            lookup_started.elapsed(),
-        );
-        Ok(rows)
+        result
     }
 
     fn lookup_call_edge_rows(
@@ -404,163 +389,19 @@ impl WorkspaceService {
         request: &ExternLookupRequest,
     ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, RaHostInitError> {
         let lookup_started = Instant::now();
-        let mut caller_filter = None::<DefId>;
-        let mut callee_filter = None::<DefId>;
-        let mut site_filter = None::<SpanId>;
-        let mut dispatch_filter = None::<crate::DispatchKind>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Def =>
-                {
-                    caller_filter = Some(DefId::new(host.stable_id()));
-                }
-                (1, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Def =>
-                {
-                    callee_filter = Some(DefId::new(host.stable_id()));
-                }
-                (2, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Span =>
-                {
-                    site_filter = Some(SpanId::new(host.stable_id()));
-                }
-                (3, ExternLookupValue::Enum { name, variant })
-                    if name.as_ref() == "DispatchKind" =>
-                {
-                    let Some(dispatch) = dispatch_kind_from_variant(variant.as_ref()) else {
-                        return Ok(Some(Vec::new()));
-                    };
-                    dispatch_filter = Some(dispatch);
-                }
-                _ => return Ok(None),
-            }
-        }
-        if caller_filter.is_none() && callee_filter.is_none() {
-            return Ok(None);
-        }
-
-        let mut id_host = DeterministicRaHost::new();
-        let mut rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-        let mut unsupported = false;
-        let mut lookup_defs = self.lookup_defs.clone();
-        let mut lookup_spans = self.lookup_spans.clone();
-        let db = self.analysis_host.raw_database();
-        let mut lookup_error = None::<Option<Vec<Vec<ExternLookupValue>>>>;
-        hir::attach_db(db, || {
-            let sema = hir::Semantics::new(db);
-            if let Some(caller) = caller_filter {
-                let Some(record) = lookup_defs.get(&caller).cloned() else {
-                    lookup_error = Some(None);
-                    return;
-                };
-                let Some(function) = record
-                    .entity
-                    .as_ref()
-                    .and_then(RaEntity::as_function)
-                else {
-                    lookup_error = Some(Some(Vec::new()));
-                    return;
-                };
-                if let Some(entry) = lookup_defs.get_mut(&caller) {
-                    entry.entity = Some(RaEntity::ModuleDef(ModuleDef::Function(function)));
-                }
-                if !collect_lookup_call_edges_for_function(
-                    db,
-                    &self.vfs,
-                    self.workspace_root.as_path(),
-                    &sema,
-                    &mut lookup_defs,
-                    &mut lookup_spans,
-                    &mut id_host,
-                    &mut rows,
-                    caller,
-                    function,
-                    &CallLookupFilters {
-                        peer_filter: callee_filter,
-                        site_filter,
-                        dispatch_filter,
-                    },
-                ) {
-                    unsupported = true;
-                }
-            } else if let Some(callee) = callee_filter {
-                let Some(record) = lookup_defs.get(&callee).cloned() else {
-                    lookup_error = Some(None);
-                    return;
-                };
-                let collect_started = Instant::now();
-                let resolve_function_started = Instant::now();
-                let resolved = record
-                    .entity
-                    .as_ref()
-                    .and_then(RaEntity::as_function);
-                let resolve_function_elapsed = resolve_function_started.elapsed();
-                if let Some(resolved) = resolved {
-                    if let Some(entry) = lookup_defs.get_mut(&callee) {
-                        entry.entity = Some(RaEntity::ModuleDef(ModuleDef::Function(resolved)));
-                    }
-                    let collect_callers_started = Instant::now();
-                    if !collect_lookup_callers_for_function(
-                        db,
-                        &self.vfs,
-                        self.workspace_root.as_path(),
-                        &sema,
-                        &mut lookup_defs,
-                        &mut lookup_spans,
-                        &mut id_host,
-                        &mut rows,
-                        resolved,
-                        callee,
-                        &CallLookupFilters {
-                            peer_filter: caller_filter,
-                            site_filter,
-                            dispatch_filter,
-                        },
-                    ) {
-                        unsupported = true;
-                    }
-                    if std::env::var_os("RAQL_TRACE_TIMINGS").is_some() {
-                        eprintln!(
-                            "raql-timing workspace_service.lookup_call_edge_rows.callee_parts resolve_function_ms={} collect_callers_ms={}",
-                            resolve_function_elapsed.as_millis(),
-                            collect_callers_started.elapsed().as_millis(),
-                        );
-                    }
-                } else {
-                    lookup_error = Some(Some(Vec::new()));
-                    return;
-                }
-                trace_timing(
-                    "workspace_service.lookup_call_edge_rows.callee_collect",
-                    collect_started.elapsed(),
-                );
-            }
-        });
-
-        if let Some(result) = lookup_error {
-            trace_timing(
-                "workspace_service.lookup_call_edge_rows.total",
-                lookup_started.elapsed(),
-            );
-            return Ok(result);
-        }
-
-        if unsupported {
-            trace_timing(
-                "workspace_service.lookup_call_edge_rows.total",
-                lookup_started.elapsed(),
-            );
-            return Ok(None);
-        }
-        self.lookup_defs = lookup_defs;
-        self.lookup_spans = lookup_spans;
-        let rows = Some(rows.into_iter().collect());
+        let rows = provider_lookup_call_edge_rows(
+            request,
+            self.analysis_host.raw_database(),
+            &self.vfs,
+            self.workspace_root.as_path(),
+            &mut self.lookup_defs,
+            &mut self.lookup_spans,
+        );
         trace_timing(
             "workspace_service.lookup_call_edge_rows.total",
             lookup_started.elapsed(),
         );
-        Ok(rows)
+        rows
     }
 
     fn lookup_def_rows(&self, request: &ExternLookupRequest) -> Vec<Vec<ExternLookupValue>> {
@@ -2178,17 +2019,6 @@ fn path_type_arg_asts(ty: &ast::Type) -> Vec<ast::Type> {
             })
             .unwrap_or_default(),
         _ => Vec::new(),
-    }
-}
-
-fn dispatch_kind_from_variant(variant: &str) -> Option<crate::DispatchKind> {
-    match variant {
-        "DIRECT" => Some(crate::DispatchKind::Direct),
-        "THROUGH_TRAIT" => Some(crate::DispatchKind::ThroughTrait),
-        "DYN" => Some(crate::DispatchKind::Dyn),
-        "CLOSURE" => Some(crate::DispatchKind::Closure),
-        "FN_POINTER" => Some(crate::DispatchKind::FnPointer),
-        _ => None,
     }
 }
 

@@ -1,21 +1,170 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Instant;
 
 use hir::{HasSource, ModuleDef};
 use ide_db::search::ReferenceCategory;
-use raql_host::{ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupValue, SpanKey};
+use raql_host::{
+    ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
+    SpanKey,
+};
 use syntax::{ast, AstNode};
 
 use crate::provider::defs::{
-    LocalFile, LookupDefRecord, ensure_lookup_function_def, ensure_lookup_synthetic_callable_def,
-    lookup_local_file, lookup_span_key_from_text,
+    LocalFile, LookupDefRecord, RaEntity, ensure_lookup_function_def,
+    ensure_lookup_synthetic_callable_def, lookup_local_file, lookup_span_key_from_text,
 };
-use crate::{DefId, DeterministicRaHost, SpanId};
+use crate::{DefId, DeterministicRaHost, RaHostInitError, SpanId};
 
 pub(crate) struct CallLookupFilters {
     pub(crate) peer_filter: Option<DefId>,
     pub(crate) site_filter: Option<SpanId>,
     pub(crate) dispatch_filter: Option<crate::DispatchKind>,
+}
+
+pub(crate) fn lookup_call_edge_rows(
+    request: &ExternLookupRequest,
+    db: &ide::RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+) -> Result<Option<Vec<Vec<ExternLookupValue>>>, RaHostInitError> {
+    let mut caller_filter = None::<DefId>;
+    let mut callee_filter = None::<DefId>;
+    let mut site_filter = None::<SpanId>;
+    let mut dispatch_filter = None::<crate::DispatchKind>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                caller_filter = Some(DefId::new(host.stable_id()));
+            }
+            (1, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                callee_filter = Some(DefId::new(host.stable_id()));
+            }
+            (2, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Span =>
+            {
+                site_filter = Some(SpanId::new(host.stable_id()));
+            }
+            (3, ExternLookupValue::Enum { name, variant }) if name.as_ref() == "DispatchKind" => {
+                let Some(dispatch) = dispatch_kind_from_variant(variant.as_ref()) else {
+                    return Ok(Some(Vec::new()));
+                };
+                dispatch_filter = Some(dispatch);
+            }
+            _ => return Ok(None),
+        }
+    }
+    if caller_filter.is_none() && callee_filter.is_none() {
+        return Ok(None);
+    }
+
+    let mut id_host = DeterministicRaHost::new();
+    let mut rows = BTreeSet::<Vec<ExternLookupValue>>::new();
+    let mut unsupported = false;
+    let mut next_lookup_defs = lookup_defs.clone();
+    let mut next_lookup_spans = lookup_spans.clone();
+    let mut lookup_error = None::<Option<Vec<Vec<ExternLookupValue>>>>;
+    hir::attach_db(db, || {
+        let sema = hir::Semantics::new(db);
+        if let Some(caller) = caller_filter {
+            let Some(record) = next_lookup_defs.get(&caller).cloned() else {
+                lookup_error = Some(None);
+                return;
+            };
+            let Some(function) = record.entity.as_ref().and_then(RaEntity::as_function) else {
+                lookup_error = Some(Some(Vec::new()));
+                return;
+            };
+            if let Some(entry) = next_lookup_defs.get_mut(&caller) {
+                entry.entity = Some(RaEntity::ModuleDef(ModuleDef::Function(function)));
+            }
+            if !collect_lookup_call_edges_for_function(
+                db,
+                vfs,
+                workspace_root,
+                &sema,
+                &mut next_lookup_defs,
+                &mut next_lookup_spans,
+                &mut id_host,
+                &mut rows,
+                caller,
+                function,
+                &CallLookupFilters {
+                    peer_filter: callee_filter,
+                    site_filter,
+                    dispatch_filter,
+                },
+            ) {
+                unsupported = true;
+            }
+        } else if let Some(callee) = callee_filter {
+            let Some(record) = next_lookup_defs.get(&callee).cloned() else {
+                lookup_error = Some(None);
+                return;
+            };
+            let collect_started = Instant::now();
+            let resolve_function_started = Instant::now();
+            let resolved = record.entity.as_ref().and_then(RaEntity::as_function);
+            let resolve_function_elapsed = resolve_function_started.elapsed();
+            if let Some(resolved) = resolved {
+                if let Some(entry) = next_lookup_defs.get_mut(&callee) {
+                    entry.entity = Some(RaEntity::ModuleDef(ModuleDef::Function(resolved)));
+                }
+                let collect_callers_started = Instant::now();
+                if !collect_lookup_callers_for_function(
+                    db,
+                    vfs,
+                    workspace_root,
+                    &sema,
+                    &mut next_lookup_defs,
+                    &mut next_lookup_spans,
+                    &mut id_host,
+                    &mut rows,
+                    resolved,
+                    callee,
+                    &CallLookupFilters {
+                        peer_filter: caller_filter,
+                        site_filter,
+                        dispatch_filter,
+                    },
+                ) {
+                    unsupported = true;
+                }
+                if std::env::var_os("RAQL_TRACE_TIMINGS").is_some() {
+                    eprintln!(
+                        "raql-timing workspace_service.lookup_call_edge_rows.callee_parts resolve_function_ms={} collect_callers_ms={}",
+                        resolve_function_elapsed.as_millis(),
+                        collect_callers_started.elapsed().as_millis(),
+                    );
+                }
+            } else {
+                lookup_error = Some(Some(Vec::new()));
+                return;
+            }
+            if std::env::var_os("RAQL_TRACE_TIMINGS").is_some() {
+                eprintln!(
+                    "raql-timing workspace_service.lookup_call_edge_rows.callee_collect {}",
+                    collect_started.elapsed().as_millis()
+                );
+            }
+        }
+    });
+
+    if let Some(result) = lookup_error {
+        return Ok(result);
+    }
+    if unsupported {
+        return Ok(None);
+    }
+    *lookup_defs = next_lookup_defs;
+    *lookup_spans = next_lookup_spans;
+    Ok(Some(rows.into_iter().collect()))
 }
 
 pub(crate) fn collect_lookup_call_edges_for_function(
@@ -454,4 +603,15 @@ pub(crate) fn method_dispatch_kind(
         return crate::DispatchKind::ThroughTrait;
     }
     crate::DispatchKind::Direct
+}
+
+fn dispatch_kind_from_variant(variant: &str) -> Option<crate::DispatchKind> {
+    match variant {
+        "DIRECT" => Some(crate::DispatchKind::Direct),
+        "THROUGH_TRAIT" => Some(crate::DispatchKind::ThroughTrait),
+        "DYN" => Some(crate::DispatchKind::Dyn),
+        "CLOSURE" => Some(crate::DispatchKind::Closure),
+        "FN_POINTER" => Some(crate::DispatchKind::FnPointer),
+        _ => None,
+    }
 }
