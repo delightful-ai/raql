@@ -17,6 +17,7 @@ use thiserror::Error;
 mod workspace_loader;
 mod capability;
 mod lazy_runtime;
+mod provider;
 mod workspace_service;
 
 pub use raql_host::{

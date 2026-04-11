@@ -26,12 +26,12 @@ use vfs::{AbsPathBuf, VfsPath};
 
 use crate::capability::{day_one_supported_capabilities, supports_day_one_capability};
 use crate::lazy_runtime::LazyRaRuntime;
+use crate::provider::core_index::CoreLookupIndex;
 use crate::workspace_loader;
 use crate::{
     DefId, DefKind, DeterministicRaHost, GenericArg, Mutability, NodeId, NodeKind,
     RaHostInitError, SpanId, TypeShape, WorldStamp,
 };
-use raql_engine::{EngineHostView, HostValueKind, RuntimeValue};
 
 #[derive(Debug)]
 pub struct WorkspaceService {
@@ -41,6 +41,7 @@ pub struct WorkspaceService {
     vfs: vfs::Vfs,
     _proc_macro_client: Option<Box<dyn workspace_loader::ProcMacroClientHandle>>,
     core_host: Option<DeterministicRaHost>,
+    core_index: Option<CoreLookupIndex>,
     core_host_spec: Option<CoreHostBuildSpec>,
     tracked_files: BTreeSet<PathBuf>,
     tracked_file_states: BTreeMap<PathBuf, WatchedFileState>,
@@ -244,6 +245,7 @@ impl WorkspaceService {
             vfs: loaded.vfs,
             _proc_macro_client: loaded.proc_macro_client,
             core_host: None,
+            core_index: None,
             core_host_spec: None,
             tracked_files,
             tracked_file_states,
@@ -443,7 +445,7 @@ impl WorkspaceService {
                     ExternLookupValue::String(record.name.clone()),
                 ]]);
             }
-            if let Some(name) = self.lookup_bound_def_name_from_core_host(def) {
+            if let Some(name) = self.lookup_bound_def_name_from_core_index(def) {
                 if requested_name.is_some_and(|expected| expected != name.as_ref()) {
                     return Ok(Vec::new());
                 }
@@ -1141,20 +1143,18 @@ impl WorkspaceService {
         Ok(Vec::new())
     }
 
-    fn lookup_bound_def_name_from_core_host(&mut self, def: DefId) -> Option<Box<str>> {
-        let rows = EngineHostView::extern_relation_rows(self.core_host.as_mut()?, "def_name")
-            .ok()
-            .flatten()?;
-        rows.into_iter().find_map(|row| match row.as_slice() {
-            [
-                RuntimeValue::Host {
-                    kind: HostValueKind::Def,
-                    id,
-                },
-                RuntimeValue::String(name),
-            ] if *id == def.stable_id().as_u64() => Some(name.clone().into_boxed_str()),
-            _ => None,
-        })
+    fn lookup_bound_def_name_from_core_index(&self, def: DefId) -> Option<Box<str>> {
+        self.core_index
+            .as_ref()?
+            .def_name(def)
+            .map(|name| name.to_owned().into_boxed_str())
+    }
+
+    fn lookup_bound_def_path_from_core_index(&self, def: DefId) -> Option<Box<str>> {
+        self.core_index
+            .as_ref()?
+            .def_path(def)
+            .map(|path| path.to_owned().into_boxed_str())
     }
 
     fn lookup_def_path_rows(
@@ -1178,32 +1178,39 @@ impl WorkspaceService {
         let Some(def) = def else {
             return Ok(None);
         };
-        let Some(mut record) = self.lookup_defs.get(&def).cloned() else {
-            return Ok(None);
-        };
-        if record.path.is_none() {
-            let db = self.analysis_host.raw_database();
-            hir::attach_db(db, || {
-                if let Some(function) = record
-                    .entity
-                    .as_ref()
-                    .and_then(RaEntity::as_function)
-                {
-                    record.path = Some(canonical_function_path(db, function).into_boxed_str());
-                } else if let Some(path) = record.entity.as_ref().and_then(|entity| entity.canonical_path(db)) {
-                    record.path = Some(path.into_boxed_str());
-                }
-            });
-            if let Some(entry) = self.lookup_defs.get_mut(&def) {
-                if entry.path.is_none() {
-                    entry.path = record.path.clone();
-                }
-                if entry.entity.is_none() {
-                    entry.entity = record.entity.clone();
+        let mut path = if let Some(record) = self.lookup_defs.get(&def).cloned() {
+            let mut record = record;
+            if record.path.is_none() {
+                let db = self.analysis_host.raw_database();
+                hir::attach_db(db, || {
+                    if let Some(function) = record
+                        .entity
+                        .as_ref()
+                        .and_then(RaEntity::as_function)
+                    {
+                        record.path = Some(canonical_function_path(db, function).into_boxed_str());
+                    } else if let Some(path) =
+                        record.entity.as_ref().and_then(|entity| entity.canonical_path(db))
+                    {
+                        record.path = Some(path.into_boxed_str());
+                    }
+                });
+                if let Some(entry) = self.lookup_defs.get_mut(&def) {
+                    if entry.path.is_none() {
+                        entry.path = record.path.clone();
+                    }
+                    if entry.entity.is_none() {
+                        entry.entity = record.entity.clone();
+                    }
                 }
             }
-        }
-        let Some(path) = record.path.as_ref() else {
+            record
+                .path
+                .or_else(|| self.lookup_bound_def_path_from_core_index(def))
+        } else {
+            self.lookup_bound_def_path_from_core_index(def)
+        };
+        let Some(path) = path.take() else {
             return Ok(None);
         };
         if path_filter.is_some_and(|expected| expected != path.as_ref()) {
@@ -1218,7 +1225,7 @@ impl WorkspaceService {
                 ExternLookupHostValueKind::Def,
                 def.stable_id(),
             )),
-            ExternLookupValue::String(path.clone()),
+            ExternLookupValue::String(path),
         ]]);
         trace_timing(
             "workspace_service.lookup_def_path_rows.total",
@@ -2368,7 +2375,12 @@ impl WorkspaceService {
         let Some(def) = def else {
             return Vec::new();
         };
-        let Some(kind) = self.lookup_defs.get(&def).map(|record| record.kind) else {
+        let Some(kind) = self
+            .lookup_defs
+            .get(&def)
+            .map(|record| record.kind)
+            .or_else(|| self.core_index.as_ref().and_then(|index| index.def_kind(def)))
+        else {
             return Vec::new();
         };
         if kind_filter.is_some_and(|expected| expected != kind) {
@@ -2513,7 +2525,7 @@ impl WorkspaceService {
                 .is_none_or(|current| !current.covers(required_spec))
         {
             let build_started = Instant::now();
-            self.core_host = Some(build_core_host(
+            let artifacts = build_core_host(
                 &self.analysis_host,
                 &self.vfs,
                 &self.workspace_root,
@@ -2521,7 +2533,9 @@ impl WorkspaceService {
                 self.workspace_epoch,
                 self.content_revision,
                 &build_spec,
-            )?);
+            )?;
+            self.core_host = Some(artifacts.host);
+            self.core_index = Some(artifacts.index);
             trace_timing("workspace_service.ensure_core_host.build_core_host", build_started.elapsed());
             self.core_host_spec = Some(build_spec);
         }
@@ -2596,6 +2610,7 @@ impl WorkspaceService {
             // TODO(ra-native-audit): stop dropping the entire deterministic host for ordinary
             // source edits. Preserve or incrementally reconcile host state where safe.
             self.core_host = None;
+            self.core_index = None;
             self.core_host_spec = None;
             self.lookup_defs.clear();
             self.lookup_spans.clear();
@@ -2637,6 +2652,7 @@ impl WorkspaceService {
         self.vfs = vfs;
         self._proc_macro_client = proc_macro_client;
         self.core_host = None;
+        self.core_index = None;
         self.core_host_spec = None;
         self.tracked_files = tracked_files;
         self.tracked_file_states = tracked_file_states;
@@ -2690,6 +2706,7 @@ struct CoreFactsBuilder<'db> {
     build_spec: CoreHostBuildSpec,
     files: BTreeMap<vfs::FileId, LocalFile>,
     host: DeterministicRaHost,
+    core_index: CoreLookupIndex,
     def_path_by_id: BTreeMap<DefId, String>,
     local_adts: Vec<Adt>,
     local_traits: Vec<hir::Trait>,
@@ -2791,14 +2808,17 @@ impl<'db> CoreFactsBuilder<'db> {
                 if self.build_spec.def_handles {
                     self.host.insert_handle(def_id, format!("def://{path}"));
                 }
+                self.record_core_def(def_id, name, kind, path.as_str());
                 if self.build_spec.def_publicity {
-                    self.host.mark_public(def_id, module_def_is_public(symbol.def, self.db));
+                    let is_public = module_def_is_public(symbol.def, self.db);
+                    self.host.mark_public(def_id, is_public);
+                    self.core_index.mark_public(def_id, is_public);
                 }
                 if self.build_spec.def_test_flags {
-                    self.host
-                        .mark_in_test(def_id, module_def_in_test(symbol.def, self.db));
+                    let in_test = module_def_in_test(symbol.def, self.db);
+                    self.host.mark_in_test(def_id, in_test);
+                    self.core_index.mark_in_test(def_id, in_test);
                 }
-                self.def_path_by_id.insert(def_id, path);
             }
         });
         trace_timing("workspace_service.populate_defs_from_symbols.lower", lower_started.elapsed());
@@ -3384,7 +3404,9 @@ impl<'db> CoreFactsBuilder<'db> {
                 .insert_synthetic_def(def_id, name.as_str(), kind, path.as_str());
             self.host.mark_public(def_id, true);
             self.host.mark_in_test(def_id, false);
-            self.def_path_by_id.insert(def_id, path);
+            self.record_core_def(def_id, name.as_str(), kind, path.as_str());
+            self.core_index.mark_public(def_id, true);
+            self.core_index.mark_in_test(def_id, false);
         }
         def_id
     }
@@ -3423,14 +3445,15 @@ impl<'db> CoreFactsBuilder<'db> {
                 self.host.insert_handle(def_id, format!("def://{path}"));
                 self.host.mark_public(def_id, false);
                 self.host.mark_in_test(def_id, false);
-                self.def_path_by_id.insert(def_id, path);
             } else {
                 self.host
                     .insert_synthetic_def(def_id, label.as_str(), DefKind::Other, path.as_str());
                 self.host.mark_public(def_id, false);
                 self.host.mark_in_test(def_id, false);
-                self.def_path_by_id.insert(def_id, path);
             }
+            self.record_core_def(def_id, label.as_str(), DefKind::Other, path.as_str());
+            self.core_index.mark_public(def_id, false);
+            self.core_index.mark_in_test(def_id, false);
         }
         def_id
     }
@@ -3446,7 +3469,9 @@ impl<'db> CoreFactsBuilder<'db> {
                 .insert_synthetic_def(def_id, name.as_str(), DefKind::Other, path.as_str());
             self.host.mark_public(def_id, false);
             self.host.mark_in_test(def_id, false);
-            self.def_path_by_id.insert(def_id, path);
+            self.record_core_def(def_id, name.as_str(), DefKind::Other, path.as_str());
+            self.core_index.mark_public(def_id, false);
+            self.core_index.mark_in_test(def_id, false);
         }
         def_id
     }
@@ -3495,7 +3520,12 @@ impl<'db> CoreFactsBuilder<'db> {
         self.host.mark_public(def_id, false);
         self.host
             .mark_in_test(def_id, rel_path.starts_with("tests/") || rel_path.contains("/tests/"));
-        self.def_path_by_id.insert(def_id, path);
+        self.record_core_def(def_id, "impl", DefKind::Impl, path.as_str());
+        self.core_index.mark_public(def_id, false);
+        self.core_index.mark_in_test(
+            def_id,
+            rel_path.starts_with("tests/") || rel_path.contains("/tests/"),
+        );
         Some(def_id)
     }
 
@@ -3694,7 +3724,7 @@ impl<'db> CoreFactsBuilder<'db> {
         if self.build_spec.def_handles {
             self.host.insert_handle(def_id, format!("def://{path}"));
         }
-        self.def_path_by_id.insert(def_id, path.clone());
+        self.record_core_def(def_id, name.as_str(), kind, path.as_str());
 
         if self.build_spec.def_publicity {
             let is_public = match def {
@@ -3710,6 +3740,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 ModuleDef::BuiltinType(_) => false,
             };
             self.host.mark_public(def_id, is_public);
+            self.core_index.mark_public(def_id, is_public);
         }
         if self.build_spec.def_test_flags {
             let in_test_scope = match def {
@@ -3725,8 +3756,14 @@ impl<'db> CoreFactsBuilder<'db> {
                 ModuleDef::BuiltinType(_) => false,
             };
             self.host.mark_in_test(def_id, in_test || in_test_scope);
+            self.core_index.mark_in_test(def_id, in_test || in_test_scope);
         }
         Some(def_id)
+    }
+
+    fn record_core_def(&mut self, def_id: DefId, name: &str, kind: DefKind, path: &str) {
+        self.def_path_by_id.insert(def_id, path.to_owned());
+        self.core_index.record_def(def_id, name, kind, path);
     }
 
     fn module_is_test(&self, module: Module) -> bool {
@@ -3737,6 +3774,11 @@ impl<'db> CoreFactsBuilder<'db> {
     }
 }
 
+struct CoreHostArtifacts {
+    host: DeterministicRaHost,
+    index: CoreLookupIndex,
+}
+
 fn build_core_host(
     analysis_host: &AnalysisHost,
     vfs: &vfs::Vfs,
@@ -3745,7 +3787,7 @@ fn build_core_host(
     workspace_epoch: u64,
     content_revision: u64,
     build_spec: &CoreHostBuildSpec,
-) -> Result<DeterministicRaHost, RaHostInitError> {
+) -> Result<CoreHostArtifacts, RaHostInitError> {
     // TODO(ra-native-audit): this still rebuilds a whole deterministic host snapshot after hot-path
     // invalidation. Replace with narrower incremental reconciliation where possible.
     let build_started = Instant::now();
@@ -3784,6 +3826,7 @@ fn build_core_host(
         build_spec: build_spec.clone(),
         files,
         host,
+        core_index: CoreLookupIndex::default(),
         def_path_by_id: BTreeMap::new(),
         local_adts: Vec::new(),
         local_traits: Vec::new(),
@@ -3791,7 +3834,10 @@ fn build_core_host(
     };
     builder.populate(build_spec);
     trace_timing("workspace_service.build_core_host.total", build_started.elapsed());
-    Ok(builder.host)
+    Ok(CoreHostArtifacts {
+        host: builder.host,
+        index: builder.core_index,
+    })
 }
 
 fn trace_timing(label: &str, elapsed: std::time::Duration) {
