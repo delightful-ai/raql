@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Instant, UNIX_EPOCH};
 
-use base_db::{RootQueryDb, SourceDatabase};
+use base_db::SourceDatabase;
 use camino::Utf8PathBuf;
 use hir::{Adt, AssocItem, HasSource, HasVisibility, Impl, Module, ModuleDef};
 use ide::{AnalysisHost, LineIndex};
@@ -95,11 +95,8 @@ struct LookupDefRecord {
     kind: DefKind,
     span: SpanId,
     path: Option<Box<str>>,
-    crate_name: Option<Box<str>>,
-    module_ancestry: Vec<Box<str>>,
     entity: Option<RaEntity>,
     ra_span: Option<RaSpan>,
-    function_ptr: Option<syntax::AstPtr<ast::Fn>>,
     function: Option<hir::Function>,
 }
 
@@ -443,7 +440,6 @@ impl WorkspaceService {
             return Ok(Vec::new());
         };
 
-        let db = self.analysis_host.raw_database();
         fn push_named_ast_def(
             rows: &mut BTreeSet<Vec<ExternLookupValue>>,
             id_host: &mut DeterministicRaHost,
@@ -486,11 +482,8 @@ impl WorkspaceService {
                     kind,
                     span,
                     path,
-                    crate_name: None,
-                    module_ancestry: Vec::new(),
                     entity: function.map(RaEntity::Function),
                     ra_span: Some(RaSpan { file_id, range }),
-                    function_ptr: None,
                     function,
                 },
             );
@@ -505,10 +498,7 @@ impl WorkspaceService {
         }
 
         fn push_named_function_def(
-            _db: &ide::RootDatabase,
-            _vfs: &vfs::Vfs,
-            _workspace_root: &Path,
-            _sema: &hir::Semantics<'_, ide::RootDatabase>,
+            sema: &hir::Semantics<'_, ide::RootDatabase>,
             rows: &mut BTreeSet<Vec<ExternLookupValue>>,
             id_host: &mut DeterministicRaHost,
             lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
@@ -521,23 +511,13 @@ impl WorkspaceService {
             kind: DefKind,
             function_item: ast::Fn,
         ) {
-            fn module_ancestry(node: &syntax::SyntaxNode) -> Vec<Box<str>> {
-                let mut names = node
-                    .ancestors()
-                    .filter_map(ast::Module::cast)
-                    .filter_map(|module| {
-                        module.name().map(|name| name.text().to_string().into_boxed_str())
-                    })
-                    .collect::<Vec<_>>();
-                names.reverse();
-                names
-            }
             let Some(name) = function_item.name() else {
                 return;
             };
             if name.text().as_str() != requested_name {
                 return;
             }
+            let function = sema.to_def(&function_item);
             push_named_ast_def(
                 rows,
                 id_host,
@@ -552,24 +532,11 @@ impl WorkspaceService {
                 name.text().as_str(),
                 function_item.syntax().text_range(),
                 None,
-                None,
+                function,
             );
-            let token = format!(
-                "lookup_def:{kind:?}:{rel_path}:{}..{}",
-                u32::from(function_item.syntax().text_range().start()),
-                u32::from(function_item.syntax().text_range().end())
-            );
-            let def_id = id_host.intern_def_from_token(token.as_str());
-            if let Some(record) = lookup_defs.get_mut(&def_id) {
-                record.module_ancestry = module_ancestry(function_item.syntax());
-                record.function_ptr = Some(syntax::AstPtr::new(&function_item));
-            }
         }
 
         fn collect_named_assoc_defs(
-            db: &ide::RootDatabase,
-            vfs: &vfs::Vfs,
-            workspace_root: &Path,
             sema: &hir::Semantics<'_, ide::RootDatabase>,
             item: ast::AssocItem,
             rows: &mut BTreeSet<Vec<ExternLookupValue>>,
@@ -584,9 +551,6 @@ impl WorkspaceService {
         ) {
             if let ast::AssocItem::Fn(function_item) = item {
                 push_named_function_def(
-                    db,
-                    vfs,
-                    workspace_root,
                     sema,
                     rows,
                     id_host,
@@ -604,9 +568,6 @@ impl WorkspaceService {
         }
 
         fn collect_named_defs_from_item(
-            db: &ide::RootDatabase,
-            vfs: &vfs::Vfs,
-            workspace_root: &Path,
             sema: &hir::Semantics<'_, ide::RootDatabase>,
             item: ast::Item,
             rows: &mut BTreeSet<Vec<ExternLookupValue>>,
@@ -622,9 +583,6 @@ impl WorkspaceService {
             match item {
                 ast::Item::Fn(function_item) => {
                     push_named_function_def(
-                        db,
-                        vfs,
-                        workspace_root,
                         sema,
                         rows,
                         id_host,
@@ -743,9 +701,6 @@ impl WorkspaceService {
                     if let Some(item_list) = it.assoc_item_list() {
                         for child in item_list.assoc_items() {
                             collect_named_assoc_defs(
-                                db,
-                                vfs,
-                                workspace_root,
                                 sema,
                                 child,
                                 rows,
@@ -783,9 +738,6 @@ impl WorkspaceService {
                     if let Some(item_list) = it.item_list() {
                         for child in item_list.items() {
                             collect_named_defs_from_item(
-                                db,
-                                vfs,
-                                workspace_root,
                                 sema,
                                 child,
                                 rows,
@@ -805,9 +757,6 @@ impl WorkspaceService {
                     if let Some(item_list) = it.assoc_item_list() {
                         for child in item_list.assoc_items() {
                             collect_named_assoc_defs(
-                                db,
-                                vfs,
-                                workspace_root,
                                 sema,
                                 child,
                                 rows,
@@ -1081,9 +1030,6 @@ impl WorkspaceService {
                 let source = sema.parse(editioned);
                 for item in source.items() {
                     collect_named_defs_from_item(
-                        db,
-                        vfs,
-                        workspace_root.as_path(),
                         &sema,
                         item,
                         &mut rows,
@@ -1195,13 +1141,11 @@ impl WorkspaceService {
         if record.path.is_none() {
             let db = self.analysis_host.raw_database();
             hir::attach_db(db, || {
-                let sema = hir::Semantics::new(db);
                 if let Some(function) = record
                     .entity
                     .as_ref()
                     .and_then(RaEntity::as_function)
                     .or(record.function)
-                    .or_else(|| Self::lookup_function_from_ra_span(db, &sema, &record))
                 {
                     record.path = Some(canonical_function_path(db, function).into_boxed_str());
                     record.entity = Some(RaEntity::Function(function));
@@ -1242,199 +1186,6 @@ impl WorkspaceService {
             lookup_started.elapsed(),
         );
         Ok(rows)
-    }
-
-    fn lookup_function_from_ra_span(
-        db: &ide::RootDatabase,
-        sema: &hir::Semantics<'_, ide::RootDatabase>,
-        record: &LookupDefRecord,
-    ) -> Option<hir::Function> {
-        let ra_span = record.ra_span.clone()?;
-        let relevant_crates = db.relevant_crates(ra_span.file_id.file_id());
-        for krate in hir::Crate::all(db)
-            .into_iter()
-            .filter(|krate| relevant_crates.iter().any(|candidate| *candidate == krate.base()))
-        {
-            let Some(display_name) = krate.display_name(db) else {
-                continue;
-            };
-            let mut query_text = format!("::{}", display_name.canonical_name());
-            for module_name in &record.module_ancestry {
-                query_text.push_str("::");
-                query_text.push_str(module_name);
-            }
-            query_text.push_str("::");
-            query_text.push_str(record.name.as_ref());
-            query_text.push('#');
-            let mut query = Query::new(query_text);
-            query.exact();
-            query.exclude_imports();
-            for symbol in world_symbols(db, query) {
-                if symbol.is_alias || symbol.is_import {
-                    continue;
-                }
-                let ModuleDef::Function(function) = symbol.def else {
-                    continue;
-                };
-                let function_kind = if function.has_self_param(db) {
-                    DefKind::Method
-                } else {
-                    DefKind::Fn
-                };
-                if function_kind != record.kind {
-                    continue;
-                }
-                let original = symbol.loc.hir_file_id.original_file_respecting_includes(db);
-                if original.file_id(db) == ra_span.file_id.file_id()
-                    && symbol.loc.ptr.text_range() == ra_span.range
-                {
-                    return Some(function);
-                }
-            }
-        }
-        let mut candidates = Vec::<hir::Function>::new();
-        ide_db::helpers::visit_file_defs(sema, ra_span.file_id.file_id(), &mut |definition| {
-            let ide_db::defs::Definition::Function(function) = definition else {
-                return;
-            };
-            if function.name(db).as_str() != record.name.as_ref() {
-                return;
-            }
-            let function_kind = if function.has_self_param(db) {
-                DefKind::Method
-            } else {
-                DefKind::Fn
-            };
-            if function_kind != record.kind {
-                return;
-            }
-            candidates.push(function);
-        });
-        if let [function] = candidates.as_slice() {
-            return Some(*function);
-        }
-        for function in candidates {
-            let Some(source) = function.source(db) else {
-                continue;
-            };
-            let original = source.file_id.original_file(db);
-            if original.file_id(db) == ra_span.file_id.file_id()
-                && source.value.syntax().text_range() == ra_span.range
-            {
-                return Some(function);
-            }
-        }
-        if let Some(function_ptr) = record.function_ptr {
-            let editioned =
-                base_db::EditionedFileId::current_edition_guess_origin(db, ra_span.file_id.file_id());
-            let source = sema.parse(editioned);
-            let ast_fn = function_ptr.to_node(source.syntax());
-            if ast_fn.syntax().text_range() == ra_span.range
-                && let Some(function) = sema.to_def(&ast_fn)
-                && Self::function_matches_record_name_and_kind(db, record, function)
-            {
-                return Some(function);
-            }
-        }
-        let mut modules = sema.file_to_module_defs(ra_span.file_id.file_id()).collect::<Vec<_>>();
-        for name in &record.module_ancestry {
-            let mut next = Vec::<hir::Module>::new();
-            for module in modules {
-                for declaration in module.declarations(db) {
-                    let ModuleDef::Module(child) = declaration else {
-                        continue;
-                    };
-                    if child
-                        .name(db)
-                        .is_some_and(|child_name| child_name.as_str() == name.as_ref())
-                    {
-                        next.push(child);
-                    }
-                }
-            }
-            modules = next;
-            if modules.is_empty() {
-                break;
-            }
-        }
-        if !modules.is_empty() && record.kind == DefKind::Fn {
-            let mut candidates = Vec::<hir::Function>::new();
-            for module in modules {
-                for declaration in module.declarations(db) {
-                    let ModuleDef::Function(function) = declaration else {
-                        continue;
-                    };
-                    if function.name(db).as_str() != record.name.as_ref() || function.has_self_param(db) {
-                        continue;
-                    }
-                    candidates.push(function);
-                }
-            }
-            if let [function] = candidates.as_slice() {
-                return Some(*function);
-            }
-            for function in candidates {
-                let Some(source) = function.source(db) else {
-                    continue;
-                };
-                let original = source.file_id.original_file(db);
-                if original.file_id(db) == ra_span.file_id.file_id()
-                    && source.value.syntax().text_range() == ra_span.range
-                {
-                    return Some(function);
-                }
-            }
-        }
-        let mut query = Query::new(format!("{}#", record.name));
-        query.exact();
-        query.exclude_imports();
-        for symbol in world_symbols(db, query) {
-            if symbol.is_alias || symbol.is_import {
-                continue;
-            }
-            let ModuleDef::Function(function) = symbol.def else {
-                continue;
-            };
-            let function_kind = if function.has_self_param(db) {
-                DefKind::Method
-            } else {
-                DefKind::Fn
-            };
-            if function_kind != record.kind {
-                continue;
-            }
-            let original = symbol.loc.hir_file_id.original_file_respecting_includes(db);
-            if original.file_id(db) == ra_span.file_id.file_id()
-                && symbol.loc.ptr.text_range() == ra_span.range
-            {
-                return Some(function);
-            }
-        }
-        let editioned =
-            base_db::EditionedFileId::current_edition_guess_origin(db, ra_span.file_id.file_id());
-        let source = sema.parse(editioned);
-        source.syntax().descendants().filter_map(ast::Fn::cast).find_map(|ast_fn| {
-            if ast_fn.syntax().text_range() != ra_span.range {
-                return None;
-            }
-            sema.to_def(&ast_fn)
-        })
-    }
-
-    fn function_matches_record_name_and_kind(
-        db: &ide::RootDatabase,
-        record: &LookupDefRecord,
-        function: hir::Function,
-    ) -> bool {
-        if function.name(db).as_str() != record.name.as_ref() {
-            return false;
-        }
-        let function_kind = if function.has_self_param(db) {
-            DefKind::Method
-        } else {
-            DefKind::Fn
-        };
-        function_kind == record.kind
     }
 
     fn lookup_call_edge_rows(
@@ -2311,14 +2062,11 @@ impl WorkspaceService {
                 kind,
                 span,
                 path: None,
-                crate_name: None,
-                module_ancestry: Vec::new(),
                 entity: Some(RaEntity::Function(function)),
                 ra_span: Some(RaSpan {
                     file_id: editioned.editioned_file_id(db),
                     range,
                 }),
-                function_ptr: None,
                 function: Some(function),
             },
         );
@@ -2358,11 +2106,8 @@ impl WorkspaceService {
                 kind,
                 span,
                 path: None,
-                crate_name: None,
-                module_ancestry: Vec::new(),
                 entity: Some(RaEntity::Function(function)),
                 ra_span: Some(RaSpan { file_id, range }),
-                function_ptr: None,
                 function: Some(function),
             },
         );
@@ -2401,11 +2146,8 @@ impl WorkspaceService {
                 kind: DefKind::Other,
                 span,
                 path: Some(path.into_boxed_str()),
-                crate_name: None,
-                module_ancestry: Vec::new(),
                 entity: None,
                 ra_span: Some(RaSpan { file_id, range }),
-                function_ptr: None,
                 function: None,
             },
         );
