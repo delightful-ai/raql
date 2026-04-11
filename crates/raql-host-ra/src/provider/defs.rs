@@ -4,11 +4,15 @@ use std::path::Path;
 use base_db::SourceDatabase;
 use hir::{Adt, ModuleDef};
 use ide::LineIndex;
+use ide_db::symbol_index::{Query, world_symbols};
+use raql_host::{
+    ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
+};
 use syntax::Edition;
 use vfs::{AbsPathBuf, VfsPath};
 
-use raql_host::ExternLookupValue;
-
+use crate::provider::core_index::CoreLookupIndex;
+use crate::RaHostInitError;
 use crate::{DefId, DefKind, DeterministicRaHost, SpanCoord, SpanId, SpanKey};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -369,4 +373,236 @@ pub(crate) fn ensure_lookup_synthetic_callable_def(
     );
     lookup_spans.insert(span, span_key);
     Some(def_id)
+}
+
+fn lookup_bound_def_name_from_core_index(
+    core_index: Option<&CoreLookupIndex>,
+    def: DefId,
+) -> Option<Box<str>> {
+    core_index?
+        .def_name(def)
+        .map(|name| name.to_owned().into_boxed_str())
+}
+
+fn lookup_bound_def_path_from_core_index(
+    core_index: Option<&CoreLookupIndex>,
+    def: DefId,
+) -> Option<Box<str>> {
+    core_index?
+        .def_path(def)
+        .map(|path| path.to_owned().into_boxed_str())
+}
+
+pub(crate) fn lookup_def_name_rows(
+    request: &ExternLookupRequest,
+    db: &ide::RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    core_index: Option<&CoreLookupIndex>,
+    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+) -> Result<Vec<Vec<ExternLookupValue>>, RaHostInitError> {
+    let mut requested_name = None::<&str>;
+    let mut def_filter = None::<DefId>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                def_filter = Some(DefId::new(host.stable_id()));
+            }
+            (1, ExternLookupValue::String(name)) => requested_name = Some(name.as_ref()),
+            _ => return Ok(Vec::new()),
+        }
+    }
+    if let Some(def) = def_filter {
+        if let Some(record) = lookup_defs.get(&def) {
+            if requested_name.is_some_and(|expected| expected != record.name.as_ref()) {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![vec![
+                ExternLookupValue::Host(ExternLookupHostValue::new(
+                    ExternLookupHostValueKind::Def,
+                    def.stable_id(),
+                )),
+                ExternLookupValue::String(record.name.clone()),
+            ]]);
+        }
+        if let Some(name) = lookup_bound_def_name_from_core_index(core_index, def) {
+            if requested_name.is_some_and(|expected| expected != name.as_ref()) {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![vec![
+                ExternLookupValue::Host(ExternLookupHostValue::new(
+                    ExternLookupHostValueKind::Def,
+                    def.stable_id(),
+                )),
+                ExternLookupValue::String(name),
+            ]]);
+        }
+    }
+    let Some(requested_name) = requested_name else {
+        return Ok(Vec::new());
+    };
+
+    let mut symbol_id_host = DeterministicRaHost::new();
+    let mut symbol_rows = std::collections::BTreeSet::<Vec<ExternLookupValue>>::new();
+    let mut collect_symbol_rows = |mut query: Query, include_functions: bool| {
+        query.exact();
+        query.exclude_imports();
+        for symbol in world_symbols(db, query) {
+            if symbol.is_alias || symbol.is_import {
+                continue;
+            }
+            let def = symbol.def;
+            if matches!(def, ModuleDef::Function(_)) != include_functions {
+                continue;
+            }
+            let Some(module) = def.module(db) else {
+                continue;
+            };
+            if !module.krate(db).origin(db).is_local() {
+                continue;
+            }
+            let original = symbol.loc.hir_file_id.original_file_respecting_includes(db);
+            let Some(def_id) = ensure_lookup_symbol_module_def(
+                db,
+                vfs,
+                workspace_root,
+                lookup_defs,
+                lookup_spans,
+                &mut symbol_id_host,
+                def,
+                original.editioned_file_id(db),
+                symbol.loc.ptr.text_range(),
+            ) else {
+                continue;
+            };
+            if def_filter.is_some_and(|expected| expected != def_id) {
+                continue;
+            }
+            symbol_rows.insert(vec![
+                ExternLookupValue::Host(ExternLookupHostValue::new(
+                    ExternLookupHostValueKind::Def,
+                    def_id.stable_id(),
+                )),
+                ExternLookupValue::String(requested_name.to_string().into_boxed_str()),
+            ]);
+        }
+    };
+    collect_symbol_rows(Query::new(requested_name.to_string()), false);
+    collect_symbol_rows(Query::new(format!("{requested_name}#")), true);
+    if !symbol_rows.is_empty() {
+        return Ok(symbol_rows.into_iter().collect());
+    }
+
+    let mut id_host = DeterministicRaHost::new();
+    let mut rows = std::collections::BTreeSet::<Vec<ExternLookupValue>>::new();
+    for krate in hir::Crate::all(db)
+        .into_iter()
+        .filter(|krate| krate.origin(db).is_local())
+    {
+        let mut modules = vec![krate.root_module(db)];
+        while let Some(module) = modules.pop() {
+            let query_name =
+                ide_db::imports::import_assets::NameToImport::Exact(requested_name.to_owned(), true);
+            let _ = ide_db::items_locator::items_with_name_in_module(
+                db,
+                module,
+                query_name,
+                ide_db::items_locator::AssocSearchMode::Include,
+                |item| {
+                    let def = item.into_module_def();
+                    let Some(def_id) = ensure_lookup_source_module_def(
+                        db,
+                        vfs,
+                        workspace_root,
+                        lookup_defs,
+                        lookup_spans,
+                        &mut id_host,
+                        def,
+                    ) else {
+                        return std::ops::ControlFlow::<()>::Continue(());
+                    };
+                    if def_filter.is_some_and(|expected| expected != def_id) {
+                        return std::ops::ControlFlow::<()>::Continue(());
+                    }
+                    rows.insert(vec![
+                        ExternLookupValue::Host(ExternLookupHostValue::new(
+                            ExternLookupHostValueKind::Def,
+                            def_id.stable_id(),
+                        )),
+                        ExternLookupValue::String(requested_name.to_owned().into_boxed_str()),
+                    ]);
+                    std::ops::ControlFlow::<()>::Continue(())
+                },
+            );
+            modules.extend(module.children(db));
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
+pub(crate) fn lookup_def_path_rows(
+    request: &ExternLookupRequest,
+    db: &ide::RootDatabase,
+    core_index: Option<&CoreLookupIndex>,
+    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+) -> Result<Option<Vec<Vec<ExternLookupValue>>>, RaHostInitError> {
+    let mut def = None::<DefId>;
+    let mut path_filter = None::<&str>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                def = Some(DefId::new(host.stable_id()));
+            }
+            (1, ExternLookupValue::String(path)) => path_filter = Some(path.as_ref()),
+            _ => return Ok(None),
+        }
+    }
+    let Some(def) = def else {
+        return Ok(None);
+    };
+    let mut path = if let Some(record) = lookup_defs.get(&def).cloned() {
+        let mut record = record;
+        if record.path.is_none() {
+            hir::attach_db(db, || {
+                if let Some(function) = record.entity.as_ref().and_then(RaEntity::as_function) {
+                    record.path = Some(canonical_function_path(db, function).into_boxed_str());
+                } else if let Some(path) =
+                    record.entity.as_ref().and_then(|entity| entity.canonical_path(db))
+                {
+                    record.path = Some(path.into_boxed_str());
+                }
+            });
+            if let Some(entry) = lookup_defs.get_mut(&def) {
+                if entry.path.is_none() {
+                    entry.path = record.path.clone();
+                }
+                if entry.entity.is_none() {
+                    entry.entity = record.entity.clone();
+                }
+            }
+        }
+        record
+            .path
+            .or_else(|| lookup_bound_def_path_from_core_index(core_index, def))
+    } else {
+        lookup_bound_def_path_from_core_index(core_index, def)
+    };
+    let Some(path) = path.take() else {
+        return Ok(None);
+    };
+    if path_filter.is_some_and(|expected| expected != path.as_ref()) {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(vec![vec![
+        ExternLookupValue::Host(ExternLookupHostValue::new(
+            ExternLookupHostValueKind::Def,
+            def.stable_id(),
+        )),
+        ExternLookupValue::String(path),
+    ]]))
 }

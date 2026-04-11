@@ -35,8 +35,8 @@ use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
     LocalFile, LookupDefRecord, RaEntity, canonical_function_path, def_kind_from_variant,
     def_kind_lookup_value, ensure_lookup_function_def, ensure_lookup_source_module_def,
-    ensure_lookup_symbol_module_def, ensure_lookup_synthetic_callable_def, lookup_local_file,
-    lookup_span_key_from_text, module_def_kind,
+    ensure_lookup_symbol_module_def, ensure_lookup_synthetic_callable_def, lookup_def_name_rows,
+    lookup_def_path_rows, lookup_local_file, lookup_span_key_from_text, module_def_kind,
 };
 use crate::workspace_loader;
 use crate::{
@@ -314,7 +314,16 @@ impl WorkspaceService {
         let lookup_started = Instant::now();
         let result = match (request.predicate(), request.shape()) {
             ("def_name", ExternLookupShape::FunctionExactBindings) => {
-                self.lookup_def_name_rows(request).map(Some)
+                lookup_def_name_rows(
+                    request,
+                    self.analysis_host.raw_database(),
+                    &self.vfs,
+                    self.workspace_root.as_path(),
+                    self.core_index.as_ref(),
+                    &mut self.lookup_defs,
+                    &mut self.lookup_spans,
+                )
+                .map(Some)
             }
             ("def", ExternLookupShape::RelationExactBindings) => {
                 Ok(Some(self.lookup_def_rows(request)))
@@ -325,7 +334,12 @@ impl WorkspaceService {
             ("def_span", ExternLookupShape::FunctionExactBindings) => {
                 Ok(Some(self.lookup_def_span_rows(request)))
             }
-            ("def_path", ExternLookupShape::FunctionExactBindings) => self.lookup_def_path_rows(request),
+            ("def_path", ExternLookupShape::FunctionExactBindings) => lookup_def_path_rows(
+                request,
+                self.analysis_host.raw_database(),
+                self.core_index.as_ref(),
+                &mut self.lookup_defs,
+            ),
             ("call_edge", ExternLookupShape::RelationExactBindings) => {
                 self.lookup_call_edge_rows(request)
             }
@@ -371,263 +385,6 @@ impl WorkspaceService {
         let result = execute(planned, &mut runtime);
         trace_timing("workspace_service.execute", execute_started.elapsed());
         trace_timing("workspace_service.run_planned.total", run_started.elapsed());
-        Ok(result)
-    }
-
-    fn ensure_supported_planned(&self, planned: &PlannedProgram) -> Result<(), RaHostInitError> {
-        let required = required_extern_capabilities(planned)
-            .into_iter()
-            .map(CapabilityId::from)
-            .collect::<Vec<_>>();
-        MissingCapabilitiesError::from_required_and_supported(required, self.supported_capabilities())
-            .map_err(|err| RaHostInitError::SemanticBuild {
-                details: err.to_string(),
-            })
-    }
-
-    fn lookup_def_name_rows(
-        &mut self,
-        request: &ExternLookupRequest,
-    ) -> Result<Vec<Vec<ExternLookupValue>>, RaHostInitError> {
-        // TODO(ra-native-audit): exact-name lookup is now RA-native, but it still does a full
-        // local-module fallback walk after the world symbol index misses. Push this into a real
-        // DefProvider with query-shaped caching instead of keeping the traversal inline here.
-        let mut requested_name = None::<&str>;
-        let mut def_filter = None::<DefId>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Def =>
-                {
-                    def_filter = Some(DefId::new(host.stable_id()));
-                }
-                (1, ExternLookupValue::String(name)) => requested_name = Some(name.as_ref()),
-                _ => return Ok(Vec::new()),
-            }
-        }
-        if let Some(def) = def_filter {
-            if let Some(record) = self.lookup_defs.get(&def) {
-                if requested_name.is_some_and(|expected| expected != record.name.as_ref()) {
-                    return Ok(Vec::new());
-                }
-                return Ok(vec![vec![
-                    ExternLookupValue::Host(ExternLookupHostValue::new(
-                        ExternLookupHostValueKind::Def,
-                        def.stable_id(),
-                    )),
-                    ExternLookupValue::String(record.name.clone()),
-                ]]);
-            }
-            if let Some(name) = self.lookup_bound_def_name_from_core_index(def) {
-                if requested_name.is_some_and(|expected| expected != name.as_ref()) {
-                    return Ok(Vec::new());
-                }
-                return Ok(vec![vec![
-                    ExternLookupValue::Host(ExternLookupHostValue::new(
-                        ExternLookupHostValueKind::Def,
-                        def.stable_id(),
-                    )),
-                    ExternLookupValue::String(name),
-                ]]);
-            }
-        }
-        let Some(requested_name) = requested_name else {
-            return Ok(Vec::new());
-        };
-
-        let workspace_root = self.workspace_root.clone();
-        let vfs = &self.vfs;
-        let lookup_defs = &mut self.lookup_defs;
-        let lookup_spans = &mut self.lookup_spans;
-        let db = self.analysis_host.raw_database();
-        let symbol_lookup_started = Instant::now();
-        let mut symbol_id_host = DeterministicRaHost::new();
-        let mut symbol_rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-        let mut collect_symbol_rows = |mut query: Query, include_functions: bool| {
-            query.exact();
-            query.exclude_imports();
-            for symbol in world_symbols(db, query) {
-                if symbol.is_alias || symbol.is_import {
-                    continue;
-                }
-                let def = symbol.def;
-                if matches!(def, ModuleDef::Function(_)) != include_functions {
-                    continue;
-                }
-                let Some(module) = def.module(db) else {
-                    continue;
-                };
-                if !module.krate(db).origin(db).is_local() {
-                    continue;
-                }
-                let original = symbol.loc.hir_file_id.original_file_respecting_includes(db);
-                let Some(def_id) = WorkspaceService::ensure_lookup_symbol_module_def(
-                    db,
-                    vfs,
-                    workspace_root.as_path(),
-                    lookup_defs,
-                    lookup_spans,
-                    &mut symbol_id_host,
-                    def,
-                    original.editioned_file_id(db),
-                    symbol.loc.ptr.text_range(),
-                ) else {
-                    continue;
-                };
-                if def_filter.is_some_and(|expected| expected != def_id) {
-                    continue;
-                }
-                symbol_rows.insert(vec![
-                    ExternLookupValue::Host(ExternLookupHostValue::new(
-                        ExternLookupHostValueKind::Def,
-                        def_id.stable_id(),
-                    )),
-                    ExternLookupValue::String(requested_name.to_string().into_boxed_str()),
-                ]);
-            }
-        };
-        collect_symbol_rows(Query::new(requested_name.to_string()), false);
-        collect_symbol_rows(Query::new(format!("{requested_name}#")), true);
-        trace_timing(
-            "workspace_service.lookup_def_name_rows.resolve_function_symbols",
-            symbol_lookup_started.elapsed(),
-        );
-        if !symbol_rows.is_empty() {
-            return Ok(symbol_rows.into_iter().collect());
-        }
-        let fallback_started = Instant::now();
-        let mut id_host = DeterministicRaHost::new();
-        let mut rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-        for krate in hir::Crate::all(db)
-            .into_iter()
-            .filter(|krate| krate.origin(db).is_local())
-        {
-            let mut modules = vec![krate.root_module(db)];
-            while let Some(module) = modules.pop() {
-                let query_name =
-                    ide_db::imports::import_assets::NameToImport::Exact(requested_name.to_owned(), true);
-                let _ = ide_db::items_locator::items_with_name_in_module(
-                    db,
-                    module,
-                    query_name,
-                    ide_db::items_locator::AssocSearchMode::Include,
-                    |item| {
-                        let def = item.into_module_def();
-                        let Some(def_id) = ensure_lookup_source_module_def(
-                            db,
-                            vfs,
-                            workspace_root.as_path(),
-                            lookup_defs,
-                            lookup_spans,
-                            &mut id_host,
-                            def,
-                        ) else {
-                            return std::ops::ControlFlow::<()>::Continue(());
-                        };
-                        if def_filter.is_some_and(|expected| expected != def_id) {
-                            return std::ops::ControlFlow::<()>::Continue(());
-                        }
-                        rows.insert(vec![
-                            ExternLookupValue::Host(ExternLookupHostValue::new(
-                                ExternLookupHostValueKind::Def,
-                                def_id.stable_id(),
-                            )),
-                            ExternLookupValue::String(requested_name.to_owned().into_boxed_str()),
-                        ]);
-                        std::ops::ControlFlow::<()>::Continue(())
-                    },
-                );
-                modules.extend(module.children(db));
-            }
-        }
-        trace_timing(
-            "workspace_service.lookup_def_name_rows.module_fallback.total",
-            fallback_started.elapsed(),
-        );
-        if !rows.is_empty() {
-            return Ok(rows.into_iter().collect());
-        }
-
-        Ok(Vec::new())
-    }
-
-    fn lookup_bound_def_name_from_core_index(&self, def: DefId) -> Option<Box<str>> {
-        self.core_index
-            .as_ref()?
-            .def_name(def)
-            .map(|name| name.to_owned().into_boxed_str())
-    }
-
-    fn lookup_bound_def_path_from_core_index(&self, def: DefId) -> Option<Box<str>> {
-        self.core_index
-            .as_ref()?
-            .def_path(def)
-            .map(|path| path.to_owned().into_boxed_str())
-    }
-
-    fn lookup_def_path_rows(
-        &mut self,
-        request: &ExternLookupRequest,
-    ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, RaHostInitError> {
-        let lookup_started = Instant::now();
-        let mut def = None::<DefId>;
-        let mut path_filter = None::<&str>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Def =>
-                {
-                    def = Some(DefId::new(host.stable_id()));
-                }
-                (1, ExternLookupValue::String(path)) => path_filter = Some(path.as_ref()),
-                _ => return Ok(None),
-            }
-        }
-        let Some(def) = def else {
-            return Ok(None);
-        };
-        let mut path = if let Some(record) = self.lookup_defs.get(&def).cloned() {
-            let mut record = record;
-            if record.path.is_none() {
-                let db = self.analysis_host.raw_database();
-                hir::attach_db(db, || {
-                    if let Some(function) = record
-                        .entity
-                        .as_ref()
-                        .and_then(RaEntity::as_function)
-                    {
-                        record.path = Some(canonical_function_path(db, function).into_boxed_str());
-                    } else if let Some(path) =
-                        record.entity.as_ref().and_then(|entity| entity.canonical_path(db))
-                    {
-                        record.path = Some(path.into_boxed_str());
-                    }
-                });
-                if let Some(entry) = self.lookup_defs.get_mut(&def) {
-                    if entry.path.is_none() {
-                        entry.path = record.path.clone();
-                    }
-                    if entry.entity.is_none() {
-                        entry.entity = record.entity.clone();
-                    }
-                }
-            }
-            record
-                .path
-                .or_else(|| self.lookup_bound_def_path_from_core_index(def))
-        } else {
-            self.lookup_bound_def_path_from_core_index(def)
-        };
-        let Some(path) = path.take() else {
-            return Ok(None);
-        };
-        if path_filter.is_some_and(|expected| expected != path.as_ref()) {
-            trace_timing(
-                "workspace_service.lookup_def_path_rows.total",
-                lookup_started.elapsed(),
-            );
-            return Ok(Some(Vec::new()));
-        }
         let rows = Some(vec![vec![
             ExternLookupValue::Host(ExternLookupHostValue::new(
                 ExternLookupHostValueKind::Def,
