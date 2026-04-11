@@ -29,10 +29,11 @@ use crate::lazy_runtime::LazyRaRuntime;
 use crate::provider::calls::{lookup_call_edge_rows as provider_lookup_call_edge_rows, method_dispatch_kind};
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
-    LocalFile, LookupDefRecord, RaEntity, canonical_function_path, def_kind_from_variant,
-    def_kind_lookup_value, ensure_lookup_function_def, ensure_lookup_source_module_def,
-    ensure_lookup_symbol_module_def, ensure_lookup_synthetic_callable_def, lookup_def_name_rows,
-    lookup_def_path_rows, lookup_local_file, lookup_span_key_from_text, module_def_kind,
+    LocalFile, LookupDefRecord, RaEntity, canonical_function_path, ensure_lookup_function_def,
+    ensure_lookup_source_module_def,
+    ensure_lookup_symbol_module_def, ensure_lookup_synthetic_callable_def, lookup_def_kind_rows,
+    lookup_def_name_rows, lookup_def_path_rows, lookup_def_rows, lookup_def_span_rows,
+    lookup_local_file, lookup_span_key_from_text, module_def_kind,
 };
 use crate::workspace_loader;
 use crate::{
@@ -322,13 +323,17 @@ impl WorkspaceService {
                 .map(Some)
             }
             ("def", ExternLookupShape::RelationExactBindings) => {
-                Ok(Some(self.lookup_def_rows(request)))
+                Ok(Some(lookup_def_rows(request, &self.lookup_defs)))
             }
             ("def_kind", ExternLookupShape::FunctionExactBindings) => {
-                Ok(Some(self.lookup_def_kind_rows(request)))
+                Ok(Some(lookup_def_kind_rows(
+                    request,
+                    self.core_index.as_ref(),
+                    &self.lookup_defs,
+                )))
             }
             ("def_span", ExternLookupShape::FunctionExactBindings) => {
-                Ok(Some(self.lookup_def_span_rows(request)))
+                Ok(Some(lookup_def_span_rows(request, &self.lookup_defs)))
             }
             ("def_path", ExternLookupShape::FunctionExactBindings) => lookup_def_path_rows(
                 request,
@@ -402,109 +407,6 @@ impl WorkspaceService {
             lookup_started.elapsed(),
         );
         rows
-    }
-
-    fn lookup_def_rows(&self, request: &ExternLookupRequest) -> Vec<Vec<ExternLookupValue>> {
-        let mut def = None::<DefId>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Def =>
-                {
-                    def = Some(DefId::new(host.stable_id()));
-                }
-                _ => return Vec::new(),
-            }
-        }
-        let Some(def) = def else {
-            return Vec::new();
-        };
-        if self.lookup_defs.contains_key(&def) {
-            vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
-                ExternLookupHostValueKind::Def,
-                def.stable_id(),
-            ))]]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn lookup_def_kind_rows(&self, request: &ExternLookupRequest) -> Vec<Vec<ExternLookupValue>> {
-        let mut def = None::<DefId>;
-        let mut kind_filter = None::<DefKind>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Def =>
-                {
-                    def = Some(DefId::new(host.stable_id()));
-                }
-                (1, ExternLookupValue::Enum { name, variant }) if name.as_ref() == "DefKind" => {
-                    kind_filter = def_kind_from_variant(variant.as_ref());
-                }
-                _ => return Vec::new(),
-            }
-        }
-        let Some(def) = def else {
-            return Vec::new();
-        };
-        let Some(kind) = self
-            .lookup_defs
-            .get(&def)
-            .map(|record| record.kind)
-            .or_else(|| self.core_index.as_ref().and_then(|index| index.def_kind(def)))
-        else {
-            return Vec::new();
-        };
-        if kind_filter.is_some_and(|expected| expected != kind) {
-            return Vec::new();
-        }
-        vec![vec![
-            ExternLookupValue::Host(ExternLookupHostValue::new(
-                ExternLookupHostValueKind::Def,
-                def.stable_id(),
-            )),
-            def_kind_lookup_value(kind),
-        ]]
-    }
-
-    fn lookup_def_span_rows(&self, request: &ExternLookupRequest) -> Vec<Vec<ExternLookupValue>> {
-        let mut def = None::<DefId>;
-        let mut span_filter = None::<SpanId>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Def =>
-                {
-                    def = Some(DefId::new(host.stable_id()));
-                }
-                (1, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Span =>
-                {
-                    span_filter = Some(SpanId::new(host.stable_id()));
-                }
-                _ => return Vec::new(),
-            }
-        }
-        let Some(def) = def else {
-            return Vec::new();
-        };
-        let Some(record) = self.lookup_defs.get(&def) else {
-            return Vec::new();
-        };
-        if span_filter.is_some_and(|expected| expected != record.span) {
-            return Vec::new();
-        }
-        vec![vec![
-            ExternLookupValue::Host(ExternLookupHostValue::new(
-                ExternLookupHostValueKind::Def,
-                def.stable_id(),
-            )),
-            ExternLookupValue::Host(ExternLookupHostValue::new(
-                ExternLookupHostValueKind::Span,
-                record.span.stable_id(),
-            )),
-        ]]
     }
 
     fn lookup_span_allowed_rows(&self, request: &ExternLookupRequest) -> Vec<Vec<ExternLookupValue>> {

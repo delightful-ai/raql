@@ -393,6 +393,118 @@ fn lookup_bound_def_path_from_core_index(
         .map(|path| path.to_owned().into_boxed_str())
 }
 
+pub(crate) fn lookup_def_rows(
+    request: &ExternLookupRequest,
+    lookup_defs: &BTreeMap<DefId, LookupDefRecord>,
+) -> Vec<Vec<ExternLookupValue>> {
+    let mut def = None::<DefId>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                def = Some(DefId::new(host.stable_id()));
+            }
+            _ => return Vec::new(),
+        }
+    }
+    let Some(def) = def else {
+        return Vec::new();
+    };
+    if lookup_defs.contains_key(&def) {
+        vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+            ExternLookupHostValueKind::Def,
+            def.stable_id(),
+        ))]]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn lookup_def_kind_rows(
+    request: &ExternLookupRequest,
+    core_index: Option<&CoreLookupIndex>,
+    lookup_defs: &BTreeMap<DefId, LookupDefRecord>,
+) -> Vec<Vec<ExternLookupValue>> {
+    let mut def = None::<DefId>;
+    let mut kind_filter = None::<DefKind>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                def = Some(DefId::new(host.stable_id()));
+            }
+            (1, ExternLookupValue::Enum { name, variant }) if name.as_ref() == "DefKind" => {
+                kind_filter = def_kind_from_variant(variant.as_ref());
+            }
+            _ => return Vec::new(),
+        }
+    }
+    let Some(def) = def else {
+        return Vec::new();
+    };
+    let Some(kind) = lookup_defs
+        .get(&def)
+        .map(|record| record.kind)
+        .or_else(|| core_index.and_then(|index| index.def_kind(def)))
+    else {
+        return Vec::new();
+    };
+    if kind_filter.is_some_and(|expected| expected != kind) {
+        return Vec::new();
+    }
+    vec![vec![
+        ExternLookupValue::Host(ExternLookupHostValue::new(
+            ExternLookupHostValueKind::Def,
+            def.stable_id(),
+        )),
+        def_kind_lookup_value(kind),
+    ]]
+}
+
+pub(crate) fn lookup_def_span_rows(
+    request: &ExternLookupRequest,
+    lookup_defs: &BTreeMap<DefId, LookupDefRecord>,
+) -> Vec<Vec<ExternLookupValue>> {
+    let mut def = None::<DefId>;
+    let mut span_filter = None::<SpanId>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                def = Some(DefId::new(host.stable_id()));
+            }
+            (1, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Span =>
+            {
+                span_filter = Some(SpanId::new(host.stable_id()));
+            }
+            _ => return Vec::new(),
+        }
+    }
+    let Some(def) = def else {
+        return Vec::new();
+    };
+    let Some(record) = lookup_defs.get(&def) else {
+        return Vec::new();
+    };
+    if span_filter.is_some_and(|expected| expected != record.span) {
+        return Vec::new();
+    }
+    vec![vec![
+        ExternLookupValue::Host(ExternLookupHostValue::new(
+            ExternLookupHostValueKind::Def,
+            def.stable_id(),
+        )),
+        ExternLookupValue::Host(ExternLookupHostValue::new(
+            ExternLookupHostValueKind::Span,
+            record.span.stable_id(),
+        )),
+    ]]
+}
+
 pub(crate) fn lookup_def_name_rows(
     request: &ExternLookupRequest,
     db: &ide::RootDatabase,
