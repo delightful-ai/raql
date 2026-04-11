@@ -9,7 +9,7 @@ use std::time::{Instant, UNIX_EPOCH};
 use base_db::SourceDatabase;
 use camino::Utf8PathBuf;
 use hir::{Adt, AssocItem, HasSource, HasVisibility, Impl, Module, ModuleDef};
-use ide::{AnalysisHost, LineIndex};
+use ide::AnalysisHost;
 use ide_db::symbol_index::{Query, world_symbols};
 use project_model::ProjectManifest;
 use raql_compiler::{PlannedProgram, required_extern_capabilities};
@@ -17,7 +17,7 @@ use raql_engine::{EvalResult, execute};
 use raql_host::{
     CapabilityId, CapabilitySet, ExternLookupHostValue, ExternLookupHostValueKind,
     ExternLookupRequest, ExternLookupShape, ExternLookupValue, MissingCapabilitiesError,
-    SpanCoord, SpanKey, is_engine_managed_extern, is_runtime_scalar_input_predicate,
+    SpanKey, is_engine_managed_extern, is_runtime_scalar_input_predicate,
 };
 use hir::import_map::AssocSearchMode;
 use syntax::ast::{HasGenericArgs, HasName};
@@ -28,7 +28,10 @@ use crate::capability::{day_one_supported_capabilities, supports_day_one_capabil
 use crate::lazy_runtime::LazyRaRuntime;
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
-    LookupDefRecord, RaEntity, RaSpan, canonical_function_path, module_def_kind,
+    LocalFile, LookupDefRecord, RaEntity, canonical_function_path, ensure_lookup_function_def,
+    ensure_lookup_source_module_def, ensure_lookup_symbol_module_def,
+    ensure_lookup_synthetic_callable_def, lookup_local_file, lookup_span_key_from_text,
+    module_def_kind,
 };
 use crate::workspace_loader;
 use crate::{
@@ -505,7 +508,7 @@ impl WorkspaceService {
                     ide_db::items_locator::AssocSearchMode::Include,
                     |item| {
                         let def = item.into_module_def();
-                        let Some(def_id) = Self::ensure_lookup_source_module_def(
+                        let Some(def_id) = ensure_lookup_source_module_def(
                             db,
                             vfs,
                             workspace_root.as_path(),
@@ -813,7 +816,7 @@ impl WorkspaceService {
             return true;
         };
         let editioned = source.file_id.original_file(db);
-        let Some(local) = Self::lookup_local_file(vfs, workspace_root, db, editioned.file_id(db)) else {
+        let Some(local) = lookup_local_file(vfs, workspace_root, db, editioned.file_id(db)) else {
             return true;
         };
         let Some(body) = source.value.body() else {
@@ -880,7 +883,7 @@ impl WorkspaceService {
                     let Some(callee_function) = sema.resolve_method_call(&method_call) else {
                         continue;
                     };
-                    let Some(callee_def) = Self::ensure_lookup_function_def(
+                    let Some(callee_def) = ensure_lookup_function_def(
                         db,
                         vfs,
                         workspace_root,
@@ -962,7 +965,7 @@ impl WorkspaceService {
             usage_file_hits += 1;
             let file_id = editioned.file_id(db);
             let local_started = Instant::now();
-            let Some(local) = Self::lookup_local_file(vfs, workspace_root, db, file_id) else {
+            let Some(local) = lookup_local_file(vfs, workspace_root, db, file_id) else {
                 local_total += local_started.elapsed();
                 continue;
             };
@@ -1126,7 +1129,7 @@ impl WorkspaceService {
     ) -> Option<DefId> {
         for ancestor in syntax.ancestors().skip(1) {
             if let Some(closure) = ast::ClosureExpr::cast(ancestor.clone()) {
-                return Self::ensure_lookup_synthetic_callable_def(
+                return ensure_lookup_synthetic_callable_def(
                     lookup_defs,
                     lookup_spans,
                     id_host,
@@ -1140,7 +1143,7 @@ impl WorkspaceService {
                 let Some(function) = sema.to_def(&ast_fn) else {
                     return None;
                 };
-                return Self::ensure_lookup_function_def(
+                return ensure_lookup_function_def(
                     db,
                     vfs,
                     workspace_root,
@@ -1168,7 +1171,7 @@ impl WorkspaceService {
         local: &LocalFile,
     ) -> Option<(DefId, crate::DispatchKind)> {
         match callable.kind() {
-            hir::CallableKind::Function(function) => Self::ensure_lookup_function_def(
+            hir::CallableKind::Function(function) => ensure_lookup_function_def(
                 db,
                 _vfs,
                 _workspace_root,
@@ -1178,7 +1181,7 @@ impl WorkspaceService {
                 function,
             )
                 .map(|def| (def, crate::DispatchKind::Direct)),
-            hir::CallableKind::Closure(_) => Self::ensure_lookup_synthetic_callable_def(
+            hir::CallableKind::Closure(_) => ensure_lookup_synthetic_callable_def(
                     lookup_defs,
                     lookup_spans,
                     id_host,
@@ -1188,7 +1191,7 @@ impl WorkspaceService {
                     local,
                 )
                 .map(|def| (def, crate::DispatchKind::Closure)),
-            hir::CallableKind::FnPtr | hir::CallableKind::FnImpl(_) => Self::ensure_lookup_synthetic_callable_def(
+            hir::CallableKind::FnPtr | hir::CallableKind::FnImpl(_) => ensure_lookup_synthetic_callable_def(
                     lookup_defs,
                     lookup_spans,
                     id_host,
@@ -1200,246 +1203,6 @@ impl WorkspaceService {
                 .map(|def| (def, crate::DispatchKind::FnPointer)),
             hir::CallableKind::TupleStruct(_) | hir::CallableKind::TupleEnumVariant(_) => None,
         }
-    }
-
-    fn ensure_lookup_function_def(
-        db: &ide::RootDatabase,
-        vfs: &vfs::Vfs,
-        workspace_root: &Path,
-        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-        id_host: &mut DeterministicRaHost,
-        function: hir::Function,
-    ) -> Option<DefId> {
-        Self::ensure_lookup_source_module_def(
-            db,
-            vfs,
-            workspace_root,
-            lookup_defs,
-            lookup_spans,
-            id_host,
-            ModuleDef::Function(function),
-        )
-    }
-
-    fn ensure_lookup_source_module_def(
-        db: &ide::RootDatabase,
-        vfs: &vfs::Vfs,
-        workspace_root: &Path,
-        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-        id_host: &mut DeterministicRaHost,
-        def: ModuleDef,
-    ) -> Option<DefId> {
-        let (file_id, range) = match def {
-            ModuleDef::Module(module) => {
-                let range = module
-                    .declaration_source_range(db)
-                    .unwrap_or_else(|| module.definition_source_range(db));
-                (range.file_id.original_file(db).editioned_file_id(db), range.value)
-            }
-            ModuleDef::Function(function) => {
-                let source = function.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::Adt(adt) => {
-                let source = adt.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::Variant(variant) => {
-                let source = variant.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::Const(const_) => {
-                let source = const_.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::Static(static_) => {
-                let source = static_.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::Trait(trait_) => {
-                let source = trait_.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::TypeAlias(alias) => {
-                let source = alias.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::Macro(mac) => {
-                let source = mac.source(db)?;
-                (
-                    source.file_id.original_file(db).editioned_file_id(db),
-                    source.value.syntax().text_range(),
-                )
-            }
-            ModuleDef::BuiltinType(_) => return None,
-        };
-        Self::ensure_lookup_symbol_module_def(
-            db,
-            vfs,
-            workspace_root,
-            lookup_defs,
-            lookup_spans,
-            id_host,
-            def,
-            file_id,
-            range,
-        )
-    }
-
-    fn def_kind_for_module_def(db: &ide::RootDatabase, def: ModuleDef) -> Option<DefKind> {
-        Some(match def {
-            ModuleDef::Function(function) => {
-                if function.has_self_param(db) {
-                    DefKind::Method
-                } else {
-                    DefKind::Fn
-                }
-            }
-            ModuleDef::Module(_) => DefKind::Mod,
-            ModuleDef::Adt(Adt::Struct(_)) => DefKind::Struct,
-            ModuleDef::Adt(Adt::Enum(_)) => DefKind::Enum,
-            ModuleDef::Adt(Adt::Union(_)) => DefKind::Union,
-            ModuleDef::Variant(_) => DefKind::Variant,
-            ModuleDef::Const(_) => DefKind::Const,
-            ModuleDef::Static(_) => DefKind::Static,
-            ModuleDef::Trait(_) => DefKind::Trait,
-            ModuleDef::TypeAlias(_) => DefKind::TypeAlias,
-            ModuleDef::Macro(_) => DefKind::Macro,
-            _ => return None,
-        })
-    }
-
-    fn ensure_lookup_symbol_module_def(
-        db: &ide::RootDatabase,
-        vfs: &vfs::Vfs,
-        workspace_root: &Path,
-        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-        id_host: &mut DeterministicRaHost,
-        def: ModuleDef,
-        file_id: span::EditionedFileId,
-        range: syntax::TextRange,
-    ) -> Option<DefId> {
-        let kind = Self::def_kind_for_module_def(db, def)?;
-        let local = Self::lookup_local_file(vfs, workspace_root, db, file_id.file_id())?;
-        let span_key =
-            lookup_span_key_from_text(local.rel_path.as_str(), local.text.as_str(), range)?;
-        let span = id_host
-            .intern_span_from_text(file_id, local.rel_path.clone(), local.text.as_str(), range)
-            .ok()?;
-        let entity = RaEntity::ModuleDef(def);
-        let path = entity.canonical_path(db);
-        let token = path
-            .as_ref()
-            .map(|path| match kind {
-                DefKind::Fn | DefKind::Method => format!("def:function:{path}"),
-                _ => format!("def:{kind:?}:{path}"),
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "lookup_def:{kind:?}:{}:{}..{}",
-                    local.rel_path,
-                    u32::from(range.start()),
-                    u32::from(range.end())
-                )
-            });
-        let def_id = id_host.intern_def_from_token(token.as_str());
-        let name = def.name(db)?.display(db, Edition::CURRENT).to_string();
-        lookup_defs.insert(
-            def_id,
-            LookupDefRecord {
-                name: name.into_boxed_str(),
-                kind,
-                span,
-                path: path.map(Into::into),
-                entity: Some(entity),
-                ra_span: Some(RaSpan { file_id, range }),
-            },
-        );
-        lookup_spans.insert(span, span_key);
-        Some(def_id)
-    }
-
-    fn ensure_lookup_synthetic_callable_def(
-        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-        id_host: &mut DeterministicRaHost,
-        prefix: &str,
-        syntax: &syntax::SyntaxNode,
-        file_id: span::EditionedFileId,
-        local: &LocalFile,
-    ) -> Option<DefId> {
-        let range = syntax.text_range();
-        let span_key =
-            lookup_span_key_from_text(local.rel_path.as_str(), local.text.as_str(), range)?;
-        let span = id_host
-            .intern_span_from_text(file_id, local.rel_path.clone(), local.text.as_str(), range)
-            .ok()?;
-        let label = syntax.text().to_string();
-        let path = format!(
-            "{prefix}::{}:{}..{}:{}",
-            local.rel_path,
-            u32::from(range.start()),
-            u32::from(range.end()),
-            label
-        );
-        let def_id = id_host.intern_def_from_token(format!("def:{prefix}:{path}").as_str());
-        lookup_defs.insert(
-            def_id,
-            LookupDefRecord {
-                name: label.into_boxed_str(),
-                kind: DefKind::Other,
-                span,
-                path: Some(path.into_boxed_str()),
-                entity: None,
-                ra_span: Some(RaSpan { file_id, range }),
-            },
-        );
-        lookup_spans.insert(span, span_key);
-        Some(def_id)
-    }
-
-    fn lookup_local_file(
-        vfs: &vfs::Vfs,
-        workspace_root: &Path,
-        db: &ide::RootDatabase,
-        file_id: vfs::FileId,
-    ) -> Option<LocalFile> {
-        let abs_path = vfs.file_path(file_id).as_path()?;
-        let path: &Path = abs_path.as_ref();
-        let rel_path = if path.starts_with(workspace_root) {
-            path.strip_prefix(workspace_root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/")
-        } else {
-            path.to_string_lossy().replace('\\', "/")
-        };
-        let text = db.file_text(file_id).text(db).to_string();
-        Some(LocalFile { rel_path, text })
     }
 
     fn push_lookup_call_edge_row(
@@ -3218,21 +2981,6 @@ fn def_kind_from_variant(variant: &str) -> Option<DefKind> {
         "OTHER" => Some(DefKind::Other),
         _ => None,
     }
-}
-
-fn lookup_span_key_from_text(
-    rel_path: &str,
-    source_text: &str,
-    range: syntax::TextRange,
-) -> Option<SpanKey> {
-    let line_index = LineIndex::new(source_text);
-    let start = line_index.try_line_col(range.start())?;
-    let end = line_index.try_line_col(range.end())?;
-    Some(SpanKey::new(
-        rel_path.to_string(),
-        SpanCoord::new(start.line, start.col),
-        SpanCoord::new(end.line, end.col),
-    ))
 }
 
 fn module_def_is_public(def: ModuleDef, db: &dyn hir::db::HirDatabase) -> bool {
