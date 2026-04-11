@@ -27,6 +27,9 @@ use vfs::{AbsPathBuf, VfsPath};
 use crate::capability::{day_one_supported_capabilities, supports_day_one_capability};
 use crate::lazy_runtime::LazyRaRuntime;
 use crate::provider::core_index::CoreLookupIndex;
+use crate::provider::defs::{
+    LookupDefRecord, RaEntity, RaSpan, canonical_function_path, module_def_kind,
+};
 use crate::workspace_loader;
 use crate::{
     DefId, DefKind, DeterministicRaHost, GenericArg, Mutability, NodeId, NodeKind,
@@ -70,43 +73,6 @@ impl WarmupSnapshot {
 struct WatchedFileState {
     len: u64,
     modified_unix_nanos: Option<u128>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RaEntity {
-    ModuleDef(ModuleDef),
-}
-
-impl RaEntity {
-    fn as_function(&self) -> Option<hir::Function> {
-        match self {
-            Self::ModuleDef(ModuleDef::Function(function)) => Some(*function),
-            _ => None,
-        }
-    }
-
-    fn canonical_path(&self, db: &ide::RootDatabase) -> Option<String> {
-        match self {
-            Self::ModuleDef(ModuleDef::Function(function)) => Some(canonical_function_path(db, *function)),
-            Self::ModuleDef(def) => def.canonical_path(db, Edition::CURRENT),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RaSpan {
-    file_id: span::EditionedFileId,
-    range: syntax::TextRange,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LookupDefRecord {
-    name: Box<str>,
-    kind: DefKind,
-    span: SpanId,
-    path: Option<Box<str>>,
-    entity: Option<RaEntity>,
-    ra_span: Option<RaSpan>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3440,23 +3406,6 @@ fn path_type_arg_asts(ty: &ast::Type) -> Vec<ast::Type> {
     }
 }
 
-fn canonical_function_path(db: &ide::RootDatabase, function: hir::Function) -> String {
-    let name = function.name(db).display(db, Edition::CURRENT).to_string();
-    let raw_path = ModuleDef::Function(function)
-        .canonical_path(db, Edition::CURRENT)
-        .unwrap_or_else(|| name.clone());
-    function
-        .module(db)
-        .krate(db)
-        .display_name(db)
-        .map(|crate_name| crate_name.to_string())
-        .filter(|crate_name| {
-            raw_path != *crate_name && !raw_path.starts_with(format!("{crate_name}::").as_str())
-        })
-        .map(|crate_name| format!("{crate_name}::{raw_path}"))
-        .unwrap_or(raw_path)
-}
-
 fn dispatch_kind_from_variant(variant: &str) -> Option<crate::DispatchKind> {
     match variant {
         "DIRECT" => Some(crate::DispatchKind::Direct),
@@ -3515,23 +3464,6 @@ fn method_dispatch_kind(
         return crate::DispatchKind::ThroughTrait;
     }
     crate::DispatchKind::Direct
-}
-
-fn module_def_kind(def: ModuleDef) -> Option<DefKind> {
-    Some(match def {
-        ModuleDef::Module(_) => DefKind::Mod,
-        ModuleDef::Function(_) => DefKind::Fn,
-        ModuleDef::Adt(Adt::Struct(_)) => DefKind::Struct,
-        ModuleDef::Adt(Adt::Enum(_)) => DefKind::Enum,
-        ModuleDef::Adt(Adt::Union(_)) => DefKind::Union,
-        ModuleDef::Variant(_) => DefKind::Variant,
-        ModuleDef::Const(_) => DefKind::Const,
-        ModuleDef::Static(_) => DefKind::Static,
-        ModuleDef::Trait(_) => DefKind::Trait,
-        ModuleDef::TypeAlias(_) => DefKind::TypeAlias,
-        ModuleDef::Macro(_) => DefKind::Macro,
-        ModuleDef::BuiltinType(_) => return None,
-    })
 }
 
 fn def_kind_lookup_value(kind: DefKind) -> ExternLookupValue {
