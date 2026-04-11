@@ -33,10 +33,10 @@ use crate::provider::calls::{
 };
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
-    LocalFile, LookupDefRecord, RaEntity, canonical_function_path, ensure_lookup_function_def,
-    ensure_lookup_source_module_def, ensure_lookup_symbol_module_def,
-    ensure_lookup_synthetic_callable_def, lookup_local_file, lookup_span_key_from_text,
-    module_def_kind,
+    LocalFile, LookupDefRecord, RaEntity, canonical_function_path, def_kind_from_variant,
+    def_kind_lookup_value, ensure_lookup_function_def, ensure_lookup_source_module_def,
+    ensure_lookup_symbol_module_def, ensure_lookup_synthetic_callable_def, lookup_local_file,
+    lookup_span_key_from_text, module_def_kind,
 };
 use crate::workspace_loader;
 use crate::{
@@ -2439,55 +2439,6 @@ fn belongs_to_item(node: &syntax::SyntaxNode, owner_item: &syntax::SyntaxNode) -
     node.ancestors()
         .find_map(ast::Item::cast)
         .is_some_and(|item| item.syntax() == owner_item)
-}
-
-fn def_kind_lookup_value(kind: DefKind) -> ExternLookupValue {
-    let variant = match kind {
-        DefKind::Fn => "FN",
-        DefKind::Method => "METHOD",
-        DefKind::Struct => "STRUCT",
-        DefKind::Enum => "ENUM",
-        DefKind::Union => "UNION",
-        DefKind::Trait => "TRAIT",
-        DefKind::Mod => "MOD",
-        DefKind::Impl => "IMPL",
-        DefKind::TypeAlias => "TYPE_ALIAS",
-        DefKind::Const => "CONST",
-        DefKind::Static => "STATIC",
-        DefKind::Field => "FIELD",
-        DefKind::Variant => "VARIANT",
-        DefKind::AssocType => "ASSOC_TYPE",
-        DefKind::AssocConst => "ASSOC_CONST",
-        DefKind::Macro => "MACRO",
-        DefKind::Other => "OTHER",
-    };
-    ExternLookupValue::Enum {
-        name: "DefKind".to_string().into_boxed_str(),
-        variant: variant.to_string().into_boxed_str(),
-    }
-}
-
-fn def_kind_from_variant(variant: &str) -> Option<DefKind> {
-    match variant {
-        "FN" => Some(DefKind::Fn),
-        "METHOD" => Some(DefKind::Method),
-        "STRUCT" => Some(DefKind::Struct),
-        "ENUM" => Some(DefKind::Enum),
-        "UNION" => Some(DefKind::Union),
-        "TRAIT" => Some(DefKind::Trait),
-        "MOD" => Some(DefKind::Mod),
-        "IMPL" => Some(DefKind::Impl),
-        "TYPE_ALIAS" => Some(DefKind::TypeAlias),
-        "CONST" => Some(DefKind::Const),
-        "STATIC" => Some(DefKind::Static),
-        "FIELD" => Some(DefKind::Field),
-        "VARIANT" => Some(DefKind::Variant),
-        "ASSOC_TYPE" => Some(DefKind::AssocType),
-        "ASSOC_CONST" => Some(DefKind::AssocConst),
-        "MACRO" => Some(DefKind::Macro),
-        "OTHER" => Some(DefKind::Other),
-        _ => None,
-    }
 }
 
 fn module_def_is_public(def: ModuleDef, db: &dyn hir::db::HirDatabase) -> bool {

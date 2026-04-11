@@ -7,6 +7,8 @@ use ide::LineIndex;
 use syntax::Edition;
 use vfs::{AbsPathBuf, VfsPath};
 
+use raql_host::ExternLookupValue;
+
 use crate::{DefId, DefKind, DeterministicRaHost, SpanCoord, SpanId, SpanKey};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +88,55 @@ pub(crate) fn module_def_kind(def: ModuleDef) -> Option<DefKind> {
         ModuleDef::Macro(_) => DefKind::Macro,
         ModuleDef::BuiltinType(_) => return None,
     })
+}
+
+pub(crate) fn def_kind_lookup_value(kind: DefKind) -> ExternLookupValue {
+    let variant = match kind {
+        DefKind::Fn => "FN",
+        DefKind::Method => "METHOD",
+        DefKind::Struct => "STRUCT",
+        DefKind::Enum => "ENUM",
+        DefKind::Union => "UNION",
+        DefKind::Trait => "TRAIT",
+        DefKind::Mod => "MOD",
+        DefKind::Impl => "IMPL",
+        DefKind::TypeAlias => "TYPE_ALIAS",
+        DefKind::Const => "CONST",
+        DefKind::Static => "STATIC",
+        DefKind::Field => "FIELD",
+        DefKind::Variant => "VARIANT",
+        DefKind::AssocType => "ASSOC_TYPE",
+        DefKind::AssocConst => "ASSOC_CONST",
+        DefKind::Macro => "MACRO",
+        DefKind::Other => "OTHER",
+    };
+    ExternLookupValue::Enum {
+        name: "DefKind".into(),
+        variant: variant.into(),
+    }
+}
+
+pub(crate) fn def_kind_from_variant(variant: &str) -> Option<DefKind> {
+    match variant {
+        "FN" => Some(DefKind::Fn),
+        "METHOD" => Some(DefKind::Method),
+        "STRUCT" => Some(DefKind::Struct),
+        "ENUM" => Some(DefKind::Enum),
+        "UNION" => Some(DefKind::Union),
+        "TRAIT" => Some(DefKind::Trait),
+        "MOD" => Some(DefKind::Mod),
+        "IMPL" => Some(DefKind::Impl),
+        "TYPE_ALIAS" => Some(DefKind::TypeAlias),
+        "CONST" => Some(DefKind::Const),
+        "STATIC" => Some(DefKind::Static),
+        "FIELD" => Some(DefKind::Field),
+        "VARIANT" => Some(DefKind::Variant),
+        "ASSOC_TYPE" => Some(DefKind::AssocType),
+        "ASSOC_CONST" => Some(DefKind::AssocConst),
+        "MACRO" => Some(DefKind::Macro),
+        "OTHER" => Some(DefKind::Other),
+        _ => None,
+    }
 }
 
 pub(crate) fn lookup_span_key_from_text(
