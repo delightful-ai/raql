@@ -951,7 +951,6 @@ impl WorkspaceService {
         let mut resolve_total = std::time::Duration::ZERO;
         let mut caller_owner_total = std::time::Duration::ZERO;
         let mut local_total = std::time::Duration::ZERO;
-        let mut alias_names = BTreeSet::<String>::new();
         let usage_started = Instant::now();
         let scope = ide_db::search::SearchScope::files(&search_files);
         let references = ide_db::defs::Definition::Function(function)
@@ -973,19 +972,8 @@ impl WorkspaceService {
                 if reference
                     .category
                     .contains(ide_db::search::ReferenceCategory::IMPORT)
-                    && let Some(alias_name) = {
-                        let use_tree: Option<ast::UseTree> = reference
-                            .name
-                            .syntax()
-                            .ancestors()
-                            .find_map(|node| ast::UseTree::cast(node));
-                        use_tree
-                            .and_then(|use_tree: ast::UseTree| use_tree.rename())
-                            .and_then(|rename: ast::Rename| rename.name())
-                            .map(|name: ast::Name| name.text().to_string())
-                    }
                 {
-                    alias_names.insert(alias_name);
+                    return false;
                 }
                 let Some(name_ref) = reference.name.as_name_ref().cloned() else {
                     continue;
@@ -1107,27 +1095,6 @@ impl WorkspaceService {
                 pushed_rows += 1;
             }
         }
-        if !alias_names.is_empty()
-            && !Self::scan_lookup_callers_for_names(
-                db,
-                vfs,
-                workspace_root,
-                sema,
-                lookup_defs,
-                lookup_spans,
-                id_host,
-                rows,
-                &search_files,
-                alias_names,
-                function,
-                caller_filter,
-                callee_def,
-                site_filter,
-                dispatch_filter,
-            )
-        {
-            return false;
-        }
         if std::env::var_os("RAQL_TRACE_TIMINGS").is_some() {
             eprintln!(
                 "raql-timing workspace_service.collect_lookup_callers_for_function.usages usage_file_hits={} usage_refs={} resolved_methods={} resolved_calls={} pushed_rows={} usage_ms={} local_ms={} resolve_ms={} caller_owner_ms={}",
@@ -1138,230 +1105,6 @@ impl WorkspaceService {
                 pushed_rows,
                 usage_total.as_millis(),
                 local_total.as_millis(),
-                resolve_total.as_millis(),
-                caller_owner_total.as_millis(),
-            );
-        }
-        true
-    }
-
-    fn scan_lookup_callers_for_names(
-        db: &ide::RootDatabase,
-        vfs: &vfs::Vfs,
-        workspace_root: &Path,
-        sema: &hir::Semantics<'_, ide::RootDatabase>,
-        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-        id_host: &mut DeterministicRaHost,
-        rows: &mut BTreeSet<Vec<ExternLookupValue>>,
-        search_files: &[base_db::EditionedFileId],
-        mut candidate_names: BTreeSet<String>,
-        function: hir::Function,
-        caller_filter: Option<DefId>,
-        callee_def: DefId,
-        site_filter: Option<SpanId>,
-        dispatch_filter: Option<crate::DispatchKind>,
-    ) -> bool {
-        let mut alias_names_added = 0usize;
-        let mut candidate_file_hits = 0usize;
-        let mut iterations = 0usize;
-        let mut matching_method_names = 0usize;
-        let mut matching_call_names = 0usize;
-        let mut resolved_methods = 0usize;
-        let mut resolved_calls = 0usize;
-        let mut pushed_rows = 0usize;
-        let mut parse_total = std::time::Duration::ZERO;
-        let mut resolve_total = std::time::Duration::ZERO;
-        let mut caller_owner_total = std::time::Duration::ZERO;
-        let mut local_total = std::time::Duration::ZERO;
-        loop {
-            iterations += 1;
-            let mut discovered_alias = false;
-            for editioned in search_files {
-                let file_id = editioned.file_id(db);
-                let text = db.file_text(file_id).text(db);
-                if !candidate_names
-                    .iter()
-                    .any(|name| text.contains(name.as_str()))
-                {
-                    continue;
-                }
-                let local_started = Instant::now();
-                let Some(local) = Self::lookup_local_file(vfs, workspace_root, db, file_id) else {
-                    local_total += local_started.elapsed();
-                    continue;
-                };
-                local_total += local_started.elapsed();
-                candidate_file_hits += 1;
-                let parse_started = Instant::now();
-                let source = sema.parse(*editioned);
-                parse_total += parse_started.elapsed();
-
-                for use_tree in source.syntax().descendants().filter_map(ast::UseTree::cast) {
-                    let Some(path) = use_tree.path() else {
-                        continue;
-                    };
-                    let Some(resolved) = sema.resolve_path(&path).and_then(|resolved| match resolved {
-                        hir::PathResolution::Def(ModuleDef::Function(resolved)) => Some(resolved),
-                        _ => None,
-                    }) else {
-                        continue;
-                    };
-                    if resolved != function {
-                        continue;
-                    }
-                    let alias_name = use_tree
-                        .rename()
-                        .and_then(|rename| rename.name())
-                        .map(|name| name.text().to_string())
-                        .or_else(|| {
-                            path.segment()
-                                .and_then(|segment| segment.name_ref())
-                                .map(|name_ref| name_ref.text().to_string())
-                        });
-                    let Some(alias_name) = alias_name else {
-                        continue;
-                    };
-                    if candidate_names.insert(alias_name) {
-                        alias_names_added += 1;
-                        discovered_alias = true;
-                    }
-                }
-
-                for method_call in source.syntax().descendants().filter_map(ast::MethodCallExpr::cast)
-                {
-                    let Some(name_ref) = method_call.name_ref() else {
-                        continue;
-                    };
-                    if !candidate_names.contains(name_ref.text().as_str()) {
-                        continue;
-                    }
-                    matching_method_names += 1;
-                    let resolve_started = Instant::now();
-                    let Some(resolved) = sema.resolve_method_call(&method_call) else {
-                        resolve_total += resolve_started.elapsed();
-                        continue;
-                    };
-                    resolve_total += resolve_started.elapsed();
-                    if resolved != function {
-                        continue;
-                    }
-                    resolved_methods += 1;
-                    let caller_owner_started = Instant::now();
-                    let Some(caller_def) = Self::lookup_callable_owner_def(
-                        db,
-                        vfs,
-                        workspace_root,
-                        sema,
-                        lookup_defs,
-                        lookup_spans,
-                        id_host,
-                        method_call.syntax(),
-                        editioned.editioned_file_id(db),
-                        &local,
-                    ) else {
-                        caller_owner_total += caller_owner_started.elapsed();
-                        continue;
-                    };
-                    caller_owner_total += caller_owner_started.elapsed();
-                    Self::push_lookup_call_edge_row(
-                        lookup_spans,
-                        id_host,
-                        rows,
-                        caller_def,
-                        callee_def,
-                        editioned.editioned_file_id(db),
-                        &local,
-                        method_call.syntax().text_range(),
-                        method_dispatch_kind(sema, &method_call, resolved, db),
-                        caller_filter,
-                        site_filter,
-                        dispatch_filter,
-                    );
-                    pushed_rows += 1;
-                }
-
-                for call in source.syntax().descendants().filter_map(ast::CallExpr::cast) {
-                    let Some(ast::Expr::PathExpr(path_expr)) = call.expr() else {
-                        continue;
-                    };
-                    let Some(path) = path_expr.path() else {
-                        continue;
-                    };
-                    let Some(segment) = path.segment() else {
-                        continue;
-                    };
-                    let Some(name_ref) = segment.name_ref() else {
-                        continue;
-                    };
-                    if !candidate_names.contains(name_ref.text().as_str()) {
-                        continue;
-                    }
-                    matching_call_names += 1;
-                    let resolve_started = Instant::now();
-                    let Some(resolved) = sema.resolve_path(&path).and_then(|resolved| match resolved {
-                        hir::PathResolution::Def(ModuleDef::Function(resolved)) => Some(resolved),
-                        _ => None,
-                    }) else {
-                        resolve_total += resolve_started.elapsed();
-                        continue;
-                    };
-                    resolve_total += resolve_started.elapsed();
-                    if resolved != function {
-                        continue;
-                    }
-                    resolved_calls += 1;
-                    let caller_owner_started = Instant::now();
-                    let Some(caller_def) = Self::lookup_callable_owner_def(
-                        db,
-                        vfs,
-                        workspace_root,
-                        sema,
-                        lookup_defs,
-                        lookup_spans,
-                        id_host,
-                        call.syntax(),
-                        editioned.editioned_file_id(db),
-                        &local,
-                    ) else {
-                        caller_owner_total += caller_owner_started.elapsed();
-                        continue;
-                    };
-                    caller_owner_total += caller_owner_started.elapsed();
-                    Self::push_lookup_call_edge_row(
-                        lookup_spans,
-                        id_host,
-                        rows,
-                        caller_def,
-                        callee_def,
-                        editioned.editioned_file_id(db),
-                        &local,
-                        call.syntax().text_range(),
-                        crate::DispatchKind::Direct,
-                        caller_filter,
-                        site_filter,
-                        dispatch_filter,
-                    );
-                    pushed_rows += 1;
-                }
-            }
-            if !discovered_alias {
-                break;
-            }
-        }
-        if std::env::var_os("RAQL_TRACE_TIMINGS").is_some() {
-            eprintln!(
-                "raql-timing workspace_service.scan_lookup_callers_for_names alias_names_added={} candidate_file_hits={} iterations={} method_names={} call_names={} resolved_methods={} resolved_calls={} pushed_rows={} local_ms={} parse_ms={} resolve_ms={} caller_owner_ms={}",
-                alias_names_added,
-                candidate_file_hits,
-                iterations,
-                matching_method_names,
-                matching_call_names,
-                resolved_methods,
-                resolved_calls,
-                pushed_rows,
-                local_total.as_millis(),
-                parse_total.as_millis(),
                 resolve_total.as_millis(),
                 caller_owner_total.as_millis(),
             );
