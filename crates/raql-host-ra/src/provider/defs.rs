@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use base_db::SourceDatabase;
-use hir::{Adt, HasSource, ModuleDef};
+use hir::{Adt, HasSource, HasVisibility, Module, ModuleDef};
 use ide::LineIndex;
 use ide_db::symbol_index::{Query, world_symbols};
 use raql_host::{
@@ -140,6 +140,46 @@ pub(crate) fn def_kind_from_variant(variant: &str) -> Option<DefKind> {
         "OTHER" => Some(DefKind::Other),
         _ => None,
     }
+}
+
+pub(crate) fn module_def_is_public(def: ModuleDef, db: &dyn hir::db::HirDatabase) -> bool {
+    match def {
+        ModuleDef::Module(module) => module.visibility(db) == hir::Visibility::Public,
+        ModuleDef::Function(function) => function.visibility(db) == hir::Visibility::Public,
+        ModuleDef::Adt(adt) => adt.visibility(db) == hir::Visibility::Public,
+        ModuleDef::Variant(variant) => variant.visibility(db) == hir::Visibility::Public,
+        ModuleDef::Const(const_) => const_.visibility(db) == hir::Visibility::Public,
+        ModuleDef::Static(static_) => static_.visibility(db) == hir::Visibility::Public,
+        ModuleDef::Trait(trait_) => trait_.visibility(db) == hir::Visibility::Public,
+        ModuleDef::TypeAlias(alias) => alias.visibility(db) == hir::Visibility::Public,
+        ModuleDef::Macro(mac) => mac.visibility(db) == hir::Visibility::Public,
+        ModuleDef::BuiltinType(_) => false,
+    }
+}
+
+pub(crate) fn module_def_in_test(def: ModuleDef, db: &dyn hir::db::HirDatabase) -> bool {
+    let module = match def {
+        ModuleDef::Module(module) => module,
+        ModuleDef::Function(function) => {
+            return function.is_test(db) || module_is_test_scope(function.module(db), db);
+        }
+        ModuleDef::Adt(adt) => adt.module(db),
+        ModuleDef::Variant(variant) => variant.module(db),
+        ModuleDef::Const(const_) => const_.module(db),
+        ModuleDef::Static(static_) => static_.module(db),
+        ModuleDef::Trait(trait_) => trait_.module(db),
+        ModuleDef::TypeAlias(alias) => alias.module(db),
+        ModuleDef::Macro(mac) => mac.module(db),
+        ModuleDef::BuiltinType(_) => return false,
+    };
+    module_is_test_scope(module, db)
+}
+
+pub(crate) fn module_is_test_scope(module: Module, db: &dyn hir::db::HirDatabase) -> bool {
+    module.path_to_root(db).into_iter().any(|m| {
+        m.name(db)
+            .is_some_and(|name| name.display(db, Edition::CURRENT).to_string() == "tests")
+    })
 }
 
 pub(crate) fn lookup_span_key_from_text(
