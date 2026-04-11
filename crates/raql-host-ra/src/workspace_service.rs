@@ -31,6 +31,7 @@ use crate::{
     DefId, DefKind, DeterministicRaHost, GenericArg, Mutability, NodeId, NodeKind,
     RaHostInitError, SpanId, TypeShape, WorldStamp,
 };
+use raql_engine::{EngineHostView, HostValueKind, RuntimeValue};
 
 #[derive(Debug)]
 pub struct WorkspaceService {
@@ -72,13 +73,21 @@ struct WatchedFileState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RaEntity {
-    Function(hir::Function),
+    ModuleDef(ModuleDef),
 }
 
 impl RaEntity {
     fn as_function(&self) -> Option<hir::Function> {
         match self {
-            Self::Function(function) => Some(*function),
+            Self::ModuleDef(ModuleDef::Function(function)) => Some(*function),
+            _ => None,
+        }
+    }
+
+    fn canonical_path(&self, db: &ide::RootDatabase) -> Option<String> {
+        match self {
+            Self::ModuleDef(ModuleDef::Function(function)) => Some(canonical_function_path(db, *function)),
+            Self::ModuleDef(def) => def.canonical_path(db, Edition::CURRENT),
         }
     }
 }
@@ -97,7 +106,6 @@ struct LookupDefRecord {
     path: Option<Box<str>>,
     entity: Option<RaEntity>,
     ra_span: Option<RaSpan>,
-    function: Option<hir::Function>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -435,6 +443,18 @@ impl WorkspaceService {
                     ExternLookupValue::String(record.name.clone()),
                 ]]);
             }
+            if let Some(name) = self.lookup_bound_def_name_from_core_host(def) {
+                if requested_name.is_some_and(|expected| expected != name.as_ref()) {
+                    return Ok(Vec::new());
+                }
+                return Ok(vec![vec![
+                    ExternLookupValue::Host(ExternLookupHostValue::new(
+                        ExternLookupHostValueKind::Def,
+                        def.stable_id(),
+                    )),
+                    ExternLookupValue::String(name),
+                ]]);
+            }
         }
         let Some(requested_name) = requested_name else {
             return Ok(Vec::new());
@@ -454,7 +474,7 @@ impl WorkspaceService {
             name: &str,
             range: syntax::TextRange,
             path: Option<Box<str>>,
-            function: Option<hir::Function>,
+            entity: Option<RaEntity>,
         ) {
             if name != requested_name {
                 return;
@@ -482,9 +502,8 @@ impl WorkspaceService {
                     kind,
                     span,
                     path,
-                    entity: function.map(RaEntity::Function),
+                    entity,
                     ra_span: Some(RaSpan { file_id, range }),
-                    function,
                 },
             );
             lookup_spans.insert(span, span_key);
@@ -517,7 +536,7 @@ impl WorkspaceService {
             if name.text().as_str() != requested_name {
                 return;
             }
-            let function = sema.to_def(&function_item);
+            let entity = sema.to_def(&function_item).map(|function| RaEntity::ModuleDef(ModuleDef::Function(function)));
             push_named_ast_def(
                 rows,
                 id_host,
@@ -532,7 +551,7 @@ impl WorkspaceService {
                 name.text().as_str(),
                 function_item.syntax().text_range(),
                 None,
-                function,
+                entity,
             );
         }
 
@@ -941,28 +960,34 @@ impl WorkspaceService {
         let symbol_lookup_started = Instant::now();
         let mut symbol_id_host = DeterministicRaHost::new();
         let mut symbol_rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-        hir::attach_db(db, || {
-            let mut query = Query::new(format!("{requested_name}#"));
+        let mut collect_symbol_rows = |mut query: Query, include_functions: bool| {
             query.exact();
             query.exclude_imports();
             for symbol in world_symbols(db, query) {
                 if symbol.is_alias || symbol.is_import {
                     continue;
                 }
-                let ModuleDef::Function(function) = symbol.def else {
-                    continue;
-                };
-                if !function.module(db).krate(db).origin(db).is_local() {
+                let def = symbol.def;
+                if matches!(def, ModuleDef::Function(_)) != include_functions {
                     continue;
                 }
-                let Some(def_id) = WorkspaceService::ensure_lookup_function_def(
+                let Some(module) = def.module(db) else {
+                    continue;
+                };
+                if !module.krate(db).origin(db).is_local() {
+                    continue;
+                }
+                let original = symbol.loc.hir_file_id.original_file_respecting_includes(db);
+                let Some(def_id) = WorkspaceService::ensure_lookup_symbol_module_def(
                     db,
                     vfs,
                     workspace_root.as_path(),
                     lookup_defs,
                     lookup_spans,
                     &mut symbol_id_host,
-                    function,
+                    def,
+                    original.editioned_file_id(db),
+                    symbol.loc.ptr.text_range(),
                 ) else {
                     continue;
                 };
@@ -977,7 +1002,9 @@ impl WorkspaceService {
                     ExternLookupValue::String(requested_name.to_string().into_boxed_str()),
                 ]);
             }
-        });
+        };
+        collect_symbol_rows(Query::new(requested_name.to_string()), false);
+        collect_symbol_rows(Query::new(format!("{requested_name}#")), true);
         trace_timing(
             "workspace_service.lookup_def_name_rows.resolve_function_symbols",
             symbol_lookup_started.elapsed(),
@@ -1114,6 +1141,22 @@ impl WorkspaceService {
         Ok(Vec::new())
     }
 
+    fn lookup_bound_def_name_from_core_host(&mut self, def: DefId) -> Option<Box<str>> {
+        let rows = EngineHostView::extern_relation_rows(self.core_host.as_mut()?, "def_name")
+            .ok()
+            .flatten()?;
+        rows.into_iter().find_map(|row| match row.as_slice() {
+            [
+                RuntimeValue::Host {
+                    kind: HostValueKind::Def,
+                    id,
+                },
+                RuntimeValue::String(name),
+            ] if *id == def.stable_id().as_u64() => Some(name.clone().into_boxed_str()),
+            _ => None,
+        })
+    }
+
     fn lookup_def_path_rows(
         &mut self,
         request: &ExternLookupRequest,
@@ -1145,11 +1188,10 @@ impl WorkspaceService {
                     .entity
                     .as_ref()
                     .and_then(RaEntity::as_function)
-                    .or(record.function)
                 {
                     record.path = Some(canonical_function_path(db, function).into_boxed_str());
-                    record.entity = Some(RaEntity::Function(function));
-                    record.function = Some(function);
+                } else if let Some(path) = record.entity.as_ref().and_then(|entity| entity.canonical_path(db)) {
+                    record.path = Some(path.into_boxed_str());
                 }
             });
             if let Some(entry) = self.lookup_defs.get_mut(&def) {
@@ -1158,9 +1200,6 @@ impl WorkspaceService {
                 }
                 if entry.entity.is_none() {
                     entry.entity = record.entity.clone();
-                }
-                if entry.function.is_none() {
-                    entry.function = record.function;
                 }
             }
         }
@@ -1247,14 +1286,12 @@ impl WorkspaceService {
                     .entity
                     .as_ref()
                     .and_then(RaEntity::as_function)
-                    .or(record.function)
                 else {
                     lookup_error = Some(Some(Vec::new()));
                     return;
                 };
                 if let Some(entry) = lookup_defs.get_mut(&caller) {
-                    entry.entity = Some(RaEntity::Function(function));
-                    entry.function = Some(function);
+                    entry.entity = Some(RaEntity::ModuleDef(ModuleDef::Function(function)));
                 }
                 if !Self::collect_lookup_call_edges_for_function(
                     db,
@@ -1283,13 +1320,11 @@ impl WorkspaceService {
                 let resolved = record
                     .entity
                     .as_ref()
-                    .and_then(RaEntity::as_function)
-                    .or(record.function);
+                    .and_then(RaEntity::as_function);
                 let resolve_function_elapsed = resolve_function_started.elapsed();
                 if let Some(resolved) = resolved {
                     if let Some(entry) = lookup_defs.get_mut(&callee) {
-                        entry.entity = Some(RaEntity::Function(resolved));
-                        entry.function = Some(resolved);
+                        entry.entity = Some(RaEntity::ModuleDef(ModuleDef::Function(resolved)));
                     }
                     let collect_callers_started = Instant::now();
                     if !Self::collect_lookup_callers_for_function(
@@ -2047,12 +2082,8 @@ impl WorkspaceService {
         } else {
             DefKind::Fn
         };
-        let token = format!(
-            "lookup_def:{kind:?}:{}:{}..{}",
-            local.rel_path,
-            u32::from(range.start()),
-            u32::from(range.end())
-        );
+        let path = canonical_function_path(db, function);
+        let token = format!("def:function:{path}");
         let def_id = id_host.intern_def_from_token(token.as_str());
         let name = function.name(db).display(db, Edition::CURRENT).to_string();
         lookup_defs.insert(
@@ -2061,13 +2092,86 @@ impl WorkspaceService {
                 name: name.into_boxed_str(),
                 kind,
                 span,
-                path: None,
-                entity: Some(RaEntity::Function(function)),
+                path: Some(path.into_boxed_str()),
+                entity: Some(RaEntity::ModuleDef(ModuleDef::Function(function))),
                 ra_span: Some(RaSpan {
                     file_id: editioned.editioned_file_id(db),
                     range,
                 }),
-                function: Some(function),
+            },
+        );
+        lookup_spans.insert(span, span_key);
+        Some(def_id)
+    }
+
+    fn def_kind_for_module_def(db: &ide::RootDatabase, def: ModuleDef) -> Option<DefKind> {
+        Some(match def {
+            ModuleDef::Function(function) => {
+                if function.has_self_param(db) {
+                    DefKind::Method
+                } else {
+                    DefKind::Fn
+                }
+            }
+            ModuleDef::Module(_) => DefKind::Mod,
+            ModuleDef::Adt(Adt::Struct(_)) => DefKind::Struct,
+            ModuleDef::Adt(Adt::Enum(_)) => DefKind::Enum,
+            ModuleDef::Adt(Adt::Union(_)) => DefKind::Union,
+            ModuleDef::Variant(_) => DefKind::Variant,
+            ModuleDef::Const(_) => DefKind::Const,
+            ModuleDef::Static(_) => DefKind::Static,
+            ModuleDef::Trait(_) => DefKind::Trait,
+            ModuleDef::TypeAlias(_) => DefKind::TypeAlias,
+            ModuleDef::Macro(_) => DefKind::Macro,
+            _ => return None,
+        })
+    }
+
+    fn ensure_lookup_symbol_module_def(
+        db: &ide::RootDatabase,
+        vfs: &vfs::Vfs,
+        workspace_root: &Path,
+        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+        id_host: &mut DeterministicRaHost,
+        def: ModuleDef,
+        file_id: span::EditionedFileId,
+        range: syntax::TextRange,
+    ) -> Option<DefId> {
+        let kind = Self::def_kind_for_module_def(db, def)?;
+        let local = Self::lookup_local_file(vfs, workspace_root, db, file_id.file_id())?;
+        let span_key =
+            lookup_span_key_from_text(local.rel_path.as_str(), local.text.as_str(), range)?;
+        let span = id_host
+            .intern_span_from_text(file_id, local.rel_path.clone(), local.text.as_str(), range)
+            .ok()?;
+        let entity = RaEntity::ModuleDef(def);
+        let path = entity.canonical_path(db);
+        let token = path
+            .as_ref()
+            .map(|path| match kind {
+                DefKind::Fn | DefKind::Method => format!("def:function:{path}"),
+                _ => format!("def:{kind:?}:{path}"),
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "lookup_def:{kind:?}:{}:{}..{}",
+                    local.rel_path,
+                    u32::from(range.start()),
+                    u32::from(range.end())
+                )
+            });
+        let def_id = id_host.intern_def_from_token(token.as_str());
+        let name = def.name(db)?.display(db, Edition::CURRENT).to_string();
+        lookup_defs.insert(
+            def_id,
+            LookupDefRecord {
+                name: name.into_boxed_str(),
+                kind,
+                span,
+                path: path.map(Into::into),
+                entity: Some(entity),
+                ra_span: Some(RaSpan { file_id, range }),
             },
         );
         lookup_spans.insert(span, span_key);
@@ -2092,12 +2196,8 @@ impl WorkspaceService {
         let span = id_host
             .intern_span_from_text(file_id, local.rel_path.clone(), local.text.as_str(), range)
             .ok()?;
-        let token = format!(
-            "lookup_def:{kind:?}:{}:{}..{}",
-            local.rel_path,
-            u32::from(range.start()),
-            u32::from(range.end())
-        );
+        let path = canonical_function_path(_db, function);
+        let token = format!("def:function:{path}");
         let def_id = id_host.intern_def_from_token(token.as_str());
         lookup_defs.insert(
             def_id,
@@ -2105,10 +2205,9 @@ impl WorkspaceService {
                 name: name.to_string().into_boxed_str(),
                 kind,
                 span,
-                path: None,
-                entity: Some(RaEntity::Function(function)),
+                path: Some(path.into_boxed_str()),
+                entity: Some(RaEntity::ModuleDef(ModuleDef::Function(function))),
                 ra_span: Some(RaSpan { file_id, range }),
-                function: Some(function),
             },
         );
         lookup_spans.insert(span, span_key);
@@ -2148,7 +2247,6 @@ impl WorkspaceService {
                 path: Some(path.into_boxed_str()),
                 entity: None,
                 ra_span: Some(RaSpan { file_id, range }),
-                function: None,
             },
         );
         lookup_spans.insert(span, span_key);

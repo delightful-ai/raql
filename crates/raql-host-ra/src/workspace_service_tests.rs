@@ -1618,6 +1618,45 @@ hit(Path) :- def(D), def_name(D, "alpha"), def_path(D, Path).
 }
 
 #[test]
+fn workspace_service_reports_supported_def_paths_for_exact_name_seeded_structs() {
+    let root = temp_workspace_root("def_path_struct_exact_seed");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Person {
+    pub name: String,
+}
+"#,
+    )
+    .expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.func def_name(D: Def, Name: string) extern.
+.func def_path(D: Def, Path: string) extern.
+.decl hit(Path: string).
+hit(Path) :- def_name(D, "Person"), def_path(D, Path).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    let observed = result.relations.get("hit").cloned().unwrap_or_default();
+    assert!(
+        observed.iter().any(|row| {
+            row.first().is_some_and(|value| match value {
+                RuntimeValue::String(path) => path.ends_with("Person"),
+                _ => false,
+            })
+        }),
+        "expected a supported exact-name-seeded def_path row for Person; status={:?} notes={:?} def_name={:?} def_path={:?} observed={observed:?}",
+        result.status,
+        result.notes,
+        result.relations.get("def_name"),
+        result.relations.get("def_path"),
+    );
+}
+
+#[test]
 fn workspace_service_marks_public_and_test_defs() {
     let root = temp_workspace_root("visibility_test_markers");
     fs::write(
