@@ -35,6 +35,7 @@ use crate::provider::defs::{
     lookup_def_name_rows, lookup_def_path_rows, lookup_def_rows, lookup_def_span_rows,
     lookup_local_file, lookup_span_key_from_text, module_def_kind,
 };
+use crate::provider::syntax::{lookup_span_allowed_rows, lookup_span_key_rows};
 use crate::workspace_loader;
 use crate::{
     DefId, DefKind, DeterministicRaHost, GenericArg, Mutability, NodeId, NodeKind,
@@ -345,10 +346,10 @@ impl WorkspaceService {
                 self.lookup_call_edge_rows(request)
             }
             ("span_allowed", ExternLookupShape::RelationExactBindings) => {
-                Ok(Some(self.lookup_span_allowed_rows(request)))
+                Ok(Some(lookup_span_allowed_rows(request, &self.lookup_spans)))
             }
             ("span_key", ExternLookupShape::FunctionExactBindings) => {
-                Ok(Some(self.lookup_span_key_rows(request)))
+                Ok(Some(lookup_span_key_rows(request, &self.lookup_spans)))
             }
             _ => Ok(None),
         };
@@ -407,80 +408,6 @@ impl WorkspaceService {
             lookup_started.elapsed(),
         );
         rows
-    }
-
-    fn lookup_span_allowed_rows(&self, request: &ExternLookupRequest) -> Vec<Vec<ExternLookupValue>> {
-        let mut span = None::<SpanId>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Span =>
-                {
-                    span = Some(SpanId::new(host.stable_id()));
-                }
-                _ => return Vec::new(),
-            }
-        }
-        let Some(span) = span else {
-            return Vec::new();
-        };
-        if self.lookup_spans.contains_key(&span) {
-            vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
-                ExternLookupHostValueKind::Span,
-                span.stable_id(),
-            ))]]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn lookup_span_key_rows(&self, request: &ExternLookupRequest) -> Vec<Vec<ExternLookupValue>> {
-        let mut span = None::<SpanId>;
-        let mut rel_path_filter = None::<&str>;
-        let mut l0_filter = None::<i64>;
-        let mut c0_filter = None::<i64>;
-        let mut l1_filter = None::<i64>;
-        let mut c1_filter = None::<i64>;
-        for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
-            match (*idx, value) {
-                (0, ExternLookupValue::Host(host))
-                    if host.kind() == ExternLookupHostValueKind::Span =>
-                {
-                    span = Some(SpanId::new(host.stable_id()));
-                }
-                (1, ExternLookupValue::String(path)) => rel_path_filter = Some(path.as_ref()),
-                (2, ExternLookupValue::Int(v)) => l0_filter = Some(*v),
-                (3, ExternLookupValue::Int(v)) => c0_filter = Some(*v),
-                (4, ExternLookupValue::Int(v)) => l1_filter = Some(*v),
-                (5, ExternLookupValue::Int(v)) => c1_filter = Some(*v),
-                _ => return Vec::new(),
-            }
-        }
-        let Some(span) = span else {
-            return Vec::new();
-        };
-        let Some(key) = self.lookup_spans.get(&span) else {
-            return Vec::new();
-        };
-        if rel_path_filter.is_some_and(|expected| expected != key.rel_path())
-            || l0_filter.is_some_and(|expected| expected != key.start().line() as i64)
-            || c0_filter.is_some_and(|expected| expected != key.start().column() as i64)
-            || l1_filter.is_some_and(|expected| expected != key.end().line() as i64)
-            || c1_filter.is_some_and(|expected| expected != key.end().column() as i64)
-        {
-            return Vec::new();
-        }
-        vec![vec![
-            ExternLookupValue::Host(ExternLookupHostValue::new(
-                ExternLookupHostValueKind::Span,
-                span.stable_id(),
-            )),
-            ExternLookupValue::String(key.rel_path().to_string().into_boxed_str()),
-            ExternLookupValue::Int(key.start().line() as i64),
-            ExternLookupValue::Int(key.start().column() as i64),
-            ExternLookupValue::Int(key.end().line() as i64),
-            ExternLookupValue::Int(key.end().column() as i64),
-        ]]
     }
 
     pub(crate) fn ensure_core_host(
