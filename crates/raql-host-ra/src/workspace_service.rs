@@ -822,6 +822,8 @@ impl WorkspaceService {
         for callable in body.syntax().descendants().filter_map(ast::CallableExpr::cast) {
             if Self::lookup_callable_owner_def(
                 db,
+                vfs,
+                workspace_root,
                 sema,
                 lookup_defs,
                 lookup_spans,
@@ -1006,6 +1008,8 @@ impl WorkspaceService {
                     let caller_owner_started = Instant::now();
                     let Some(caller_def) = Self::lookup_callable_owner_def(
                         db,
+                        vfs,
+                        workspace_root,
                         sema,
                         lookup_defs,
                         lookup_spans,
@@ -1072,6 +1076,8 @@ impl WorkspaceService {
                 let caller_owner_started = Instant::now();
                 let Some(caller_def) = Self::lookup_callable_owner_def(
                     db,
+                    vfs,
+                    workspace_root,
                     sema,
                     lookup_defs,
                     lookup_spans,
@@ -1244,6 +1250,8 @@ impl WorkspaceService {
                     let caller_owner_started = Instant::now();
                     let Some(caller_def) = Self::lookup_callable_owner_def(
                         db,
+                        vfs,
+                        workspace_root,
                         sema,
                         lookup_defs,
                         lookup_spans,
@@ -1306,6 +1314,8 @@ impl WorkspaceService {
                     let caller_owner_started = Instant::now();
                     let Some(caller_def) = Self::lookup_callable_owner_def(
                         db,
+                        vfs,
+                        workspace_root,
                         sema,
                         lookup_defs,
                         lookup_spans,
@@ -1361,6 +1371,8 @@ impl WorkspaceService {
 
     fn lookup_callable_owner_def(
         db: &ide::RootDatabase,
+        vfs: &vfs::Vfs,
+        workspace_root: &Path,
         sema: &hir::Semantics<'_, ide::RootDatabase>,
         lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
         lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
@@ -1382,30 +1394,16 @@ impl WorkspaceService {
                 );
             }
             if let Some(ast_fn) = ast::Fn::cast(ancestor) {
-                let Some(name) = ast_fn.name() else {
-                    continue;
-                };
-                let kind = if ast_fn
-                    .param_list()
-                    .is_some_and(|params| params.self_param().is_some())
-                {
-                    DefKind::Method
-                } else {
-                    DefKind::Fn
-                };
                 let Some(function) = sema.to_def(&ast_fn) else {
                     return None;
                 };
-                return Self::ensure_lookup_syntax_function_def(
+                return Self::ensure_lookup_function_def(
                     db,
+                    vfs,
+                    workspace_root,
                     lookup_defs,
                     lookup_spans,
                     id_host,
-                    name.text().as_str(),
-                    kind,
-                    ast_fn.syntax(),
-                    file_id,
-                    local,
                     function,
                 );
             }
@@ -1635,42 +1633,6 @@ impl WorkspaceService {
                 span,
                 path: path.map(Into::into),
                 entity: Some(entity),
-                ra_span: Some(RaSpan { file_id, range }),
-            },
-        );
-        lookup_spans.insert(span, span_key);
-        Some(def_id)
-    }
-
-    fn ensure_lookup_syntax_function_def(
-        _db: &ide::RootDatabase,
-        lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-        lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-        id_host: &mut DeterministicRaHost,
-        name: &str,
-        kind: DefKind,
-        syntax: &syntax::SyntaxNode,
-        file_id: span::EditionedFileId,
-        local: &LocalFile,
-        function: hir::Function,
-    ) -> Option<DefId> {
-        let range = syntax.text_range();
-        let span_key =
-            lookup_span_key_from_text(local.rel_path.as_str(), local.text.as_str(), range)?;
-        let span = id_host
-            .intern_span_from_text(file_id, local.rel_path.clone(), local.text.as_str(), range)
-            .ok()?;
-        let path = canonical_function_path(_db, function);
-        let token = format!("def:function:{path}");
-        let def_id = id_host.intern_def_from_token(token.as_str());
-        lookup_defs.insert(
-            def_id,
-            LookupDefRecord {
-                name: name.to_string().into_boxed_str(),
-                kind,
-                span,
-                path: Some(path.into_boxed_str()),
-                entity: Some(RaEntity::ModuleDef(ModuleDef::Function(function))),
                 ra_span: Some(RaSpan { file_id, range }),
             },
         );
