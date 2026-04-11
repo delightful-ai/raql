@@ -1,16 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Instant;
 
 use base_db::SourceDatabase;
-use hir::{HasSource, ModuleDef};
+use hir::{Adt, HasSource, ModuleDef};
 use ide_db::search::ReferenceCategory;
 use raql_host::{
     ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
     SpanKey,
 };
+use syntax::ast::HasName;
 use syntax::{ast, AstNode};
 
+use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
     LocalFile, LookupDefRecord, RaEntity, ensure_lookup_function_def,
     ensure_lookup_synthetic_callable_def, lookup_local_file, lookup_span_key_from_text,
@@ -23,11 +25,108 @@ pub(crate) struct CallLookupFilters {
     pub(crate) dispatch_filter: Option<crate::DispatchKind>,
 }
 
+pub(crate) trait CallGraphProvider {
+    fn local_file(&self, file_id: vfs::FileId) -> Option<LocalFile>;
+    fn register_function_def_for_call_graph(&mut self, function: hir::Function) -> Option<DefId>;
+    fn register_adt_def_for_call_graph(&mut self, adt: Adt) -> DefId;
+    fn register_variant_def_for_call_graph(&mut self, variant: hir::Variant) -> Option<DefId>;
+    fn register_synthetic_callable_for_call_graph(
+        &mut self,
+        prefix: &str,
+        syntax: &syntax::SyntaxNode,
+        file_id: span::EditionedFileId,
+        local: &LocalFile,
+    ) -> DefId;
+    fn intern_call_site_for_call_graph(
+        &mut self,
+        file_id: span::EditionedFileId,
+        rel_path: String,
+        source_text: &str,
+        range: syntax::TextRange,
+    ) -> Option<SpanId>;
+    fn insert_call_id_for_call_graph(&mut self, call_id: crate::CallId, value: String);
+    fn insert_call_edge_for_call_graph(
+        &mut self,
+        caller: DefId,
+        callee: DefId,
+        site: SpanId,
+        dispatch: crate::DispatchKind,
+    );
+}
+
+pub(crate) fn extract_call_edges<P: CallGraphProvider>(
+    provider: &mut P,
+    db: &ide::RootDatabase,
+    local_functions: &[hir::Function],
+) {
+    let sema = hir::Semantics::new(db);
+    let local_functions = local_functions.to_vec();
+    let mut parsed_by_file = HashMap::new();
+    for function in local_functions {
+        let Some(source) = function.source(db) else {
+            continue;
+        };
+        let editioned = source.file_id.original_file(db);
+        let Some(local) = provider.local_file(editioned.file_id(db)) else {
+            continue;
+        };
+        let parsed = parsed_by_file
+            .entry(source.file_id)
+            .or_insert_with(|| sema.parse_or_expand(source.file_id));
+        let lookup_offset = source
+            .value
+            .name()
+            .map(|name| name.syntax().text_range().start())
+            .unwrap_or_else(|| source.value.syntax().text_range().start());
+        let Some(ast_fn) = sema.find_node_at_offset_with_descend::<ast::Fn>(parsed, lookup_offset)
+        else {
+            continue;
+        };
+        let Some(caller_def) = provider.register_function_def_for_call_graph(function) else {
+            continue;
+        };
+        let Some(body) = ast_fn.body() else {
+            continue;
+        };
+        let owner_item = ast::Item::Fn(ast_fn.clone());
+        for callable_expr in body.syntax().descendants().filter_map(ast::CallableExpr::cast) {
+            if !belongs_to_item(callable_expr.syntax(), owner_item.syntax()) {
+                continue;
+            }
+            match callable_expr {
+                ast::CallableExpr::Call(call) => {
+                    record_call_expr(
+                        provider,
+                        db,
+                        &sema,
+                        caller_def,
+                        &call,
+                        editioned.editioned_file_id(db),
+                        &local,
+                    );
+                }
+                ast::CallableExpr::MethodCall(method_call) => {
+                    record_method_call(
+                        provider,
+                        db,
+                        &sema,
+                        caller_def,
+                        &method_call,
+                        editioned.editioned_file_id(db),
+                        &local,
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn lookup_call_edge_rows(
     request: &ExternLookupRequest,
     db: &ide::RootDatabase,
     vfs: &vfs::Vfs,
     workspace_root: &Path,
+    core_index: Option<&CoreLookupIndex>,
     lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
     lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
 ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, RaHostInitError> {
@@ -74,7 +173,16 @@ pub(crate) fn lookup_call_edge_rows(
     hir::attach_db(db, || {
         let sema = hir::Semantics::new(db);
         if let Some(caller) = caller_filter {
-            let Some(record) = next_lookup_defs.get(&caller).cloned() else {
+            let Some(record) = lookup_function_record(
+                db,
+                vfs,
+                workspace_root,
+                core_index,
+                &mut next_lookup_defs,
+                &mut next_lookup_spans,
+                &mut id_host,
+                caller,
+            ) else {
                 lookup_error = Some(None);
                 return;
             };
@@ -105,7 +213,16 @@ pub(crate) fn lookup_call_edge_rows(
                 unsupported = true;
             }
         } else if let Some(callee) = callee_filter {
-            let Some(record) = next_lookup_defs.get(&callee).cloned() else {
+            let Some(record) = lookup_function_record(
+                db,
+                vfs,
+                workspace_root,
+                core_index,
+                &mut next_lookup_defs,
+                &mut next_lookup_spans,
+                &mut id_host,
+                callee,
+            ) else {
                 lookup_error = Some(None);
                 return;
             };
@@ -168,6 +285,35 @@ pub(crate) fn lookup_call_edge_rows(
     Ok(Some(rows.into_iter().collect()))
 }
 
+fn lookup_function_record(
+    db: &ide::RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    core_index: Option<&CoreLookupIndex>,
+    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+    id_host: &mut DeterministicRaHost,
+    def: DefId,
+) -> Option<LookupDefRecord> {
+    if let Some(record) = lookup_defs.get(&def).cloned() {
+        return Some(record);
+    }
+    let function = core_index?.function(def)?;
+    let seeded = ensure_lookup_function_def(
+        db,
+        vfs,
+        workspace_root,
+        lookup_defs,
+        lookup_spans,
+        id_host,
+        function,
+    )?;
+    if seeded != def {
+        return None;
+    }
+    lookup_defs.get(&def).cloned()
+}
+
 pub(crate) fn collect_lookup_call_edges_for_function(
     db: &ide::RootDatabase,
     vfs: &vfs::Vfs,
@@ -188,11 +334,13 @@ pub(crate) fn collect_lookup_call_edges_for_function(
     let Some(local) = lookup_local_file(vfs, workspace_root, db, editioned.file_id(db)) else {
         return true;
     };
-    let Some(body) = source.value.body() else {
+    let parsed = sema.parse_or_expand(source.file_id);
+    let source_fn = syntax::AstPtr::new(&source.value).to_node(&parsed);
+    let Some(body) = source_fn.body() else {
         return true;
     };
     for callable in body.syntax().descendants().filter_map(ast::CallableExpr::cast) {
-        if lookup_callable_owner_def(
+        let owner = lookup_callable_owner_def(
             db,
             vfs,
             workspace_root,
@@ -203,8 +351,8 @@ pub(crate) fn collect_lookup_call_edges_for_function(
             callable.syntax(),
             editioned.editioned_file_id(db),
             &local,
-        ) != Some(caller_def)
-        {
+        );
+        if owner != Some(caller_def) {
             continue;
         }
         match callable {
@@ -308,18 +456,50 @@ pub(crate) fn collect_lookup_callers_for_function(
         );
     }
     let scope = ide_db::search::SearchScope::files(&search_files);
-    let references = ide_db::defs::Definition::Function(function)
+    let mut pending_references = vec![ide_db::defs::Definition::Function(function)
         .usages(sema)
         .in_scope(&scope)
-        .all();
-    for (editioned, file_references) in references {
+        .all()];
+    let mut seen_import_renames = BTreeSet::new();
+    while let Some(references) = pending_references.pop() {
+        for (editioned, file_references) in references {
         let file_id = editioned.file_id(db);
         let Some(local) = lookup_local_file(vfs, workspace_root, db, file_id) else {
             continue;
         };
         for reference in file_references {
             if reference.category.contains(ReferenceCategory::IMPORT) {
-                return false;
+                let Some(name_ref) = reference.name.as_name_ref().cloned() else {
+                    continue;
+                };
+                let Some(rename) = name_ref
+                    .syntax()
+                    .ancestors()
+                    .find_map(ast::UseTree::cast)
+                    .and_then(|use_tree| use_tree.rename())
+                else {
+                    continue;
+                };
+                let rename_name = rename
+                    .name()
+                    .map(|name| name.syntax().text_range())
+                    .unwrap_or_else(|| rename.syntax().text_range());
+                let rename_key = format!(
+                    "{}:{}..{}",
+                    local.rel_path,
+                    u32::from(rename_name.start()),
+                    u32::from(rename_name.end())
+                );
+                if seen_import_renames.insert(rename_key) {
+                    pending_references.push(
+                        ide_db::defs::Definition::Function(function)
+                            .usages(sema)
+                            .with_rename(Some(&rename))
+                            .in_scope(&scope)
+                            .all(),
+                    );
+                }
+                continue;
             }
             let Some(name_ref) = reference.name.as_name_ref().cloned() else {
                 continue;
@@ -418,6 +598,7 @@ pub(crate) fn collect_lookup_callers_for_function(
                 filters,
             );
         }
+    }
     }
     true
 }
@@ -614,4 +795,128 @@ fn dispatch_kind_from_variant(variant: &str) -> Option<crate::DispatchKind> {
         "FN_POINTER" => Some(crate::DispatchKind::FnPointer),
         _ => None,
     }
+}
+
+fn record_call_expr<P: CallGraphProvider>(
+    provider: &mut P,
+    db: &ide::RootDatabase,
+    sema: &hir::Semantics<'_, ide::RootDatabase>,
+    caller_def: DefId,
+    call: &ast::CallExpr,
+    file_id: span::EditionedFileId,
+    local: &LocalFile,
+) {
+    let Some(callee_expr) = call.expr() else {
+        return;
+    };
+    let Some(type_info) = sema.type_of_expr(&callee_expr) else {
+        return;
+    };
+    let Some(callable) = type_info.original.as_callable(db) else {
+        return;
+    };
+    let Some((callee_def, dispatch)) =
+        call_target_from_callable(provider, &callable, &callee_expr, file_id, local)
+    else {
+        return;
+    };
+    let Some(site) = provider.intern_call_site_for_call_graph(
+        file_id,
+        local.rel_path.clone(),
+        local.text.as_str(),
+        call.syntax().text_range(),
+    ) else {
+        return;
+    };
+    let range = call.syntax().text_range();
+    let token = format!(
+        "{}:{}..{}",
+        local.rel_path,
+        u32::from(range.start()),
+        u32::from(range.end())
+    );
+    let call_id = crate::CallId::new(crate::deterministic_stable_id("call", token.as_str()));
+    provider.insert_call_id_for_call_graph(call_id, format!("call:{token}"));
+    provider.insert_call_edge_for_call_graph(caller_def, callee_def, site, dispatch);
+}
+
+fn record_method_call<P: CallGraphProvider>(
+    provider: &mut P,
+    db: &ide::RootDatabase,
+    sema: &hir::Semantics<'_, ide::RootDatabase>,
+    caller_def: DefId,
+    method_call: &ast::MethodCallExpr,
+    file_id: span::EditionedFileId,
+    local: &LocalFile,
+) {
+    let Some(function) = sema.resolve_method_call(method_call) else {
+        return;
+    };
+    let Some(callee_def) = provider.register_function_def_for_call_graph(function) else {
+        return;
+    };
+    let dispatch = method_dispatch_kind(sema, method_call, function, db);
+    let Some(site) = provider.intern_call_site_for_call_graph(
+        file_id,
+        local.rel_path.clone(),
+        local.text.as_str(),
+        method_call.syntax().text_range(),
+    ) else {
+        return;
+    };
+    let range = method_call.syntax().text_range();
+    let token = format!(
+        "{}:{}..{}",
+        local.rel_path,
+        u32::from(range.start()),
+        u32::from(range.end())
+    );
+    let call_id = crate::CallId::new(crate::deterministic_stable_id("call", token.as_str()));
+    provider.insert_call_id_for_call_graph(call_id, format!("call:{token}"));
+    provider.insert_call_edge_for_call_graph(caller_def, callee_def, site, dispatch);
+}
+
+fn call_target_from_callable<P: CallGraphProvider>(
+    provider: &mut P,
+    callable: &hir::Callable<'_>,
+    callee_expr: &ast::Expr,
+    file_id: span::EditionedFileId,
+    local: &LocalFile,
+) -> Option<(DefId, crate::DispatchKind)> {
+    match callable.kind() {
+        hir::CallableKind::Function(function) => provider
+            .register_function_def_for_call_graph(function)
+            .map(|def| (def, crate::DispatchKind::Direct)),
+        hir::CallableKind::TupleStruct(strukt) => Some((
+            provider.register_adt_def_for_call_graph(Adt::Struct(strukt)),
+            crate::DispatchKind::Direct,
+        )),
+        hir::CallableKind::TupleEnumVariant(variant) => provider
+            .register_variant_def_for_call_graph(variant)
+            .map(|def| (def, crate::DispatchKind::Direct)),
+        hir::CallableKind::Closure(_) => Some((
+            provider.register_synthetic_callable_for_call_graph(
+                "closure",
+                callee_expr.syntax(),
+                file_id,
+                local,
+            ),
+            crate::DispatchKind::Closure,
+        )),
+        hir::CallableKind::FnPtr | hir::CallableKind::FnImpl(_) => Some((
+            provider.register_synthetic_callable_for_call_graph(
+                "fn_pointer",
+                callee_expr.syntax(),
+                file_id,
+                local,
+            ),
+            crate::DispatchKind::FnPointer,
+        )),
+    }
+}
+
+fn belongs_to_item(node: &syntax::SyntaxNode, owner_item: &syntax::SyntaxNode) -> bool {
+    node.ancestors()
+        .find_map(ast::Item::cast)
+        .is_some_and(|item| item.syntax() == owner_item)
 }

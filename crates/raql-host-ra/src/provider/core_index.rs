@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
+use hir::Function;
+
 use crate::{DefId, DefKind};
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub(crate) struct CoreLookupIndex {
     defs: BTreeMap<DefId, CoreDefMetadata>,
+    functions: BTreeMap<DefId, Function>,
 }
 
 impl CoreLookupIndex {
@@ -30,6 +33,10 @@ impl CoreLookupIndex {
         }
     }
 
+    pub(crate) fn record_function(&mut self, def_id: DefId, function: Function) {
+        self.functions.insert(def_id, function);
+    }
+
     pub(crate) fn def_name(&self, def_id: DefId) -> Option<&str> {
         self.defs.get(&def_id).map(|metadata| metadata.name.as_ref())
     }
@@ -40,6 +47,18 @@ impl CoreLookupIndex {
 
     pub(crate) fn def_path(&self, def_id: DefId) -> Option<&str> {
         self.defs.get(&def_id).map(|metadata| metadata.path.as_ref())
+    }
+
+    pub(crate) fn contains_def(&self, def_id: DefId) -> bool {
+        self.defs.contains_key(&def_id)
+    }
+
+    pub(crate) fn def_ids(&self) -> impl Iterator<Item = DefId> + '_ {
+        self.defs.keys().copied()
+    }
+
+    pub(crate) fn function(&self, def_id: DefId) -> Option<Function> {
+        self.functions.get(&def_id).copied()
     }
 }
 

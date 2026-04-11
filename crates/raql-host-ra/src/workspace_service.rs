@@ -26,7 +26,10 @@ use vfs::{AbsPathBuf, VfsPath};
 
 use crate::capability::{day_one_supported_capabilities, supports_day_one_capability};
 use crate::lazy_runtime::LazyRaRuntime;
-use crate::provider::calls::{lookup_call_edge_rows as provider_lookup_call_edge_rows, method_dispatch_kind};
+use crate::provider::calls::{
+    CallGraphProvider, extract_call_edges as provider_extract_call_edges,
+    lookup_call_edge_rows as provider_lookup_call_edge_rows,
+};
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
     LocalFile, LookupDefRecord, canonical_function_path, lookup_def_kind_rows,
@@ -339,7 +342,11 @@ impl WorkspaceService {
                 .map(Some)
             }
             ("def", ExternLookupShape::RelationExactBindings) => {
-                Ok(Some(lookup_def_rows(request, &self.lookup_defs)))
+                Ok(Some(lookup_def_rows(
+                    request,
+                    self.core_index.as_ref(),
+                    &self.lookup_defs,
+                )))
             }
             ("def_kind", ExternLookupShape::FunctionExactBindings) => {
                 Ok(Some(lookup_def_kind_rows(
@@ -415,6 +422,7 @@ impl WorkspaceService {
             self.analysis_host.raw_database(),
             &self.vfs,
             self.workspace_root.as_path(),
+            self.core_index.as_ref(),
             &mut self.lookup_defs,
             &mut self.lookup_spans,
         );
@@ -643,7 +651,8 @@ impl<'db> CoreFactsBuilder<'db> {
                 self.extract_impls();
             }
             if build_spec.call_graph {
-                self.extract_call_edges();
+                let local_functions = self.local_functions.clone();
+                provider_extract_call_edges(self, self.db, &local_functions);
             }
             if build_spec.syntax_nodes {
                 extract_syntax_nodes(self.db, &self.files, &mut self.host);
@@ -963,175 +972,6 @@ impl<'db> CoreFactsBuilder<'db> {
         let error_def = self.result_error_def(return_ty);
         self.host.set_fn_return_type(function_def, Some(return_ref));
         self.host.set_fn_error_type(function_def, error_def);
-    }
-
-    fn extract_call_edges(&mut self) {
-        // TODO(ra-native-audit): keep tightening this toward RA's outgoing-call semantics.
-        // This now preserves closure bodies while excluding nested item bodies from the outer
-        // function's call set.
-        let sema = hir::Semantics::new(self.db);
-        let local_functions = self.local_functions.clone();
-        let mut parsed_by_file = HashMap::new();
-        for function in local_functions {
-            let Some(source) = function.source(self.db) else {
-                continue;
-            };
-            let editioned = source.file_id.original_file(self.db);
-            let Some(local) = self.files.get(&editioned.file_id(self.db)).cloned() else {
-                continue;
-            };
-            let parsed = parsed_by_file
-                .entry(source.file_id)
-                .or_insert_with(|| sema.parse_or_expand(source.file_id));
-            let lookup_offset = source
-                .value
-                .name()
-                .map(|name| name.syntax().text_range().start())
-                .unwrap_or_else(|| source.value.syntax().text_range().start());
-            let Some(ast_fn) = sema.find_node_at_offset_with_descend::<ast::Fn>(parsed, lookup_offset) else {
-                continue;
-            };
-            let Some(caller_def) = self.register_function_def(function) else {
-                continue;
-            };
-            let Some(body) = ast_fn.body() else {
-                continue;
-            };
-            let owner_item = ast::Item::Fn(ast_fn.clone());
-            for callable_expr in body.syntax().descendants().filter_map(ast::CallableExpr::cast) {
-                if !belongs_to_item(callable_expr.syntax(), owner_item.syntax()) {
-                    continue;
-                }
-                match callable_expr {
-                    ast::CallableExpr::Call(call) => {
-                        self.record_call_expr(
-                            &sema,
-                            caller_def,
-                            &call,
-                            editioned.editioned_file_id(self.db),
-                            &local,
-                        );
-                    }
-                    ast::CallableExpr::MethodCall(method_call) => {
-                        self.record_method_call(
-                            &sema,
-                            caller_def,
-                            &method_call,
-                            editioned.editioned_file_id(self.db),
-                            &local,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn record_call_expr(
-        &mut self,
-        sema: &hir::Semantics<'_, ide::RootDatabase>,
-        caller_def: DefId,
-        call: &ast::CallExpr,
-        file_id: span::EditionedFileId,
-        local: &LocalFile,
-    ) {
-        let Some(callee_expr) = call.expr() else {
-            return;
-        };
-        let Some(type_info) = sema.type_of_expr(&callee_expr) else {
-            return;
-        };
-        let Some(callable) = type_info.original.as_callable(self.db) else {
-            return;
-        };
-        let Some((callee_def, dispatch)) =
-            self.call_target_from_callable(&callable, &callee_expr, file_id, local)
-        else {
-            return;
-        };
-        let Ok(site) = self.host.intern_span_from_text(
-            file_id,
-            local.rel_path.clone(),
-            local.text.as_str(),
-            call.syntax().text_range(),
-        ) else {
-            return;
-        };
-        let range = call.syntax().text_range();
-        let token = format!(
-            "{}:{}..{}",
-            local.rel_path,
-            u32::from(range.start()),
-            u32::from(range.end())
-        );
-        let call_id = crate::CallId::new(crate::deterministic_stable_id("call", token.as_str()));
-        self.host.insert_call_id(call_id, format!("call:{token}"));
-        self.host
-            .insert_call_edge(caller_def, callee_def, site, dispatch);
-    }
-
-    fn record_method_call(
-        &mut self,
-        sema: &hir::Semantics<'_, ide::RootDatabase>,
-        caller_def: DefId,
-        method_call: &ast::MethodCallExpr,
-        file_id: span::EditionedFileId,
-        local: &LocalFile,
-    ) {
-        let Some(function) = sema.resolve_method_call(method_call) else {
-            return;
-        };
-        let Some(callee_def) = self.register_function_def(function) else {
-            return;
-        };
-        let dispatch = method_dispatch_kind(sema, method_call, function, self.db);
-        let Ok(site) = self.host.intern_span_from_text(
-            file_id,
-            local.rel_path.clone(),
-            local.text.as_str(),
-            method_call.syntax().text_range(),
-        ) else {
-            return;
-        };
-        let range = method_call.syntax().text_range();
-        let token = format!(
-            "{}:{}..{}",
-            local.rel_path,
-            u32::from(range.start()),
-            u32::from(range.end())
-        );
-        let call_id = crate::CallId::new(crate::deterministic_stable_id("call", token.as_str()));
-        self.host.insert_call_id(call_id, format!("call:{token}"));
-        self.host
-            .insert_call_edge(caller_def, callee_def, site, dispatch);
-    }
-
-    fn call_target_from_callable(
-        &mut self,
-        callable: &hir::Callable<'_>,
-        callee_expr: &ast::Expr,
-        file_id: span::EditionedFileId,
-        local: &LocalFile,
-    ) -> Option<(DefId, crate::DispatchKind)> {
-        match callable.kind() {
-            hir::CallableKind::Function(function) => self
-                .register_function_def(function)
-                .map(|def| (def, crate::DispatchKind::Direct)),
-            hir::CallableKind::TupleStruct(strukt) => Some((
-                self.register_adt_def(Adt::Struct(strukt)),
-                crate::DispatchKind::Direct,
-            )),
-            hir::CallableKind::TupleEnumVariant(variant) => self
-                .register_module_def(ModuleDef::Variant(variant), false)
-                .map(|def| (def, crate::DispatchKind::Direct)),
-            hir::CallableKind::Closure(_) => Some((
-                self.register_synthetic_callable_def("closure", callee_expr.syntax(), file_id, local),
-                crate::DispatchKind::Closure,
-            )),
-            hir::CallableKind::FnPtr | hir::CallableKind::FnImpl(_) => Some((
-                self.register_synthetic_callable_def("fn_pointer", callee_expr.syntax(), file_id, local),
-                crate::DispatchKind::FnPointer,
-            )),
-        }
     }
 
     fn result_error_def(&mut self, ty: hir::Type) -> Option<DefId> {
@@ -1587,7 +1427,9 @@ impl<'db> CoreFactsBuilder<'db> {
             self.host.insert_handle(def_id, format!("def://{path}"));
         }
         self.record_core_def(def_id, name.as_str(), kind, path.as_str());
-
+        if let ModuleDef::Function(function) = def {
+            self.core_index.record_function(def_id, function);
+        }
         if self.build_spec.def_publicity {
             let is_public = match def {
                 ModuleDef::Module(module) => module.visibility(self.db) == hir::Visibility::Public,
@@ -1811,10 +1653,58 @@ fn path_type_arg_asts(ty: &ast::Type) -> Vec<ast::Type> {
     }
 }
 
-fn belongs_to_item(node: &syntax::SyntaxNode, owner_item: &syntax::SyntaxNode) -> bool {
-    node.ancestors()
-        .find_map(ast::Item::cast)
-        .is_some_and(|item| item.syntax() == owner_item)
+impl<'db> CallGraphProvider for CoreFactsBuilder<'db> {
+    fn local_file(&self, file_id: vfs::FileId) -> Option<LocalFile> {
+        self.files.get(&file_id).cloned()
+    }
+
+    fn register_function_def_for_call_graph(&mut self, function: hir::Function) -> Option<DefId> {
+        CoreFactsBuilder::register_function_def(self, function)
+    }
+
+    fn register_adt_def_for_call_graph(&mut self, adt: Adt) -> DefId {
+        CoreFactsBuilder::register_adt_def(self, adt)
+    }
+
+    fn register_variant_def_for_call_graph(&mut self, variant: hir::Variant) -> Option<DefId> {
+        CoreFactsBuilder::register_module_def(self, ModuleDef::Variant(variant), false)
+    }
+
+    fn register_synthetic_callable_for_call_graph(
+        &mut self,
+        prefix: &str,
+        syntax: &syntax::SyntaxNode,
+        file_id: span::EditionedFileId,
+        local: &LocalFile,
+    ) -> DefId {
+        CoreFactsBuilder::register_synthetic_callable_def(self, prefix, syntax, file_id, local)
+    }
+
+    fn intern_call_site_for_call_graph(
+        &mut self,
+        file_id: span::EditionedFileId,
+        rel_path: String,
+        source_text: &str,
+        range: syntax::TextRange,
+    ) -> Option<SpanId> {
+        self.host
+            .intern_span_from_text(file_id, rel_path, source_text, range)
+            .ok()
+    }
+
+    fn insert_call_id_for_call_graph(&mut self, call_id: crate::CallId, value: String) {
+        self.host.insert_call_id(call_id, value);
+    }
+
+    fn insert_call_edge_for_call_graph(
+        &mut self,
+        caller: DefId,
+        callee: DefId,
+        site: SpanId,
+        dispatch: crate::DispatchKind,
+    ) {
+        self.host.insert_call_edge(caller, callee, site, dispatch);
+    }
 }
 
 fn explicit_watched_files(watched_entries: &[vfs::loader::Entry]) -> BTreeSet<PathBuf> {

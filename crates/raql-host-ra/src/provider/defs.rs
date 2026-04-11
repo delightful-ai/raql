@@ -434,6 +434,7 @@ fn lookup_bound_def_path_from_core_index(
 
 pub(crate) fn lookup_def_rows(
     request: &ExternLookupRequest,
+    core_index: Option<&CoreLookupIndex>,
     lookup_defs: &BTreeMap<DefId, LookupDefRecord>,
 ) -> Vec<Vec<ExternLookupValue>> {
     let mut def = None::<DefId>;
@@ -447,17 +448,37 @@ pub(crate) fn lookup_def_rows(
             _ => return Vec::new(),
         }
     }
-    let Some(def) = def else {
+    if let Some(def) = def {
+        if lookup_defs.contains_key(&def) || core_index.is_some_and(|index| index.contains_def(def)) {
+            return vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+                ExternLookupHostValueKind::Def,
+                def.stable_id(),
+            ))]];
+        }
         return Vec::new();
-    };
-    if lookup_defs.contains_key(&def) {
-        vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
-            ExternLookupHostValueKind::Def,
-            def.stable_id(),
-        ))]]
-    } else {
-        Vec::new()
     }
+    let mut rows = Vec::new();
+    if let Some(core_index) = core_index {
+        rows.extend(core_index.def_ids().map(|def| {
+            vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+                ExternLookupHostValueKind::Def,
+                def.stable_id(),
+            ))]
+        }));
+    }
+    rows.extend(
+        lookup_defs
+            .keys()
+            .copied()
+            .filter(|def_id| !core_index.is_some_and(|index| index.contains_def(*def_id)))
+            .map(|def| {
+                vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+                    ExternLookupHostValueKind::Def,
+                    def.stable_id(),
+                ))]
+            }),
+    );
+    rows
 }
 
 pub(crate) fn lookup_def_kind_rows(

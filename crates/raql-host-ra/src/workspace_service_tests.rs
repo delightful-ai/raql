@@ -1892,6 +1892,90 @@ pub fn direct_caller() { direct_target(); }
 }
 
 #[test]
+fn workspace_service_looks_up_call_edges_for_bound_caller() {
+    let root = temp_workspace_root("lookup_seeded_callees");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn direct_target() {}
+pub fn direct_caller() { direct_target(); }
+"#,
+    )
+    .expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let caller_rows = service
+        .extern_lookup_rows(&ExternLookupRequest::new(
+            "def_name",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [1],
+            vec![ExternLookupValue::String("direct_caller".into())],
+        ))
+        .expect("lookup caller")
+        .expect("caller rows");
+    let caller = caller_rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|value| match value {
+            ExternLookupValue::Host(host) if host.kind() == ExternLookupHostValueKind::Def => {
+                Some(DefId::new(host.stable_id()))
+            }
+            _ => None,
+        })
+        .expect("caller def");
+
+    let call_rows = service
+        .extern_lookup_rows(&ExternLookupRequest::new(
+            "call_edge",
+            ExternLookupShape::RelationExactBindings,
+            4,
+            [0],
+            vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+                ExternLookupHostValueKind::Def,
+                caller.stable_id(),
+            ))],
+        ))
+        .expect("lookup call_edge")
+        .expect("call_edge rows");
+
+    let callee = call_rows
+        .iter()
+        .find_map(|row| match (row.get(1), row.get(3)) {
+            (
+                Some(ExternLookupValue::Host(host)),
+                Some(ExternLookupValue::Enum { name, variant }),
+            ) if host.kind() == ExternLookupHostValueKind::Def
+                && name.as_ref() == "DispatchKind"
+                && variant.as_ref() == "DIRECT" =>
+            {
+                Some(DefId::new(host.stable_id()))
+            }
+            _ => None,
+        })
+        .expect("callee def");
+
+    let callee_name_rows = service
+        .extern_lookup_rows(&ExternLookupRequest::new(
+            "def_name",
+            ExternLookupShape::FunctionExactBindings,
+            2,
+            [0],
+            vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+                ExternLookupHostValueKind::Def,
+                callee.stable_id(),
+            ))],
+        ))
+        .expect("lookup callee name")
+        .expect("callee name rows");
+
+    assert!(callee_name_rows.iter().any(|row| {
+        row.get(1)
+            .is_some_and(|value| matches!(value, ExternLookupValue::String(name) if name.as_ref() == "direct_target"))
+    }));
+}
+
+#[test]
 fn workspace_service_looks_up_call_edges_for_bound_callee_through_alias_reference() {
     let root = temp_workspace_root("lookup_seeded_callers_alias");
     fs::write(
