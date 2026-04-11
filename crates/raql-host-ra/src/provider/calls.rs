@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
+use base_db::SourceDatabase;
 use hir::{HasSource, ModuleDef};
 use ide_db::search::ReferenceCategory;
 use raql_host::{
@@ -221,7 +222,6 @@ pub(crate) fn collect_lookup_call_edges_for_function(
                     db,
                     vfs,
                     workspace_root,
-                    sema,
                     lookup_defs,
                     lookup_spans,
                     id_host,

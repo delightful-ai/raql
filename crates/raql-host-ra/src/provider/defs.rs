@@ -2,14 +2,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use base_db::SourceDatabase;
-use hir::{Adt, ModuleDef};
+use hir::{Adt, HasSource, ModuleDef};
 use ide::LineIndex;
 use ide_db::symbol_index::{Query, world_symbols};
 use raql_host::{
     ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
 };
-use syntax::Edition;
-use vfs::{AbsPathBuf, VfsPath};
+use syntax::{AstNode, Edition};
 
 use crate::provider::core_index::CoreLookupIndex;
 use crate::RaHostInitError;

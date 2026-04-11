@@ -15,9 +15,9 @@ use project_model::ProjectManifest;
 use raql_compiler::{PlannedProgram, required_extern_capabilities};
 use raql_engine::{EvalResult, execute};
 use raql_host::{
-    CapabilityId, CapabilitySet, ExternLookupHostValue, ExternLookupHostValueKind,
-    ExternLookupRequest, ExternLookupShape, ExternLookupValue, MissingCapabilitiesError,
-    SpanKey, is_engine_managed_extern, is_runtime_scalar_input_predicate,
+    CapabilityId, CapabilitySet, ExternLookupRequest, ExternLookupShape, ExternLookupValue,
+    MissingCapabilitiesError, SpanKey,
+    is_engine_managed_extern, is_runtime_scalar_input_predicate,
 };
 use hir::import_map::AssocSearchMode;
 use syntax::ast::{HasGenericArgs, HasName};
@@ -29,17 +29,17 @@ use crate::lazy_runtime::LazyRaRuntime;
 use crate::provider::calls::{lookup_call_edge_rows as provider_lookup_call_edge_rows, method_dispatch_kind};
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
-    LocalFile, LookupDefRecord, RaEntity, canonical_function_path, ensure_lookup_function_def,
-    ensure_lookup_source_module_def,
-    ensure_lookup_symbol_module_def, ensure_lookup_synthetic_callable_def, lookup_def_kind_rows,
+    LocalFile, LookupDefRecord, canonical_function_path, lookup_def_kind_rows,
     lookup_def_name_rows, lookup_def_path_rows, lookup_def_rows, lookup_def_span_rows,
-    lookup_local_file, lookup_span_key_from_text, module_def_kind,
+    module_def_kind,
 };
-use crate::provider::syntax::{lookup_span_allowed_rows, lookup_span_key_rows};
+use crate::provider::syntax::{
+    extract_syntax_nodes, lookup_span_allowed_rows, lookup_span_key_rows,
+};
 use crate::workspace_loader;
 use crate::{
-    DefId, DefKind, DeterministicRaHost, GenericArg, Mutability, NodeId, NodeKind,
-    RaHostInitError, SpanId, TypeShape, WorldStamp,
+    DefId, DefKind, DeterministicRaHost, GenericArg, Mutability, RaHostInitError, SpanId,
+    TypeShape, WorldStamp,
 };
 
 #[derive(Debug)]
@@ -305,6 +305,21 @@ impl WorkspaceService {
             || supports_day_one_capability(predicate)
     }
 
+    pub(crate) fn ensure_supported_planned(
+        &self,
+        planned: &PlannedProgram,
+    ) -> Result<(), RaHostInitError> {
+        MissingCapabilitiesError::from_required_and_supported(
+            required_extern_capabilities(planned)
+                .into_iter()
+                .map(CapabilityId::from),
+            self.supported_capabilities(),
+        )
+        .map_err(|err| RaHostInitError::SemanticBuild {
+            details: err.to_string(),
+        })
+    }
+
     pub(crate) fn extern_lookup_rows(
         &mut self,
         request: &ExternLookupRequest,
@@ -387,7 +402,7 @@ impl WorkspaceService {
         let result = execute(planned, &mut runtime);
         trace_timing("workspace_service.execute", execute_started.elapsed());
         trace_timing("workspace_service.run_planned.total", run_started.elapsed());
-        result
+        Ok(result)
     }
 
     fn lookup_call_edge_rows(
@@ -596,13 +611,6 @@ pub fn resolve_workspace_root(input: &Path) -> Result<PathBuf, RaHostInitError> 
     workspace_loader::true_workspace_root(Path::new(&manifest.manifest_path().to_string()))
 }
 
-#[derive(Debug)]
-#[derive(Clone)]
-struct LocalFile {
-    rel_path: String,
-    text: String,
-}
-
 struct CoreFactsBuilder<'db> {
     db: &'db ide::RootDatabase,
     build_spec: CoreHostBuildSpec,
@@ -638,7 +646,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 self.extract_call_edges();
             }
             if build_spec.syntax_nodes {
-                self.extract_syntax_nodes();
+                extract_syntax_nodes(self.db, &self.files, &mut self.host);
             }
         });
         trace_timing("workspace_service.populate.semantic_phases", semantic_started.elapsed());
@@ -1015,54 +1023,6 @@ impl<'db> CoreFactsBuilder<'db> {
                     }
                 }
             }
-        }
-    }
-
-    fn extract_syntax_nodes(&mut self) {
-        // TODO(ra-native-audit): this still walks our own host-side node graph, but the parsed
-        // syntax tree itself now comes directly from RA instead of a parallel raw parse pass.
-        let sema = hir::Semantics::new(self.db);
-        let files = self.files.clone();
-        for (file_id, local) in files {
-            let editioned_file =
-                base_db::EditionedFileId::current_edition_guess_origin(self.db, file_id);
-            let root = sema.parse(editioned_file).syntax().clone();
-            self.record_syntax_node(&root, editioned_file.editioned_file_id(self.db), &local, None);
-        }
-    }
-
-    fn record_syntax_node(
-        &mut self,
-        node: &syntax::SyntaxNode,
-        file_id: span::EditionedFileId,
-        local: &LocalFile,
-        parent: Option<NodeId>,
-    ) {
-        let range = node.text_range();
-        let Ok(span) = self.host.intern_span_from_text(
-            file_id,
-            local.rel_path.clone(),
-            local.text.as_str(),
-            range,
-        ) else {
-            for child in node.children() {
-                self.record_syntax_node(&child, file_id, local, parent);
-            }
-            return;
-        };
-        let token = format!(
-            "{}:{}..{}:{:?}",
-            local.rel_path,
-            u32::from(range.start()),
-            u32::from(range.end()),
-            node.kind()
-        );
-        let node_id = NodeId::new(crate::deterministic_stable_id("node", token.as_str()));
-        self.host.insert_node_id(node_id, format!("node:{token}"));
-        self.host
-            .insert_node(node_id, syntax_node_kind(node), span, parent);
-        for child in node.children() {
-            self.record_syntax_node(&child, file_id, local, Some(node_id));
         }
     }
 
@@ -1893,32 +1853,6 @@ fn module_is_test_scope(module: Module, db: &dyn hir::db::HirDatabase) -> bool {
         m.name(db)
             .is_some_and(|name| name.display(db, Edition::CURRENT).to_string() == "tests")
     })
-}
-
-fn syntax_node_kind(node: &syntax::SyntaxNode) -> NodeKind {
-    if ast::IfExpr::cast(node.clone()).is_some() {
-        NodeKind::If
-    } else if ast::MatchExpr::cast(node.clone()).is_some() {
-        NodeKind::Match
-    } else if ast::WhileExpr::cast(node.clone()).is_some() {
-        NodeKind::While
-    } else if ast::ForExpr::cast(node.clone()).is_some() {
-        NodeKind::For
-    } else if ast::LoopExpr::cast(node.clone()).is_some() {
-        NodeKind::Loop
-    } else if ast::BlockExpr::cast(node.clone()).is_some() {
-        NodeKind::Block
-    } else if ast::TryExpr::cast(node.clone()).is_some() {
-        NodeKind::Try
-    } else if ast::MatchArm::cast(node.clone()).is_some() {
-        NodeKind::Arm
-    } else if ast::Item::cast(node.clone()).is_some() {
-        NodeKind::Item
-    } else if ast::Expr::cast(node.clone()).is_some() {
-        NodeKind::Expr
-    } else {
-        NodeKind::Other
-    }
 }
 
 fn explicit_watched_files(watched_entries: &[vfs::loader::Entry]) -> BTreeSet<PathBuf> {
