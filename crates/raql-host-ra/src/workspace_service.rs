@@ -541,8 +541,7 @@ impl WorkspaceService {
                 self.core_host = None;
                 self.core_index = None;
                 self.core_host_spec = None;
-                self.lookup_defs.clear();
-                self.lookup_spans.clear();
+                self.invalidate_lookup_state_for_paths(&changed_tracked_paths);
                 self.tracked_dirs =
                     tracked_directory_watch_set(&self.tracked_files, &self.watched_entries);
                 for path in changed_tracked_paths {
@@ -576,6 +575,7 @@ impl WorkspaceService {
         }
 
         let mut change = hir::ChangeWithProcMacros::default();
+        let mut changed_tracked_paths = BTreeSet::new();
         let mut saw_change = false;
         for path in &self.tracked_files {
             if !path.extension().is_some_and(|ext| ext == "rs") {
@@ -618,6 +618,7 @@ impl WorkspaceService {
                 details: err.to_string(),
             })?;
             change.change_file(file_id, Some(text));
+            changed_tracked_paths.insert(path.clone());
             saw_change = true;
         }
         let _ = self.vfs.take_changes();
@@ -629,8 +630,7 @@ impl WorkspaceService {
             self.core_host = None;
             self.core_index = None;
             self.core_host_spec = None;
-            self.lookup_defs.clear();
-            self.lookup_spans.clear();
+            self.invalidate_lookup_state_for_paths(&changed_tracked_paths);
         }
         for (path, state) in tracked_rust_file_states {
             self.tracked_file_states.insert(path, state);
@@ -699,6 +699,50 @@ impl WorkspaceService {
             }
         }
         Ok(false)
+    }
+
+    fn invalidate_lookup_state_for_paths(&mut self, changed_paths: &BTreeSet<PathBuf>) {
+        if changed_paths.is_empty() {
+            return;
+        }
+        let changed_path_strings = changed_paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<BTreeSet<_>>();
+        let changed_rel_paths = changed_paths
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix(&self.workspace_root)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            })
+            .collect::<BTreeSet<_>>();
+        let invalid_spans = self
+            .lookup_spans
+            .iter()
+            .filter_map(|(span_id, span_key)| {
+                (changed_rel_paths.contains(span_key.rel_path())
+                    || changed_path_strings.contains(span_key.rel_path()))
+                .then_some(*span_id)
+            })
+            .collect::<BTreeSet<_>>();
+        self.lookup_spans
+            .retain(|span_id, _| !invalid_spans.contains(span_id));
+        let vfs = &self.vfs;
+        self.lookup_defs.retain(|_, record| {
+            if invalid_spans.contains(&record.span) {
+                return false;
+            }
+            let Some(ra_span) = &record.ra_span else {
+                return true;
+            };
+            let path = vfs.file_path(ra_span.file_id.file_id());
+            let Some(abs_path) = path.as_path() else {
+                return true;
+            };
+            let path: &Path = abs_path.as_ref();
+            !changed_paths.contains(path)
+        });
     }
 }
 
