@@ -146,6 +146,19 @@ pub(super) fn tracked_file_state_map(
     Ok(states)
 }
 
+pub(super) fn tracked_rust_file_state_map(
+    tracked_files: &BTreeSet<PathBuf>,
+) -> Result<BTreeMap<PathBuf, WatchedFileState>, RaHostInitError> {
+    let mut states = BTreeMap::new();
+    for path in tracked_files {
+        if !path.extension().is_some_and(|ext| ext == "rs") {
+            continue;
+        }
+        states.insert(path.clone(), watched_file_state(path)?);
+    }
+    Ok(states)
+}
+
 pub(super) fn tracked_path_state(
     path: &Path,
 ) -> Result<Option<WatchedFileState>, RaHostInitError> {

@@ -50,6 +50,7 @@ mod watch;
 use self::tracking::{
     auxiliary_build_input_state, build_script_rerun_paths, path_requires_reload,
     tracked_directory_watch_set, tracked_file_state_map, tracked_path_state,
+    tracked_rust_file_state_map,
     tracked_workspace_state,
 };
 use self::watch::WorkspaceWatcher;
@@ -494,6 +495,7 @@ impl WorkspaceService {
         let watch_batch = self.watcher.drain(WATCHER_READY_TIMEOUT);
         if !watch_batch.changed_files.is_empty() {
             let mut change = hir::ChangeWithProcMacros::default();
+            let mut changed_tracked_paths = BTreeSet::new();
             let mut saw_change = false;
             for (abs_path, contents) in watch_batch.changed_files {
                 let path: &Path = abs_path.as_ref();
@@ -526,6 +528,7 @@ impl WorkspaceService {
                     details: err.to_string(),
                 })?;
                 if self.tracked_files.contains(&path_buf) || is_rust_file {
+                    changed_tracked_paths.insert(path_buf.clone());
                     self.tracked_files.insert(path_buf);
                 }
                 change.change_file(file_id, Some(text));
@@ -542,7 +545,16 @@ impl WorkspaceService {
                 self.lookup_spans.clear();
                 self.tracked_dirs =
                     tracked_directory_watch_set(&self.tracked_files, &self.watched_entries);
-                self.tracked_file_states = tracked_file_state_map(&self.tracked_files)?;
+                for path in changed_tracked_paths {
+                    match tracked_path_state(path.as_path())? {
+                        Some(state) => {
+                            self.tracked_file_states.insert(path, state);
+                        }
+                        None => {
+                            self.tracked_file_states.remove(&path);
+                        }
+                    }
+                }
                 self.tracked_dir_states = tracked_file_state_map(&self.tracked_dirs)?;
             }
             return Ok(());
@@ -555,8 +567,10 @@ impl WorkspaceService {
         if self.reload_sensitive_files_changed()? {
             return self.reload_full();
         }
-        let tracked_file_states = tracked_file_state_map(&self.tracked_files)?;
-        if tracked_file_states == self.tracked_file_states {
+        let tracked_rust_file_states = tracked_rust_file_state_map(&self.tracked_files)?;
+        if tracked_rust_file_states.iter().all(|(path, state)| {
+            self.tracked_file_states.get(path) == Some(state)
+        }) {
             self.tracked_dir_states = tracked_dir_states;
             return Ok(());
         }
@@ -564,7 +578,10 @@ impl WorkspaceService {
         let mut change = hir::ChangeWithProcMacros::default();
         let mut saw_change = false;
         for path in &self.tracked_files {
-            let changed_on_disk = tracked_file_states
+            if !path.extension().is_some_and(|ext| ext == "rs") {
+                continue;
+            }
+            let changed_on_disk = tracked_rust_file_states
                 .get(path)
                 .is_some_and(|state| self.tracked_file_states.get(path) != Some(state));
             if !changed_on_disk {
@@ -615,7 +632,9 @@ impl WorkspaceService {
             self.lookup_defs.clear();
             self.lookup_spans.clear();
         }
-        self.tracked_file_states = tracked_file_states;
+        for (path, state) in tracked_rust_file_states {
+            self.tracked_file_states.insert(path, state);
+        }
         self.tracked_dir_states = tracked_dir_states;
         Ok(())
     }
