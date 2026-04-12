@@ -243,6 +243,38 @@ hit(Name) :- def_name(D, "gamma"), def_name(D, Name), def_span(D, Span), node_at
 }
 
 #[test]
+fn workspace_service_tracks_incremental_rust_file_edits_after_watcher_settles() {
+    let root = temp_workspace_root("incremental_after_watcher_ready");
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").expect("write lib.rs");
+
+    let mut service =
+        WorkspaceService::from_manifest_path(root.join("Cargo.toml").as_std_path()).expect("service");
+    std::thread::sleep(Duration::from_millis(150));
+
+    let initial_epoch = service.workspace_epoch();
+    fs::write(root.join("src/lib.rs"), "pub fn omega() {}\n").expect("rewrite lib.rs");
+
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl contains(Haystack: string, Needle: string) extern.
+.decl hit(Name: string).
+hit(Name) :- def(D), def_name(D, Name), contains(Name, "omega").
+"#,
+    );
+    let result = service.run_planned(&planned).expect("watcher-ready run");
+    assert!(result.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("omega".to_string())])
+    }));
+    assert_eq!(
+        service.workspace_epoch(),
+        initial_epoch,
+        "same-file Rust edits should stay incremental after watcher settles"
+    );
+}
+
+#[test]
 fn workspace_service_excludes_import_and_alias_symbols_from_def_surface() {
     let root = temp_workspace_root("def_surface_excludes_aliases");
     fs::write(

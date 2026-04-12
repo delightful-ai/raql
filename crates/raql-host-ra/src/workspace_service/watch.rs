@@ -1,5 +1,5 @@
 use crossbeam_channel::{Receiver, unbounded};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vfs::loader::LoadingProgress;
 
 pub(super) struct WatchBatch {
@@ -11,6 +11,7 @@ pub(super) struct WorkspaceWatcher {
     _handle: Box<dyn vfs::loader::Handle>,
     receiver: Receiver<vfs::loader::Message>,
     ready: bool,
+    ready_since: Option<Instant>,
 }
 
 impl WorkspaceWatcher {
@@ -27,6 +28,7 @@ impl WorkspaceWatcher {
             _handle: handle,
             receiver,
             ready: false,
+            ready_since: None,
         }
     }
 
@@ -43,6 +45,15 @@ impl WorkspaceWatcher {
         WatchBatch {
             changed_files,
         }
+    }
+
+    pub(super) fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub(super) fn is_settled(&self, settle_duration: Duration) -> bool {
+        self.ready_since
+            .is_some_and(|ready_since| ready_since.elapsed() >= settle_duration)
     }
 
     fn drain_messages(&mut self, changed_files: &mut Vec<(vfs::AbsPathBuf, Option<Vec<u8>>)>) {
@@ -62,6 +73,7 @@ impl WorkspaceWatcher {
             vfs::loader::Message::Progress { n_done, .. } => {
                 if n_done == LoadingProgress::Finished {
                     self.ready = true;
+                    self.ready_since.get_or_insert_with(Instant::now);
                 }
             }
             vfs::loader::Message::Loaded { .. } => {}

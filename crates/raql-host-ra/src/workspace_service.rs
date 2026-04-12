@@ -56,6 +56,7 @@ use self::tracking::{
 use self::watch::WorkspaceWatcher;
 
 const WATCHER_READY_TIMEOUT: Duration = Duration::from_millis(20);
+const WATCHER_SETTLE_GRACE: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub struct WorkspaceService {
@@ -514,6 +515,8 @@ impl WorkspaceService {
         }
 
         let watch_batch = self.watcher.drain(WATCHER_READY_TIMEOUT);
+        let watcher_ready = self.watcher.is_ready();
+        let watcher_settled = self.watcher.is_settled(WATCHER_SETTLE_GRACE);
         if !watch_batch.changed_files.is_empty() {
             let mut change = hir::ChangeWithProcMacros::default();
             let mut changed_tracked_paths = BTreeSet::new();
@@ -581,11 +584,14 @@ impl WorkspaceService {
             return Ok(());
         }
 
-        let tracked_dir_states = tracked_file_state_map(&self.tracked_dirs)?;
-        if tracked_dir_states != self.tracked_dir_states {
+        if self.reload_sensitive_files_changed()? {
             return self.reload_full();
         }
-        if self.reload_sensitive_files_changed()? {
+        if watcher_ready && watcher_settled {
+            return Ok(());
+        }
+        let tracked_dir_states = tracked_file_state_map(&self.tracked_dirs)?;
+        if tracked_dir_states != self.tracked_dir_states {
             return self.reload_full();
         }
         let tracked_rust_file_states = tracked_rust_file_state_map(&self.tracked_files)?;
