@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -22,7 +21,7 @@ pub(super) fn tracked_workspace_state(
                 return None;
             }
             let path: &Path = abs.as_ref();
-            is_local_workspace_file(path).then(|| path.to_path_buf())
+            is_relevant_workspace_file(path).then(|| path.to_path_buf())
         })
         .collect::<BTreeSet<_>>();
     tracked_files.extend(explicit_watched_files(watched_entries));
@@ -250,58 +249,4 @@ pub(super) fn path_requires_reload(
         return true;
     }
     !path.extension().is_some_and(|ext| ext == "rs")
-}
-
-fn is_local_workspace_file(path: &Path) -> bool {
-    is_relevant_workspace_file(path) && !is_external_dependency_path(path)
-}
-
-fn is_external_dependency_path(path: &Path) -> bool {
-    path.starts_with(cargo_home_dir().join("registry"))
-        || path.starts_with(cargo_home_dir().join("git").join("checkouts"))
-        || path.starts_with(rustup_home_dir().join("toolchains"))
-        || has_component_sequence(path, &[".cargo", "registry"])
-        || has_component_sequence(path, &[".cargo", "git", "checkouts"])
-        || has_component_sequence(path, &[".rustup", "toolchains"])
-        || has_registry_source_layout(path)
-}
-
-fn cargo_home_dir() -> PathBuf {
-    std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
-        .unwrap_or_else(|| PathBuf::from(".cargo"))
-}
-
-fn rustup_home_dir() -> PathBuf {
-    std::env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
-        .unwrap_or_else(|| PathBuf::from(".rustup"))
-}
-
-fn has_component_sequence(path: &Path, sequence: &[&str]) -> bool {
-    let components = path
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    components
-        .windows(sequence.len())
-        .any(|window| window == sequence)
-}
-
-fn has_registry_source_layout(path: &Path) -> bool {
-    let components = path
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    components
-        .windows(4)
-        .any(|window| window[0] == "registry" && window[1] == "src")
 }
