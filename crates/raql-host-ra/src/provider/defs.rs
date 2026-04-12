@@ -807,13 +807,29 @@ pub(crate) fn lookup_def_flag_rows(
             _ => return None,
         }
     }
-    let def = def?;
-    let flag = lookup_bound_def_flag_from_core_index(core_index, def, predicate)?;
-    if !flag {
-        return Some(Vec::new());
+    if let Some(def) = def {
+        let flag = lookup_bound_def_flag_from_core_index(core_index, def, predicate)?;
+        if !flag {
+            return Some(Vec::new());
+        }
+        return Some(vec![vec![ExternLookupValue::Host(
+            ExternLookupHostValue::new(ExternLookupHostValueKind::Def, def.stable_id()),
+        )]]);
     }
-    Some(vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
-        ExternLookupHostValueKind::Def,
-        def.stable_id(),
-    ))]])
+    let core_index = core_index?;
+    Some(
+        core_index
+            .def_ids()
+            .filter(|def| {
+                lookup_bound_def_flag_from_core_index(Some(core_index), *def, predicate)
+                    == Some(true)
+            })
+            .map(|def| {
+                vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+                    ExternLookupHostValueKind::Def,
+                    def.stable_id(),
+                ))]
+            })
+            .collect(),
+    )
 }

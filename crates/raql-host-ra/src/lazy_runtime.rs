@@ -43,6 +43,8 @@ impl<'a> LazyRaRuntime<'a> {
                 | "def_kind"
                 | "def_span"
                 | "def_path"
+                | "is_public"
+                | "in_test"
                 | "span_allowed"
                 | "span_key"
                 | "call_edge"

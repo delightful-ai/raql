@@ -1786,6 +1786,33 @@ exported_test(Name) :- def(D), def_name(D, Name), in_test(D), contains(Name, "ex
 }
 
 #[test]
+fn workspace_service_supports_unbound_public_def_lookup_rows() {
+    let root = temp_workspace_root("visibility_lookup_only");
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\nfn beta() {}\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl is_public(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl hit(Name: string).
+hit(Name) :- is_public(D), def_name(D, Name).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(matches!(result.status, EvalStatus::Ok), "{result:?}");
+    assert!(result.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("alpha".to_string())])
+    }));
+    assert!(
+        !result.relations.get("hit").is_some_and(|rows| {
+            rows.contains(&vec![RuntimeValue::String("beta".to_string())])
+        }),
+        "unbound visibility lookup should enumerate only public defs"
+    );
+}
+
+#[test]
 fn workspace_service_reports_workspace_relative_span_keys() {
     let root = temp_workspace_root("span_key_relative");
     fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");

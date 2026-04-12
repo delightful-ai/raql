@@ -181,8 +181,6 @@ impl CoreHostBuildSpec {
             && !self.type_facts
             && !self.adt_structure
             && !self.def_handles
-            && !self.def_publicity
-            && !self.def_test_flags
     }
 }
 
@@ -389,9 +387,17 @@ impl WorkspaceService {
                 &mut self.lookup_defs,
             ),
             ("is_public", ExternLookupShape::RelationExactBindings) => {
+                let _ = self.ensure_core_host(&CoreHostBuildSpec {
+                    def_publicity: true,
+                    ..CoreHostBuildSpec::default()
+                })?;
                 Ok(lookup_def_flag_rows(request, self.core_index.as_ref(), "is_public"))
             }
             ("in_test", ExternLookupShape::RelationExactBindings) => {
+                let _ = self.ensure_core_host(&CoreHostBuildSpec {
+                    def_test_flags: true,
+                    ..CoreHostBuildSpec::default()
+                })?;
                 Ok(lookup_def_flag_rows(request, self.core_index.as_ref(), "in_test"))
             }
             ("call_edge", ExternLookupShape::RelationExactBindings) => {

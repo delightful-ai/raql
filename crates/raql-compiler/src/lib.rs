@@ -3278,7 +3278,8 @@ fn supports_zero_bound_relation_lookup(
     predicate: &str,
     kind: DeclarationKind,
 ) -> bool {
-    matches!(kind, DeclarationKind::Relation) && matches!(predicate, "def")
+    matches!(kind, DeclarationKind::Relation)
+        && matches!(predicate, "def" | "is_public" | "in_test")
 }
 
 #[derive(Debug, Clone)]
