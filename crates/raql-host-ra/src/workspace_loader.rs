@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use ide::RootDatabase;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, ProjectFolders, load_workspace_into_db};
-use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource};
+use project_model::{CargoConfig, ProjectManifest, ProjectWorkspace, RustLibSource};
 use toml::Value;
 use vfs::AbsPathBuf;
 
@@ -19,7 +19,6 @@ pub(crate) struct LoadedWorkspace {
     pub(crate) db: RootDatabase,
     pub(crate) vfs: vfs::Vfs,
     pub(crate) watched_entries: Vec<vfs::loader::Entry>,
-    pub(crate) local_tracking_roots: Vec<PathBuf>,
     pub(crate) proc_macro_client: Option<Box<dyn ProcMacroClientHandle>>,
 }
 
@@ -112,7 +111,6 @@ fn load_from_manifest(manifest: ProjectManifest) -> Result<LoadedWorkspace, RaHo
     }
 
     let workspace_root = PathBuf::from(workspace.workspace_root().to_string());
-    let local_tracking_roots = local_tracking_roots(&workspace);
     let project_folders_started = Instant::now();
     let project_folders = ProjectFolders::new(std::slice::from_ref(&workspace), &[], None);
     let watched_entries = project_folders
@@ -145,7 +143,6 @@ fn load_from_manifest(manifest: ProjectManifest) -> Result<LoadedWorkspace, RaHo
         db,
         vfs,
         watched_entries,
-        local_tracking_roots,
         proc_macro_client: proc_macro_client
             .map(|client| Box::new(client) as Box<dyn ProcMacroClientHandle>),
     })
@@ -229,34 +226,4 @@ fn trace_loader_timing(label: &str, elapsed: std::time::Duration) {
         return;
     }
     eprintln!("raql-timing {label} {}ms", elapsed.as_millis());
-}
-
-fn local_tracking_roots(workspace: &ProjectWorkspace) -> Vec<PathBuf> {
-    let mut roots = match &workspace.kind {
-        ProjectWorkspaceKind::Cargo { cargo, .. } => cargo
-            .packages()
-            .filter(|&pkg| cargo[pkg].is_local)
-            .flat_map(|pkg| {
-                cargo[pkg]
-                    .targets
-                    .iter()
-                    .filter_map(|&tgt| cargo[tgt].root.parent())
-                    .map(path_ref_to_path_buf)
-            })
-            .collect::<Vec<_>>(),
-        _ => workspace
-            .to_roots()
-            .into_iter()
-            .filter(|root| root.is_local)
-            .flat_map(|root| root.include.into_iter().map(path_ref_to_path_buf))
-            .collect::<Vec<_>>(),
-    };
-    roots.extend(workspace.extra_includes.iter().map(path_ref_to_path_buf));
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn path_ref_to_path_buf(path: impl AsRef<Path>) -> PathBuf {
-    path.as_ref().to_path_buf()
 }

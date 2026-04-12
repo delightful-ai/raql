@@ -198,15 +198,13 @@ impl WorkspaceService {
             &loaded.watched_entries,
             loaded.manifest_path.as_path(),
             loaded.workspace_root.as_path(),
-            &loaded.local_tracking_roots,
         )?;
         trace_timing("workspace_service.from_loaded.tracked_workspace_state", tracked_files_started.elapsed());
         let tracked_file_states_started = Instant::now();
         let tracked_file_states = tracked_file_state_map(&tracked_files)?;
         trace_timing("workspace_service.from_loaded.tracked_file_state_map", tracked_file_states_started.elapsed());
         let tracked_dirs_started = Instant::now();
-        let tracked_dirs =
-            tracked_directory_watch_set(&tracked_files, loaded.manifest_path.as_path(), loaded.workspace_root.as_path());
+        let tracked_dirs = tracked_directory_watch_set(&tracked_files, &loaded.watched_entries);
         trace_timing("workspace_service.from_loaded.tracked_directory_watch_set", tracked_dirs_started.elapsed());
         let tracked_dir_states_started = Instant::now();
         let tracked_dir_states = tracked_file_state_map(&tracked_dirs)?;
@@ -557,7 +555,6 @@ impl WorkspaceService {
             db,
             vfs,
             watched_entries,
-            local_tracking_roots,
             proc_macro_client,
             ..
         } = loaded;
@@ -568,10 +565,9 @@ impl WorkspaceService {
                 &watched_entries,
                 manifest_path.as_path(),
                 workspace_root.as_path(),
-                &local_tracking_roots,
             )?;
         let tracked_file_states = tracked_file_state_map(&tracked_files)?;
-        let tracked_dirs = tracked_directory_watch_set(&tracked_files, manifest_path.as_path(), workspace_root.as_path());
+        let tracked_dirs = tracked_directory_watch_set(&tracked_files, &watched_entries);
         let tracked_dir_states = tracked_file_state_map(&tracked_dirs)?;
         let build_script_rerun_paths = build_script_rerun_paths(&tracked_files)?;
         let auxiliary_build_inputs =

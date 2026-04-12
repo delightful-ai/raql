@@ -13,17 +13,16 @@ pub(super) fn tracked_workspace_state(
     watched_entries: &[vfs::loader::Entry],
     manifest_path: &Path,
     workspace_root: &Path,
-    local_tracking_roots: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>, RaHostInitError> {
     let mut tracked_files = vfs
         .iter()
-        .filter_map(|(_, path)| path.as_path().map(|abs| {
+        .filter_map(|(_, path)| {
+            let abs = path.as_path()?;
+            if !watched_entries.iter().any(|entry| entry.contains_file(abs)) {
+                return None;
+            }
             let path: &Path = abs.as_ref();
-            path.to_path_buf()
-        }))
-        .filter(|path| {
-            is_local_workspace_file(path.as_path())
-                && path_is_in_tracking_roots(path, local_tracking_roots)
+            is_local_workspace_file(path).then(|| path.to_path_buf())
         })
         .collect::<BTreeSet<_>>();
     tracked_files.extend(explicit_watched_files(watched_entries));
@@ -47,10 +46,6 @@ fn explicit_watched_files(watched_entries: &[vfs::loader::Entry]) -> BTreeSet<Pa
     files
 }
 
-fn path_is_in_tracking_roots(path: &Path, local_tracking_roots: &[PathBuf]) -> bool {
-    local_tracking_roots.iter().any(|root| path.starts_with(root))
-}
-
 fn workspace_watch_files(manifest_path: &Path, workspace_root: &Path) -> BTreeSet<PathBuf> {
     [
         manifest_path.to_path_buf(),
@@ -67,17 +62,30 @@ fn workspace_watch_files(manifest_path: &Path, workspace_root: &Path) -> BTreeSe
 
 pub(super) fn tracked_directory_watch_set(
     tracked_files: &BTreeSet<PathBuf>,
-    manifest_path: &Path,
-    workspace_root: &Path,
+    watched_entries: &[vfs::loader::Entry],
 ) -> BTreeSet<PathBuf> {
     let mut dirs = BTreeSet::new();
-    dirs.insert(workspace_root.to_path_buf());
-    if let Some(parent) = manifest_path.parent() {
-        dirs.insert(parent.to_path_buf());
-    }
     for path in tracked_files {
         if let Some(parent) = path.parent() {
             dirs.insert(parent.to_path_buf());
+        }
+    }
+    for entry in watched_entries {
+        match entry {
+            vfs::loader::Entry::Files(paths) => {
+                for path in paths {
+                    let path: &Path = path.as_ref();
+                    if let Some(parent) = path.parent() {
+                        dirs.insert(parent.to_path_buf());
+                    }
+                }
+            }
+            vfs::loader::Entry::Directories(directories) => {
+                for include in &directories.include {
+                    let path: &Path = include.as_ref();
+                    dirs.insert(path.to_path_buf());
+                }
+            }
         }
     }
     dirs
