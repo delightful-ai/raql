@@ -727,6 +727,193 @@ impl DeterministicRaHost {
         self.node_records.get(&node).map(|record| record.parent)
     }
 
+    pub(crate) fn invalidate_paths(&mut self, changed_rel_paths: &BTreeSet<String>) {
+        if changed_rel_paths.is_empty() {
+            return;
+        }
+        let invalid_spans = self
+            .span_keys
+            .iter()
+            .filter_map(|(span, key)| changed_rel_paths.contains(key.rel_path()).then_some(*span))
+            .collect::<BTreeSet<_>>();
+        let invalid_defs = self
+            .def_records
+            .iter()
+            .filter_map(|(def, record)| invalid_spans.contains(&record.span).then_some(*def))
+            .collect::<BTreeSet<_>>();
+        let invalid_nodes = self
+            .node_records
+            .iter()
+            .filter_map(|(node, record)| invalid_spans.contains(&record.span).then_some(*node))
+            .collect::<BTreeSet<_>>();
+        let mut invalid_types = self
+            .def_records
+            .iter()
+            .filter(|(def, _)| invalid_defs.contains(def))
+            .flat_map(|(_, record)| [record.return_type].into_iter().flatten())
+            .chain(
+                self.field_records
+                    .iter()
+                    .filter(|record| invalid_defs.contains(&record.owner))
+                    .map(|record| record.ty),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let next = invalid_types
+                .iter()
+                .flat_map(|type_ref| match self.type_shapes.get(type_ref) {
+                    Some(TypeShape::App { args, .. }) => args
+                        .iter()
+                        .filter_map(|arg| match arg {
+                            GenericArg::Type(type_ref) => Some(*type_ref),
+                            GenericArg::Lifetime | GenericArg::Const => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    Some(TypeShape::Ref { inner, .. })
+                    | Some(TypeShape::Ptr { inner, .. })
+                    | Some(TypeShape::Slice(inner)) => vec![*inner],
+                    Some(TypeShape::Tuple(items)) => items.clone(),
+                    Some(TypeShape::Param(_)) | Some(TypeShape::Prim(_)) | Some(TypeShape::Unknown) | None => {
+                        Vec::new()
+                    }
+                })
+                .collect::<Vec<_>>();
+            for type_ref in next {
+                changed |= invalid_types.insert(type_ref);
+            }
+        }
+
+        self.span_keys
+            .retain(|span, _| !invalid_spans.contains(span));
+        self.def_records
+            .retain(|def, _| !invalid_defs.contains(def));
+        self.handle_keys
+            .retain(|def, _| !invalid_defs.contains(def));
+        self.public_defs
+            .retain(|def| !invalid_defs.contains(def));
+        self.test_defs
+            .retain(|def| !invalid_defs.contains(def));
+        self.field_records.retain(|record| {
+            !invalid_defs.contains(&record.owner) && !invalid_types.contains(&record.ty)
+        });
+        self.variant_records.retain(|record| {
+            !invalid_defs.contains(&record.owner) && !invalid_defs.contains(&record.variant_def)
+        });
+        self.method_records.retain(|(owner, method)| {
+            !invalid_defs.contains(owner) && !invalid_defs.contains(method)
+        });
+        self.trait_method_records.retain(|(owner, method)| {
+            !invalid_defs.contains(owner) && !invalid_defs.contains(method)
+        });
+        self.impl_records.retain(|record| {
+            !invalid_defs.contains(&record.ty)
+                && !invalid_defs.contains(&record.tr)
+                && !invalid_defs.contains(&record.impl_def)
+        });
+        self.from_impl_records.retain(|(src, dst, impl_def)| {
+            !invalid_defs.contains(src)
+                && !invalid_defs.contains(dst)
+                && !invalid_defs.contains(impl_def)
+        });
+        self.construct_records.retain(|record| {
+            !invalid_defs.contains(&record.err_type)
+                && !invalid_defs.contains(&record.function)
+                && !invalid_spans.contains(&record.site)
+        });
+        self.propagate_records.retain(|record| {
+            !invalid_defs.contains(&record.err_type)
+                && !invalid_defs.contains(&record.function)
+                && !invalid_spans.contains(&record.site)
+        });
+        self.convert_records.retain(|record| {
+            !invalid_defs.contains(&record.src)
+                && !invalid_defs.contains(&record.dst)
+                && !invalid_defs.contains(&record.function)
+                && !invalid_spans.contains(&record.site)
+        });
+        self.handle_records.retain(|record| {
+            !invalid_defs.contains(&record.err_type)
+                && !invalid_defs.contains(&record.function)
+                && !invalid_spans.contains(&record.site)
+        });
+        self.compare_records.retain(|record| {
+            !invalid_defs.contains(&record.subject)
+                && !invalid_defs.contains(&record.function)
+                && !invalid_spans.contains(&record.site)
+        });
+        self.write_records.retain(|record| {
+            !invalid_defs.contains(&record.subject)
+                && !invalid_defs.contains(&record.function)
+                && !invalid_spans.contains(&record.site)
+        });
+        self.search_records
+            .retain(|record| !invalid_defs.contains(&record.def));
+        self.call_edges.retain(|edge| {
+            !invalid_defs.contains(&edge.caller)
+                && !invalid_defs.contains(&edge.callee)
+                && !invalid_spans.contains(&edge.site)
+        });
+        self.node_records
+            .retain(|node, _| !invalid_nodes.contains(node));
+        self.node_keys
+            .retain(|node, _| !invalid_nodes.contains(node));
+        self.type_shapes
+            .retain(|type_ref, _| !invalid_types.contains(type_ref));
+        self.typeref_keys
+            .retain(|type_ref, _| !invalid_types.contains(type_ref));
+        self.call_keys.retain(|_, handle| {
+            !changed_rel_paths
+                .iter()
+                .any(|path| handle.as_str().starts_with(format!("call:{path}:").as_str()))
+        });
+        self.impl_keys.retain(|_, handle| {
+            !changed_rel_paths
+                .iter()
+                .any(|path| handle.as_str().starts_with(format!("impl:{path}:").as_str()))
+        });
+    }
+
+    pub(crate) fn merge_from(&mut self, mut other: Self) {
+        self.world_stamp = other.world_stamp;
+        self.runtime_scalar_options = other.runtime_scalar_options;
+        self.scalar_inputs.append(&mut other.scalar_inputs);
+        self.stable_overrides.append(&mut other.stable_overrides);
+        self.control_max_depth = other.control_max_depth;
+        self.runtime_notes.append(&mut other.runtime_notes);
+        self.extern_relation_errors.append(&mut other.extern_relation_errors);
+        self.type_shapes.append(&mut other.type_shapes);
+        self.node_records.append(&mut other.node_records);
+        self.span_keys.append(&mut other.span_keys);
+        self.def_records.append(&mut other.def_records);
+        self.call_edges.append(&mut other.call_edges);
+        self.field_records.append(&mut other.field_records);
+        self.variant_records.append(&mut other.variant_records);
+        self.method_records.append(&mut other.method_records);
+        self.trait_method_records.append(&mut other.trait_method_records);
+        self.impl_records.append(&mut other.impl_records);
+        self.from_impl_records.append(&mut other.from_impl_records);
+        self.construct_records.append(&mut other.construct_records);
+        self.propagate_records.append(&mut other.propagate_records);
+        self.convert_records.append(&mut other.convert_records);
+        self.handle_records.append(&mut other.handle_records);
+        self.compare_records.append(&mut other.compare_records);
+        self.write_records.append(&mut other.write_records);
+        self.search_records.append(&mut other.search_records);
+        self.public_defs.append(&mut other.public_defs);
+        self.test_defs.append(&mut other.test_defs);
+        if other.allowed_spans.is_some() {
+            self.allowed_spans = other.allowed_spans.take();
+        }
+        self.handle_keys.append(&mut other.handle_keys);
+        self.typeref_keys.append(&mut other.typeref_keys);
+        self.node_keys.append(&mut other.node_keys);
+        self.call_keys.append(&mut other.call_keys);
+        self.ref_keys.append(&mut other.ref_keys);
+        self.impl_keys.append(&mut other.impl_keys);
+    }
+
     fn known_defs(&self) -> BTreeSet<DefId> {
         let mut defs = BTreeSet::new();
         defs.extend(self.def_records.keys().copied());

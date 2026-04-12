@@ -185,6 +185,64 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "alpha").
 }
 
 #[test]
+fn workspace_service_preserves_core_host_on_incremental_syntax_edits() {
+    let root = temp_workspace_root("incremental_core_host_overlay");
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() {}\npub fn beta() { alpha(); }\n",
+    )
+    .expect("write lib.rs");
+
+    let mut service =
+        WorkspaceService::from_manifest_path(root.join("Cargo.toml").as_std_path()).expect("service");
+    let beta_query = plan_query(
+        r#"
+.decl def_span(D: Def, Span: Span) extern.
+.decl node_at(Query: Span, Node: Node) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl hit(Name: string).
+hit(Name) :- def_name(D, "beta"), def_name(D, Name), def_span(D, Span), node_at(Span, _).
+"#,
+    );
+    let first = service.run_planned(&beta_query).expect("first run");
+    assert!(first.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("beta".to_string())])
+    }));
+    assert!(service.has_core_host(), "core host should be populated after call-graph query");
+
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn alpha() {}\npub fn gamma() { alpha(); }\n",
+    )
+    .expect("rewrite lib.rs");
+    service.sync().expect("sync after edit");
+    assert!(
+        service.has_core_host(),
+        "ordinary rust edits should preserve core host via changed-file overlay"
+    );
+
+    let gamma_query = plan_query(
+        r#"
+.decl def_span(D: Def, Span: Span) extern.
+.decl node_at(Query: Span, Node: Node) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl hit(Name: string).
+hit(Name) :- def_name(D, "gamma"), def_name(D, Name), def_span(D, Span), node_at(Span, _).
+"#,
+    );
+    let second = service.run_planned(&gamma_query).expect("second run");
+    assert!(second.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("gamma".to_string())])
+    }));
+    assert!(
+        !second.relations.get("hit").is_some_and(|rows| {
+            rows.contains(&vec![RuntimeValue::String("beta".to_string())])
+        }),
+        "stale syntax rows should be removed after overlay refresh"
+    );
+}
+
+#[test]
 fn workspace_service_excludes_import_and_alias_symbols_from_def_surface() {
     let root = temp_workspace_root("def_surface_excludes_aliases");
     fs::write(

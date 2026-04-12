@@ -958,3 +958,22 @@ hit(Name) :- f(Name).
             .is_none()
     );
 }
+
+#[test]
+fn planner_marks_zero_bound_def_relation_for_lookup() {
+    let src = r#"
+.decl def(D: Def) extern.
+.decl hit(D: Def).
+hit(D) :- def(D).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("type");
+    let planned = plan(typed).expect("plan");
+    let lookup = planned.planned_rules()[0].ordered_goals()[0]
+        .extern_lookup()
+        .expect("lookup metadata");
+
+    assert_eq!(lookup.shape(), ExternLookupShape::RelationExactBindings);
+    assert!(lookup.bound_positions().is_empty());
+}

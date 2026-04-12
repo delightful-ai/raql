@@ -260,6 +260,12 @@ impl WorkspaceService {
         self.workspace_epoch
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_core_host(&self) -> bool {
+        self.core_host.is_some()
+    }
+
+
     pub fn analysis_snapshot(&self) -> WarmupSnapshot {
         WarmupSnapshot(self.analysis_host.analysis())
     }
@@ -357,6 +363,9 @@ impl WorkspaceService {
                 .map(Some)
             }
             ("def", ExternLookupShape::RelationExactBindings) => {
+                if request.bound_positions().is_empty() && self.core_index.is_none() {
+                    let _ = self.ensure_core_host(&CoreHostBuildSpec::default())?;
+                }
                 Ok(Some(lookup_def_rows(
                     request,
                     self.core_index.as_ref(),
@@ -544,8 +553,10 @@ impl WorkspaceService {
             if saw_change {
                 self.analysis_host.apply_change(change);
                 self.content_revision = self.content_revision.saturating_add(1);
-                self.core_host = None;
-                self.invalidate_core_index_for_paths(&changed_tracked_paths);
+                if !self.try_overlay_core_host_for_paths(&changed_tracked_paths)? {
+                    self.core_host = None;
+                    self.invalidate_core_index_for_paths(&changed_tracked_paths);
+                }
                 self.invalidate_lookup_state_for_paths(&changed_tracked_paths);
                 self.tracked_dirs =
                     tracked_directory_watch_set(&self.tracked_files, &self.watched_entries);
@@ -630,10 +641,10 @@ impl WorkspaceService {
         if saw_change {
             self.analysis_host.apply_change(change);
             self.content_revision = self.content_revision.saturating_add(1);
-            // TODO(ra-native-audit): stop dropping the entire deterministic host for ordinary
-            // source edits. Preserve or incrementally reconcile host state where safe.
-            self.core_host = None;
-            self.invalidate_core_index_for_paths(&changed_tracked_paths);
+            if !self.try_overlay_core_host_for_paths(&changed_tracked_paths)? {
+                self.core_host = None;
+                self.invalidate_core_index_for_paths(&changed_tracked_paths);
+            }
             self.invalidate_lookup_state_for_paths(&changed_tracked_paths);
         }
         for (path, state) in tracked_rust_file_states {
@@ -750,18 +761,64 @@ impl WorkspaceService {
     }
 
     fn invalidate_core_index_for_paths(&mut self, changed_paths: &BTreeSet<PathBuf>) {
+        let changed_rel_paths = self.changed_rel_paths(changed_paths);
         let Some(core_index) = self.core_index.as_mut() else {
             return;
         };
-        let changed_rel_paths = changed_paths
+        core_index.invalidate_paths(&changed_rel_paths);
+    }
+
+    fn try_overlay_core_host_for_paths(
+        &mut self,
+        changed_paths: &BTreeSet<PathBuf>,
+    ) -> Result<bool, RaHostInitError> {
+        let Some(build_spec) = self.core_host_spec.clone() else {
+            return Ok(false);
+        };
+        if build_spec.impls {
+            return Ok(false);
+        }
+        let changed_rel_paths = self.changed_rel_paths(changed_paths);
+        let Some(core_host) = self.core_host.as_mut() else {
+            return Ok(false);
+        };
+        let changed_rust_paths = changed_paths
+            .iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if changed_rust_paths.is_empty() {
+            return Ok(false);
+        }
+        let overlay = build_core_host(
+            &self.analysis_host,
+            &self.vfs,
+            &self.workspace_root,
+            &changed_rust_paths,
+            self.workspace_epoch,
+            self.content_revision,
+            &build_spec,
+        )?;
+        core_host.invalidate_paths(&changed_rel_paths);
+        core_host.merge_from(overlay.host);
+        if let Some(core_index) = self.core_index.as_mut() {
+            core_index.invalidate_paths(&changed_rel_paths);
+            core_index.merge_from(overlay.index);
+        } else {
+            self.core_index = Some(overlay.index);
+        }
+        Ok(true)
+    }
+
+    fn changed_rel_paths(&self, changed_paths: &BTreeSet<PathBuf>) -> BTreeSet<String> {
+        changed_paths
             .iter()
             .filter_map(|path| {
                 path.strip_prefix(&self.workspace_root)
                     .ok()
                     .map(|rel| rel.to_string_lossy().replace('\\', "/"))
             })
-            .collect::<BTreeSet<_>>();
-        core_index.invalidate_paths(&changed_rel_paths);
+            .collect()
     }
 }
 

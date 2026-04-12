@@ -3242,7 +3242,7 @@ fn planned_extern_lookup(
         .enumerate()
         .filter_map(|(idx, term)| term_is_ground(term, ground, var_types).then_some(idx))
         .collect::<Vec<_>>();
-    if bound_positions.is_empty() {
+    if bound_positions.is_empty() && !supports_zero_bound_relation_lookup(predicate, decl.kind()) {
         return None;
     }
 
@@ -3272,6 +3272,13 @@ fn planned_extern_lookup(
         shape,
         bound_positions,
     })
+}
+
+fn supports_zero_bound_relation_lookup(
+    predicate: &str,
+    kind: DeclarationKind,
+) -> bool {
+    matches!(kind, DeclarationKind::Relation) && matches!(predicate, "def")
 }
 
 #[derive(Debug, Clone)]

@@ -97,6 +97,11 @@ impl CoreLookupIndex {
             self.functions.remove(&def_id);
         }
     }
+
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        self.defs.extend(other.defs);
+        self.functions.extend(other.functions);
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
