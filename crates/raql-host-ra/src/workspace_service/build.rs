@@ -318,7 +318,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 .insert_synthetic_def(def_id, name.as_str(), kind, path.as_str());
             self.host.mark_public(def_id, true);
             self.host.mark_in_test(def_id, false);
-            self.record_core_def(def_id, name.as_str(), kind, path.as_str());
+            self.record_core_def(def_id, name.as_str(), kind, path.as_str(), None);
             self.core_index.mark_public(def_id, true);
             self.core_index.mark_in_test(def_id, false);
         }
@@ -365,7 +365,13 @@ impl<'db> CoreFactsBuilder<'db> {
                 self.host.mark_public(def_id, false);
                 self.host.mark_in_test(def_id, false);
             }
-            self.record_core_def(def_id, label.as_str(), DefKind::Other, path.as_str());
+            self.record_core_def(
+                def_id,
+                label.as_str(),
+                DefKind::Other,
+                path.as_str(),
+                Some(local.rel_path.as_str()),
+            );
             self.core_index.mark_public(def_id, false);
             self.core_index.mark_in_test(def_id, false);
         }
@@ -383,7 +389,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 .insert_synthetic_def(def_id, name.as_str(), DefKind::Other, path.as_str());
             self.host.mark_public(def_id, false);
             self.host.mark_in_test(def_id, false);
-            self.record_core_def(def_id, name.as_str(), DefKind::Other, path.as_str());
+            self.record_core_def(def_id, name.as_str(), DefKind::Other, path.as_str(), None);
             self.core_index.mark_public(def_id, false);
             self.core_index.mark_in_test(def_id, false);
         }
@@ -434,7 +440,13 @@ impl<'db> CoreFactsBuilder<'db> {
         self.host.mark_public(def_id, false);
         self.host
             .mark_in_test(def_id, rel_path.starts_with("tests/") || rel_path.contains("/tests/"));
-        self.record_core_def(def_id, "impl", DefKind::Impl, path.as_str());
+        self.record_core_def(
+            def_id,
+            "impl",
+            DefKind::Impl,
+            path.as_str(),
+            Some(rel_path.as_str()),
+        );
         self.core_index.mark_public(def_id, false);
         self.core_index.mark_in_test(
             def_id,
@@ -638,7 +650,73 @@ impl<'db> CoreFactsBuilder<'db> {
         if self.build_spec.def_handles {
             self.host.insert_handle(def_id, format!("def://{path}"));
         }
-        self.record_core_def(def_id, name.as_str(), kind, path.as_str());
+        let source_rel_path = match def {
+            ModuleDef::Module(module) => {
+                let range = module
+                    .declaration_source_range(self.db)
+                    .unwrap_or_else(|| module.definition_source_range(self.db));
+                let editioned = range.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }
+            ModuleDef::Function(function) => function.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::Adt(adt) => adt.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::Variant(variant) => variant.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::Const(const_) => const_.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::Static(static_) => static_.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::Trait(trait_) => trait_.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::TypeAlias(alias) => alias.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::Macro(mac) => mac.source(self.db).and_then(|source| {
+                let editioned = source.file_id.original_file(self.db);
+                self.files
+                    .get(&editioned.file_id(self.db))
+                    .map(|local| local.rel_path.clone())
+            }),
+            ModuleDef::BuiltinType(_) => None,
+        };
+        self.record_core_def(
+            def_id,
+            name.as_str(),
+            kind,
+            path.as_str(),
+            source_rel_path.as_deref(),
+        );
         if let ModuleDef::Function(function) = def {
             self.core_index.record_function(def_id, function);
         }
@@ -679,9 +757,17 @@ impl<'db> CoreFactsBuilder<'db> {
         Some(def_id)
     }
 
-    pub(super) fn record_core_def(&mut self, def_id: DefId, name: &str, kind: DefKind, path: &str) {
+    pub(super) fn record_core_def(
+        &mut self,
+        def_id: DefId,
+        name: &str,
+        kind: DefKind,
+        path: &str,
+        source_rel_path: Option<&str>,
+    ) {
         self.def_path_by_id.insert(def_id, path.to_owned());
-        self.core_index.record_def(def_id, name, kind, path);
+        self.core_index
+            .record_def(def_id, name, kind, path, source_rel_path);
     }
 
     pub(super) fn module_is_test(&self, module: Module) -> bool {

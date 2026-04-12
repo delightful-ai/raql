@@ -539,8 +539,7 @@ impl WorkspaceService {
                 self.analysis_host.apply_change(change);
                 self.content_revision = self.content_revision.saturating_add(1);
                 self.core_host = None;
-                self.core_index = None;
-                self.core_host_spec = None;
+                self.invalidate_core_index_for_paths(&changed_tracked_paths);
                 self.invalidate_lookup_state_for_paths(&changed_tracked_paths);
                 self.tracked_dirs =
                     tracked_directory_watch_set(&self.tracked_files, &self.watched_entries);
@@ -628,8 +627,7 @@ impl WorkspaceService {
             // TODO(ra-native-audit): stop dropping the entire deterministic host for ordinary
             // source edits. Preserve or incrementally reconcile host state where safe.
             self.core_host = None;
-            self.core_index = None;
-            self.core_host_spec = None;
+            self.invalidate_core_index_for_paths(&changed_tracked_paths);
             self.invalidate_lookup_state_for_paths(&changed_tracked_paths);
         }
         for (path, state) in tracked_rust_file_states {
@@ -744,6 +742,21 @@ impl WorkspaceService {
             !changed_paths.contains(path)
         });
     }
+
+    fn invalidate_core_index_for_paths(&mut self, changed_paths: &BTreeSet<PathBuf>) {
+        let Some(core_index) = self.core_index.as_mut() else {
+            return;
+        };
+        let changed_rel_paths = changed_paths
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix(&self.workspace_root)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            })
+            .collect::<BTreeSet<_>>();
+        core_index.invalidate_paths(&changed_rel_paths);
+    }
 }
 
 pub fn resolve_workspace_root(input: &Path) -> Result<PathBuf, RaHostInitError> {
@@ -837,6 +850,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 let Some(local) = self.files.get(&editioned.file_id(self.db)) else {
                     continue;
                 };
+                let local_rel_path = local.rel_path.clone();
                 let Some(kind) = module_def_kind(symbol.def) else {
                     continue;
                 };
@@ -863,7 +877,7 @@ impl<'db> CoreFactsBuilder<'db> {
                         .host
                         .intern_span_from_text(
                             editioned.editioned_file_id(self.db),
-                            local.rel_path.clone(),
+                            local_rel_path.clone(),
                             local.text.as_str(),
                             syntax.text_range(),
                         )
@@ -879,7 +893,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 if self.build_spec.def_handles {
                     self.host.insert_handle(def_id, format!("def://{path}"));
                 }
-                self.record_core_def(def_id, name, kind, path.as_str());
+                self.record_core_def(def_id, name, kind, path.as_str(), Some(local_rel_path.as_str()));
                 if self.build_spec.def_publicity {
                     let is_public = module_def_is_public(symbol.def, self.db);
                     self.host.mark_public(def_id, is_public);
