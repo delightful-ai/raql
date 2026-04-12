@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hir::Function;
 
-use crate::{DefId, DefKind, SpanId, SpanKey};
+use crate::{DefId, DefKind, SpanId, SpanKey, StableHandle};
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub(crate) struct CoreLookupIndex {
@@ -63,6 +63,11 @@ impl CoreLookupIndex {
 
     pub(crate) fn def_path(&self, def_id: DefId) -> Option<&str> {
         self.defs.get(&def_id).map(|metadata| metadata.path.as_ref())
+    }
+
+    pub(crate) fn def_handle(&self, def_id: DefId) -> Option<StableHandle> {
+        self.def_path(def_id)
+            .map(|path| StableHandle::new(format!("def://{path}")))
     }
 
     pub(crate) fn is_public(&self, def_id: DefId) -> Option<bool> {

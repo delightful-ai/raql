@@ -589,6 +589,53 @@ pub(crate) fn lookup_def_span_rows(
     ]]
 }
 
+pub(crate) fn lookup_def_handle_rows(
+    request: &ExternLookupRequest,
+    core_index: Option<&CoreLookupIndex>,
+    lookup_defs: &BTreeMap<DefId, LookupDefRecord>,
+) -> Vec<Vec<ExternLookupValue>> {
+    let mut def = None::<DefId>;
+    let mut handle_filter = None::<&str>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                def = Some(DefId::new(host.stable_id()));
+            }
+            (1, ExternLookupValue::String(handle)) => handle_filter = Some(handle.as_ref()),
+            _ => return Vec::new(),
+        }
+    }
+    let Some(def) = def else {
+        return Vec::new();
+    };
+    let handle = if let Some(record) = lookup_defs.get(&def) {
+        record
+            .path
+            .as_deref()
+            .map(|path| format!("def://{path}"))
+            .map(|handle| ExternLookupValue::String(handle.into_boxed_str()))
+    } else {
+        core_index
+            .and_then(|index| index.def_handle(def))
+            .map(|handle| ExternLookupValue::String(handle.as_str().to_string().into_boxed_str()))
+    };
+    let Some(ExternLookupValue::String(handle)) = handle else {
+        return Vec::new();
+    };
+    if handle_filter.is_some_and(|expected| expected != handle.as_ref()) {
+        return Vec::new();
+    }
+    vec![vec![
+        ExternLookupValue::Host(ExternLookupHostValue::new(
+            ExternLookupHostValueKind::Def,
+            def.stable_id(),
+        )),
+        ExternLookupValue::String(handle),
+    ]]
+}
+
 pub(crate) fn lookup_def_name_rows(
     request: &ExternLookupRequest,
     db: &ide::RootDatabase,

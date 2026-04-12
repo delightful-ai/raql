@@ -348,6 +348,68 @@ hit(RelPath) :-
 }
 
 #[test]
+fn lang_run_supports_lookup_seeded_handle_queries_on_the_daemon_path() {
+    let work = temp_dir("daemon_lookup_seeded_handle");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.func def_name(D: Def, Name: string) extern.
+.func handle(D: Def, H: string) extern.
+.decl hit(H: string).
+hit(H) :- def_name(D, "alpha"), handle(D, H).
+"#,
+    )
+    .expect("write query");
+
+    let run = || {
+        Command::new(raql_bin())
+            .args([
+                "lang",
+                "run",
+                query.to_str().expect("utf8 query"),
+                "--rust-file",
+                workspace.to_str().expect("utf8 workspace"),
+                "--include-dir",
+                env!("CARGO_MANIFEST_DIR"),
+            ])
+            .output()
+            .expect("run raql")
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "lookup-seeded handle daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_stdout.contains("def://alpha") || first_stdout.contains("::alpha"),
+        "stdout={first_stdout}"
+    );
+    assert!(first_stdout.contains("daemon: cold"), "stdout={first_stdout}");
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "warm lookup-seeded handle daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second_stdout.contains("def://alpha") || second_stdout.contains("::alpha"),
+        "stdout={second_stdout}"
+    );
+    assert!(second_stdout.contains("daemon: warm"), "stdout={second_stdout}");
+}
+
+#[test]
 fn lang_run_supports_stdlib_exact_name_seed_queries_with_duplicate_names_on_the_daemon_path() {
     let work = temp_dir("daemon_stdlib_exact_name_duplicates");
     let workspace = work.join("ws");

@@ -2021,6 +2021,51 @@ hit(S) :- def_name(D, "answer"), def_span(D, S).
 }
 
 #[test]
+fn lazy_runtime_resolves_lookup_seeded_handles_without_core_host() {
+    let root = temp_workspace_root("lookup_seeded_runtime_handle");
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.func def_name(D: Def, Name: string) extern.
+.decl hit(D: Def).
+hit(D) :- def_name(D, "answer").
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    let def = match result
+        .relations
+        .get("hit")
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.first())
+    {
+        Some(RuntimeValue::Host { kind, id }) if *kind == raql_engine::HostValueKind::Def => {
+            DefId::new(StableId::new(*id))
+        }
+        other => panic!("expected def row, got {other:?}"),
+    };
+    assert!(
+        !service.has_core_host(),
+        "lookup-seeded def query should not require core_host materialization"
+    );
+
+    let handle = {
+        let shared = Rc::new(RefCell::new(&mut service));
+        let runtime = LazyRaRuntime::new(shared, CoreHostBuildSpec::default());
+        runtime.handle(def).expect("runtime handle")
+    };
+    assert!(
+        handle.as_str() == "def://answer" || handle.as_str().ends_with("::answer"),
+        "handle={handle:?}"
+    );
+    assert!(
+        !service.has_core_host(),
+        "handle should resolve from RA-backed lookup/core-index state before falling back to core_host"
+    );
+}
+
+#[test]
 fn workspace_service_ignores_unloaded_root_subtree_changes() {
     let root = temp_workspace_root("ignore_unloaded_subtree");
     fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");

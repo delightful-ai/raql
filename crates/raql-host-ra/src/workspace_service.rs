@@ -31,14 +31,14 @@ use crate::provider::calls::{
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
     LocalFile, LookupDefRecord, lookup_def_flag_rows, lookup_def_kind_rows, lookup_def_name_rows,
-    lookup_def_path_rows, lookup_def_rows, lookup_def_span_rows, module_def_in_test,
+    lookup_def_handle_rows, lookup_def_path_rows, lookup_def_rows, lookup_def_span_rows, module_def_in_test,
     module_def_is_public, module_def_kind,
 };
 use crate::provider::syntax::{
     extract_syntax_nodes, lookup_span_allowed_rows, lookup_span_key_rows,
 };
 use crate::workspace_loader;
-use crate::{DefId, DeterministicRaHost, RaHostInitError, SpanId, WorldStamp};
+use crate::{DefId, DeterministicRaHost, RaHostInitError, SpanId, StableHandle, WorldStamp};
 
 #[path = "workspace_service/build.rs"]
 mod build;
@@ -181,7 +181,6 @@ impl CoreHostBuildSpec {
             && !self.syntax_nodes
             && !self.type_facts
             && !self.adt_structure
-            && !self.def_handles
     }
 }
 
@@ -392,6 +391,13 @@ impl WorkspaceService {
                 self.core_index.as_ref(),
                 &mut self.lookup_defs,
             ),
+            ("handle", ExternLookupShape::FunctionExactBindings) => {
+                Ok(Some(lookup_def_handle_rows(
+                    request,
+                    self.core_index.as_ref(),
+                    &self.lookup_defs,
+                )))
+            }
             ("is_public", ExternLookupShape::RelationExactBindings) => {
                 let _ = self.ensure_core_host(&CoreHostBuildSpec {
                     def_publicity: true,
@@ -453,6 +459,14 @@ impl WorkspaceService {
             .cloned()?;
         self.lookup_spans.insert(span, key.clone());
         Some(key)
+    }
+
+    pub(crate) fn lookup_handle_if_known(&self, def: DefId) -> Option<StableHandle> {
+        self.lookup_defs
+            .get(&def)
+            .and_then(|record| record.path.as_deref())
+            .map(|path| StableHandle::new(format!("def://{path}")))
+            .or_else(|| self.core_index.as_ref().and_then(|index| index.def_handle(def)))
     }
 
     pub fn run_planned(&mut self, planned: &PlannedProgram) -> Result<EvalResult, RaHostInitError> {

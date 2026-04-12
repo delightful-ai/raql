@@ -43,6 +43,7 @@ impl<'a> LazyRaRuntime<'a> {
                 | "def_kind"
                 | "def_span"
                 | "def_path"
+                | "handle"
                 | "is_public"
                 | "in_test"
                 | "span_allowed"
@@ -68,6 +69,9 @@ impl HostRuntime for LazyRaRuntime<'_> {
     }
 
     fn handle(&self, def: DefId) -> Result<StableHandle, Self::Error> {
+        if let Some(handle) = self.service.borrow().lookup_handle_if_known(def) {
+            return Ok(handle);
+        }
         self.with_core_host(|host| HostRuntime::handle(host, def))?
     }
 
