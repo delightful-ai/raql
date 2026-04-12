@@ -6,6 +6,7 @@ use raql_host::{
 };
 use syntax::AstNode;
 
+use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::LocalFile;
 use crate::{DeterministicRaHost, NodeId, NodeKind, SpanId};
 pub(crate) fn extract_syntax_nodes(
@@ -30,6 +31,7 @@ pub(crate) fn extract_syntax_nodes(
 
 pub(crate) fn lookup_span_allowed_rows(
     request: &ExternLookupRequest,
+    core_index: Option<&CoreLookupIndex>,
     lookup_spans: &BTreeMap<SpanId, SpanKey>,
 ) -> Vec<Vec<ExternLookupValue>> {
     let mut span = None::<SpanId>;
@@ -46,7 +48,7 @@ pub(crate) fn lookup_span_allowed_rows(
     let Some(span) = span else {
         return Vec::new();
     };
-    if lookup_spans.contains_key(&span) {
+    if lookup_spans.contains_key(&span) || core_index.and_then(|index| index.span_key(span)).is_some() {
         vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
             ExternLookupHostValueKind::Span,
             span.stable_id(),
@@ -58,7 +60,8 @@ pub(crate) fn lookup_span_allowed_rows(
 
 pub(crate) fn lookup_span_key_rows(
     request: &ExternLookupRequest,
-    lookup_spans: &BTreeMap<SpanId, SpanKey>,
+    core_index: Option<&CoreLookupIndex>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
 ) -> Vec<Vec<ExternLookupValue>> {
     let mut span = None::<SpanId>;
     let mut rel_path_filter = None::<&str>;
@@ -84,7 +87,12 @@ pub(crate) fn lookup_span_key_rows(
     let Some(span) = span else {
         return Vec::new();
     };
-    let Some(key) = lookup_spans.get(&span) else {
+    let key = if let Some(key) = lookup_spans.get(&span) {
+        key.clone()
+    } else if let Some(key) = core_index.and_then(|index| index.span_key(span)).cloned() {
+        lookup_spans.entry(span).or_insert_with(|| key.clone());
+        key
+    } else {
         return Vec::new();
     };
     if rel_path_filter.is_some_and(|expected| expected != key.rel_path())

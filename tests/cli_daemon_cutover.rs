@@ -286,6 +286,68 @@ hidden_hit(Name) :- def_name(T, "hidden"), is_public(T), def_name(T, Name).
 }
 
 #[test]
+fn lang_run_supports_lookup_seeded_span_queries_on_the_daemon_path() {
+    let work = temp_dir("daemon_lookup_seeded_span");
+    let workspace = work.join("ws");
+    write_workspace(&workspace);
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.func def_name(D: Def, Name: string) extern.
+.func def_span(D: Def, S: Span) extern.
+.decl span_allowed(S: Span) extern.
+.func span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
+.decl hit(RelPath: string).
+hit(RelPath) :-
+  def_name(D, "alpha"),
+  def_span(D, S),
+  span_allowed(S),
+  span_key(S, RelPath, _L0, _C0, _L1, _C1).
+"#,
+    )
+    .expect("write query");
+
+    let run = || {
+        Command::new(raql_bin())
+            .args([
+                "lang",
+                "run",
+                query.to_str().expect("utf8 query"),
+                "--rust-file",
+                workspace.to_str().expect("utf8 workspace"),
+                "--include-dir",
+                env!("CARGO_MANIFEST_DIR"),
+            ])
+            .output()
+            .expect("run raql")
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "lookup-seeded span daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first_stdout.contains("src/lib.rs"), "stdout={first_stdout}");
+    assert!(first_stdout.contains("daemon: cold"), "stdout={first_stdout}");
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "warm lookup-seeded span daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second_stdout.contains("src/lib.rs"), "stdout={second_stdout}");
+    assert!(second_stdout.contains("daemon: warm"), "stdout={second_stdout}");
+}
+
+#[test]
 fn lang_run_supports_stdlib_exact_name_seed_queries_with_duplicate_names_on_the_daemon_path() {
     let work = temp_dir("daemon_stdlib_exact_name_duplicates");
     let workspace = work.join("ws");

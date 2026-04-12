@@ -379,7 +379,12 @@ impl WorkspaceService {
                 )))
             }
             ("def_span", ExternLookupShape::FunctionExactBindings) => {
-                Ok(Some(lookup_def_span_rows(request, &self.lookup_defs)))
+                Ok(Some(lookup_def_span_rows(
+                    request,
+                    self.core_index.as_ref(),
+                    &self.lookup_defs,
+                    &mut self.lookup_spans,
+                )))
             }
             ("def_path", ExternLookupShape::FunctionExactBindings) => lookup_def_path_rows(
                 request,
@@ -405,10 +410,18 @@ impl WorkspaceService {
                 self.lookup_call_edge_rows(request)
             }
             ("span_allowed", ExternLookupShape::RelationExactBindings) => {
-                Ok(Some(lookup_span_allowed_rows(request, &self.lookup_spans)))
+                Ok(Some(lookup_span_allowed_rows(
+                    request,
+                    self.core_index.as_ref(),
+                    &self.lookup_spans,
+                )))
             }
             ("span_key", ExternLookupShape::FunctionExactBindings) => {
-                Ok(Some(lookup_span_key_rows(request, &self.lookup_spans)))
+                Ok(Some(lookup_span_key_rows(
+                    request,
+                    self.core_index.as_ref(),
+                    &mut self.lookup_spans,
+                )))
             }
             _ => Ok(None),
         };
@@ -427,6 +440,19 @@ impl WorkspaceService {
         if let Some(host) = self.core_host.as_mut() {
             host.set_control_max_depth(depth);
         }
+    }
+
+    pub(crate) fn lookup_span_key_if_known(&mut self, span: SpanId) -> Option<SpanKey> {
+        if let Some(key) = self.lookup_spans.get(&span) {
+            return Some(key.clone());
+        }
+        let key = self
+            .core_index
+            .as_ref()
+            .and_then(|index| index.span_key(span))
+            .cloned()?;
+        self.lookup_spans.insert(span, key.clone());
+        Some(key)
     }
 
     pub fn run_planned(&mut self, planned: &PlannedProgram) -> Result<EvalResult, RaHostInitError> {

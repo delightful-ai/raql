@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hir::Function;
 
-use crate::{DefId, DefKind};
+use crate::{DefId, DefKind, SpanId, SpanKey};
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub(crate) struct CoreLookupIndex {
     defs: BTreeMap<DefId, CoreDefMetadata>,
     functions: BTreeMap<DefId, Function>,
+    span_keys: BTreeMap<SpanId, SpanKey>,
 }
 
 impl CoreLookupIndex {
@@ -45,6 +46,13 @@ impl CoreLookupIndex {
         self.functions.insert(def_id, function);
     }
 
+    pub(crate) fn record_span(&mut self, def_id: DefId, span: SpanId, key: SpanKey) {
+        if let Some(metadata) = self.defs.get_mut(&def_id) {
+            metadata.span = Some(span);
+        }
+        self.span_keys.insert(span, key);
+    }
+
     pub(crate) fn def_name(&self, def_id: DefId) -> Option<&str> {
         self.defs.get(&def_id).map(|metadata| metadata.name.as_ref())
     }
@@ -75,6 +83,14 @@ impl CoreLookupIndex {
 
     pub(crate) fn function(&self, def_id: DefId) -> Option<Function> {
         self.functions.get(&def_id).copied()
+    }
+
+    pub(crate) fn def_span(&self, def_id: DefId) -> Option<SpanId> {
+        self.defs.get(&def_id).and_then(|metadata| metadata.span)
+    }
+
+    pub(crate) fn span_key(&self, span: SpanId) -> Option<&SpanKey> {
+        self.span_keys.get(&span)
     }
 
     pub(crate) fn def_fingerprints_for_paths(
@@ -109,7 +125,11 @@ impl CoreLookupIndex {
             })
             .collect::<Vec<_>>();
         for def_id in invalid_defs {
-            self.defs.remove(&def_id);
+            if let Some(metadata) = self.defs.remove(&def_id)
+                && let Some(span) = metadata.span
+            {
+                self.span_keys.remove(&span);
+            }
             self.functions.remove(&def_id);
         }
     }
@@ -117,6 +137,7 @@ impl CoreLookupIndex {
     pub(crate) fn merge_from(&mut self, other: Self) {
         self.defs.extend(other.defs);
         self.functions.extend(other.functions);
+        self.span_keys.extend(other.span_keys);
     }
 }
 
@@ -126,6 +147,7 @@ struct CoreDefMetadata {
     kind: DefKind,
     path: Box<str>,
     source_rel_path: Option<Box<str>>,
+    span: Option<SpanId>,
     is_public: Option<bool>,
     in_test: Option<bool>,
 }
@@ -137,6 +159,7 @@ impl CoreDefMetadata {
             kind,
             path: path.to_owned().into_boxed_str(),
             source_rel_path: source_rel_path.map(|path| path.to_owned().into_boxed_str()),
+            span: None,
             is_public: None,
             in_test: None,
         }

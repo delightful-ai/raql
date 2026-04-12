@@ -3,16 +3,20 @@ use raql_compiler::{plan, resolve, typecheck};
 use raql_engine::{EvalStatus, RuntimeValue};
 use raql_host::{
     DefId, ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest,
-    ExternLookupShape, ExternLookupValue,
+    ExternLookupShape, ExternLookupValue, HostRuntime, SpanId,
 };
 use raql_syntax::parse_program;
+use std::cell::RefCell;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate as raql_host_ra;
+use crate::lazy_runtime::LazyRaRuntime;
 use crate::RaHostInitError;
-use crate::workspace_service::WorkspaceService;
+use crate::StableId;
+use crate::workspace_service::{CoreHostBuildSpec, WorkspaceService};
 
 fn temp_workspace_root(label: &str) -> Utf8PathBuf {
     let stamp = SystemTime::now()
@@ -1971,6 +1975,49 @@ hit(RelPath) :-
     assert!(result.relations.get("hit").is_some_and(|rows| {
         rows.contains(&vec![RuntimeValue::String("src/lib.rs".to_string())])
     }));
+}
+
+#[test]
+fn lazy_runtime_resolves_lookup_seeded_span_keys_without_core_host() {
+    let root = temp_workspace_root("lookup_seeded_runtime_span_key");
+    fs::write(root.join("src/lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.func def_name(D: Def, Name: string) extern.
+.func def_span(D: Def, S: Span) extern.
+.decl hit(S: Span).
+hit(S) :- def_name(D, "answer"), def_span(D, S).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    let span = match result
+        .relations
+        .get("hit")
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.first())
+    {
+        Some(RuntimeValue::Host { kind, id }) if *kind == raql_engine::HostValueKind::Span => {
+            SpanId::new(StableId::new(*id))
+        }
+        other => panic!("expected span row, got {other:?}"),
+    };
+    assert!(
+        !service.has_core_host(),
+        "lookup-seeded span query should not require core_host materialization"
+    );
+
+    let key = {
+        let shared = Rc::new(RefCell::new(&mut service));
+        let runtime = LazyRaRuntime::new(shared, CoreHostBuildSpec::default());
+        runtime.span_key(span).expect("runtime span key")
+    };
+    assert_eq!(key.rel_path(), "src/lib.rs");
+    assert!(
+        !service.has_core_host(),
+        "span_key should resolve from RA-backed lookup state before falling back to core_host"
+    );
 }
 
 #[test]

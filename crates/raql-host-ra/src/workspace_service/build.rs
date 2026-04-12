@@ -3,7 +3,7 @@ use syntax::ast::{HasGenericArgs, HasName};
 use syntax::{ast, AstNode, Edition};
 
 use super::CoreFactsBuilder;
-use crate::provider::defs::{LocalFile, canonical_function_path};
+use crate::provider::defs::{LocalFile, canonical_function_path, lookup_span_key_from_text};
 use crate::{DefId, DefKind, GenericArg, Mutability, TypeShape};
 
 impl<'db> CoreFactsBuilder<'db> {
@@ -642,6 +642,11 @@ impl<'db> CoreFactsBuilder<'db> {
                     range,
                 )
                 .ok()?;
+            if let Some(span_key) =
+                lookup_span_key_from_text(local.rel_path.as_str(), local.text.as_str(), range)
+            {
+                self.core_index.record_span(def_id, span, span_key);
+            }
             self.host.insert_def(def_id, name.as_str(), kind, span, path.as_str());
         } else {
             self.host

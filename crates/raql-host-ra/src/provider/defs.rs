@@ -537,7 +537,9 @@ pub(crate) fn lookup_def_kind_rows(
 
 pub(crate) fn lookup_def_span_rows(
     request: &ExternLookupRequest,
+    core_index: Option<&CoreLookupIndex>,
     lookup_defs: &BTreeMap<DefId, LookupDefRecord>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
 ) -> Vec<Vec<ExternLookupValue>> {
     let mut def = None::<DefId>;
     let mut span_filter = None::<SpanId>;
@@ -559,10 +561,20 @@ pub(crate) fn lookup_def_span_rows(
     let Some(def) = def else {
         return Vec::new();
     };
-    let Some(record) = lookup_defs.get(&def) else {
+    let span = if let Some(record) = lookup_defs.get(&def) {
+        record.span
+    } else if let Some(index) = core_index {
+        let Some(span) = index.def_span(def) else {
+            return Vec::new();
+        };
+        if let Some(key) = index.span_key(span) {
+            lookup_spans.entry(span).or_insert_with(|| key.clone());
+        }
+        span
+    } else {
         return Vec::new();
     };
-    if span_filter.is_some_and(|expected| expected != record.span) {
+    if span_filter.is_some_and(|expected| expected != span) {
         return Vec::new();
     }
     vec![vec![
@@ -572,7 +584,7 @@ pub(crate) fn lookup_def_span_rows(
         )),
         ExternLookupValue::Host(ExternLookupHostValue::new(
             ExternLookupHostValueKind::Span,
-            record.span.stable_id(),
+            span.stable_id(),
         )),
     ]]
 }

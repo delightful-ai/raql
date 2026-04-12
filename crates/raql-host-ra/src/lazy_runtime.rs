@@ -72,6 +72,9 @@ impl HostRuntime for LazyRaRuntime<'_> {
     }
 
     fn span_key(&self, span: SpanId) -> Result<SpanKey, Self::Error> {
+        if let Some(key) = self.service.borrow_mut().lookup_span_key_if_known(span) {
+            return Ok(key);
+        }
         self.with_core_host(|host| HostRuntime::span_key(host, span))?
     }
 
