@@ -1840,6 +1840,7 @@ version = "0.0.0"
 dependencies = [
  "base-db",
  "camino",
+ "crossbeam-channel",
  "hir",
  "ide",
  "ide-db",
@@ -1858,6 +1859,7 @@ dependencies = [
  "thiserror 1.0.69",
  "toml 0.8.23",
  "vfs",
+ "vfs-notify",
 ]
 
 [[package]]

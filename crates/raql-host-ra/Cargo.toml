@@ -22,6 +22,7 @@ vfs.workspace = true
 base-db.workspace = true
 load-cargo.workspace = true
 project-model.workspace = true
+vfs-notify.workspace = true
 
 # utilities
 line-index.workspace = true
@@ -29,6 +30,7 @@ rustc-hash.workspace = true
 thiserror.workspace = true
 camino.workspace = true
 toml = "0.8"
+crossbeam-channel.workspace = true
 
 [dev-dependencies]
 raql-syntax = { path = "../raql-syntax" }

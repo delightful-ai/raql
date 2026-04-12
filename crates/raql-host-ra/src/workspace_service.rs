@@ -44,11 +44,14 @@ use crate::{DefId, DeterministicRaHost, RaHostInitError, SpanId, WorldStamp};
 mod build;
 #[path = "workspace_service/tracking.rs"]
 mod tracking;
+#[path = "workspace_service/watch.rs"]
+mod watch;
 
 use self::tracking::{
     auxiliary_build_input_state, build_script_rerun_paths, path_requires_reload,
     tracked_directory_watch_set, tracked_file_state_map, tracked_workspace_state,
 };
+use self::watch::WorkspaceWatcher;
 
 #[derive(Debug)]
 pub struct WorkspaceService {
@@ -64,6 +67,7 @@ pub struct WorkspaceService {
     tracked_file_states: BTreeMap<PathBuf, WatchedFileState>,
     tracked_dirs: BTreeSet<PathBuf>,
     tracked_dir_states: BTreeMap<PathBuf, WatchedFileState>,
+    watcher: WorkspaceWatcher,
     watched_entries: Vec<vfs::loader::Entry>,
     build_script_rerun_paths: BTreeSet<PathBuf>,
     auxiliary_build_inputs: BTreeMap<PathBuf, Option<WatchedFileState>>,
@@ -216,6 +220,9 @@ impl WorkspaceService {
         let auxiliary_build_inputs =
             auxiliary_build_input_state(&build_script_rerun_paths, &tracked_files)?;
         trace_timing("workspace_service.from_loaded.auxiliary_build_input_state", aux_inputs_started.elapsed());
+        let watcher_started = Instant::now();
+        let watcher = WorkspaceWatcher::new(&loaded.watched_entries);
+        trace_timing("workspace_service.from_loaded.watcher_init", watcher_started.elapsed());
         Ok(Self {
             manifest_path: loaded.manifest_path,
             workspace_root: loaded.workspace_root,
@@ -229,6 +236,7 @@ impl WorkspaceService {
             tracked_file_states,
             tracked_dirs,
             tracked_dir_states,
+            watcher,
             watched_entries: loaded.watched_entries,
             build_script_rerun_paths,
             auxiliary_build_inputs,
@@ -480,6 +488,63 @@ impl WorkspaceService {
             return self.reload_full();
         }
 
+        let watch_batch = self.watcher.drain();
+        if !watch_batch.changed_files.is_empty() {
+            let mut change = hir::ChangeWithProcMacros::default();
+            let mut saw_change = false;
+            for (abs_path, contents) in watch_batch.changed_files {
+                let path: &Path = abs_path.as_ref();
+                let path_buf = path.to_path_buf();
+                let requires_reload = path_requires_reload(path, &self.build_script_rerun_paths);
+                let is_rust_file = path.extension().is_some_and(|ext| ext == "rs");
+                if requires_reload {
+                    let _ = self.vfs.take_changes();
+                    return self.reload_full();
+                }
+                let vfs_path = VfsPath::from(abs_path);
+                let changed = self.vfs.set_file_contents(vfs_path.clone(), contents.clone());
+                if !changed {
+                    continue;
+                }
+                let Some((file_id, excluded)) = self.vfs.file_id(&vfs_path) else {
+                    let _ = self.vfs.take_changes();
+                    return self.reload_full();
+                };
+                if matches!(excluded, vfs::FileExcluded::Yes) {
+                    let _ = self.vfs.take_changes();
+                    return self.reload_full();
+                }
+                let Some(bytes) = contents else {
+                    let _ = self.vfs.take_changes();
+                    return self.reload_full();
+                };
+                let text = String::from_utf8(bytes).map_err(|err| RaHostInitError::WorkspaceLoad {
+                    manifest: self.manifest_path.display().to_string(),
+                    details: err.to_string(),
+                })?;
+                if self.tracked_files.contains(&path_buf) || is_rust_file {
+                    self.tracked_files.insert(path_buf);
+                }
+                change.change_file(file_id, Some(text));
+                saw_change = true;
+            }
+            let _ = self.vfs.take_changes();
+            if saw_change {
+                self.analysis_host.apply_change(change);
+                self.content_revision = self.content_revision.saturating_add(1);
+                self.core_host = None;
+                self.core_index = None;
+                self.core_host_spec = None;
+                self.lookup_defs.clear();
+                self.lookup_spans.clear();
+                self.tracked_dirs =
+                    tracked_directory_watch_set(&self.tracked_files, &self.watched_entries);
+                self.tracked_file_states = tracked_file_state_map(&self.tracked_files)?;
+                self.tracked_dir_states = tracked_file_state_map(&self.tracked_dirs)?;
+            }
+            return Ok(());
+        }
+
         let tracked_dir_states = tracked_file_state_map(&self.tracked_dirs)?;
         if tracked_dir_states != self.tracked_dir_states {
             return self.reload_full();
@@ -584,6 +649,7 @@ impl WorkspaceService {
         self.tracked_file_states = tracked_file_states;
         self.tracked_dirs = tracked_dirs;
         self.tracked_dir_states = tracked_dir_states;
+        self.watcher = WorkspaceWatcher::new(&watched_entries);
         self.watched_entries = watched_entries;
         self.build_script_rerun_paths = build_script_rerun_paths;
         self.auxiliary_build_inputs = auxiliary_build_inputs;

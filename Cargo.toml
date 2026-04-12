@@ -50,6 +50,7 @@ thiserror                = "1.0.64"
 line-index               = "0.1.2"
 serde                    = { version = "1.0", features = ["derive"] }
 serde_json               = "1.0"
+crossbeam-channel        = "0.5"
 
 ide                      = { package = "ide", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 ide-db                   = { package = "ide-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
@@ -60,6 +61,7 @@ vfs                      = { package = "vfs", git = "https://github.com/rust-lan
 base-db                  = { package = "base-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 load-cargo               = { package = "load-cargo", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 project-model            = { package = "project-model", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+vfs-notify               = { package = "vfs-notify", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
 
 [dependencies]
 raql-cli = { path = "crates/raql-cli" }
