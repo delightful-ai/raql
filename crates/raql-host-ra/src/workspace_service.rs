@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base_db::SourceDatabase;
 use camino::Utf8PathBuf;
@@ -49,9 +49,12 @@ mod watch;
 
 use self::tracking::{
     auxiliary_build_input_state, build_script_rerun_paths, path_requires_reload,
-    tracked_directory_watch_set, tracked_file_state_map, tracked_workspace_state,
+    tracked_directory_watch_set, tracked_file_state_map, tracked_path_state,
+    tracked_workspace_state,
 };
 use self::watch::WorkspaceWatcher;
+
+const WATCHER_READY_TIMEOUT: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub struct WorkspaceService {
@@ -488,7 +491,7 @@ impl WorkspaceService {
             return self.reload_full();
         }
 
-        let watch_batch = self.watcher.drain();
+        let watch_batch = self.watcher.drain(WATCHER_READY_TIMEOUT);
         if !watch_batch.changed_files.is_empty() {
             let mut change = hir::ChangeWithProcMacros::default();
             let mut saw_change = false;
@@ -549,8 +552,12 @@ impl WorkspaceService {
         if tracked_dir_states != self.tracked_dir_states {
             return self.reload_full();
         }
+        if self.reload_sensitive_files_changed()? {
+            return self.reload_full();
+        }
         let tracked_file_states = tracked_file_state_map(&self.tracked_files)?;
         if tracked_file_states == self.tracked_file_states {
+            self.tracked_dir_states = tracked_dir_states;
             return Ok(());
         }
 
@@ -609,6 +616,7 @@ impl WorkspaceService {
             self.lookup_spans.clear();
         }
         self.tracked_file_states = tracked_file_states;
+        self.tracked_dir_states = tracked_dir_states;
         Ok(())
     }
 
@@ -658,6 +666,20 @@ impl WorkspaceService {
         self.workspace_epoch = self.workspace_epoch.saturating_add(1);
         self.content_revision = self.content_revision.saturating_add(1);
         Ok(())
+    }
+
+    fn reload_sensitive_files_changed(&self) -> Result<bool, RaHostInitError> {
+        for path in &self.tracked_files {
+            if !path_requires_reload(path.as_path(), &self.build_script_rerun_paths) {
+                continue;
+            }
+            let current = tracked_path_state(path.as_path())?;
+            match (self.tracked_file_states.get(path), current) {
+                (Some(previous), Some(current)) if previous == &current => {}
+                _ => return Ok(true),
+            }
+        }
+        Ok(false)
     }
 }
 

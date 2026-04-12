@@ -1,4 +1,5 @@
 use crossbeam_channel::{Receiver, unbounded};
+use std::time::Duration;
 use vfs::loader::LoadingProgress;
 
 pub(super) struct WatchBatch {
@@ -29,21 +30,41 @@ impl WorkspaceWatcher {
         }
     }
 
-    pub(super) fn drain(&mut self) -> WatchBatch {
+    pub(super) fn drain(&mut self, ready_timeout: Duration) -> WatchBatch {
         let mut changed_files = Vec::new();
-        for message in self.receiver.try_iter() {
-            match message {
-                vfs::loader::Message::Changed { files } => changed_files.extend(files),
-                vfs::loader::Message::Progress { n_done, .. } => {
-                    if n_done == LoadingProgress::Finished {
-                        self.ready = true;
-                    }
-                }
-                vfs::loader::Message::Loaded { .. } => {}
-            }
+        self.drain_messages(&mut changed_files);
+        if self.ready
+            && changed_files.is_empty()
+            && let Ok(message) = self.receiver.recv_timeout(ready_timeout)
+        {
+            self.handle_message(message, &mut changed_files);
+            self.drain_messages(&mut changed_files);
         }
         WatchBatch {
             changed_files,
+        }
+    }
+
+    fn drain_messages(&mut self, changed_files: &mut Vec<(vfs::AbsPathBuf, Option<Vec<u8>>)>) {
+        let messages = self.receiver.try_iter().collect::<Vec<_>>();
+        for message in messages {
+            self.handle_message(message, changed_files);
+        }
+    }
+
+    fn handle_message(
+        &mut self,
+        message: vfs::loader::Message,
+        changed_files: &mut Vec<(vfs::AbsPathBuf, Option<Vec<u8>>)>,
+    ) {
+        match message {
+            vfs::loader::Message::Changed { files } => changed_files.extend(files),
+            vfs::loader::Message::Progress { n_done, .. } => {
+                if n_done == LoadingProgress::Finished {
+                    self.ready = true;
+                }
+            }
+            vfs::loader::Message::Loaded { .. } => {}
         }
     }
 }

@@ -146,6 +146,12 @@ pub(super) fn tracked_file_state_map(
     Ok(states)
 }
 
+pub(super) fn tracked_path_state(
+    path: &Path,
+) -> Result<Option<WatchedFileState>, RaHostInitError> {
+    watched_path_state(path)
+}
+
 fn scan_all_files(dir: &Path, out: &mut BTreeSet<PathBuf>) -> Result<(), RaHostInitError> {
     let entries = fs::read_dir(dir).map_err(|err| RaHostInitError::WorkspaceLoad {
         manifest: dir.display().to_string(),
