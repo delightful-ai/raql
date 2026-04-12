@@ -432,6 +432,18 @@ fn lookup_bound_def_path_from_core_index(
         .map(|path| path.to_owned().into_boxed_str())
 }
 
+fn lookup_bound_def_flag_from_core_index(
+    core_index: Option<&CoreLookupIndex>,
+    def: DefId,
+    predicate: &str,
+) -> Option<bool> {
+    match predicate {
+        "is_public" => core_index?.is_public(def),
+        "in_test" => core_index?.in_test(def),
+        _ => None,
+    }
+}
+
 pub(crate) fn lookup_def_rows(
     request: &ExternLookupRequest,
     core_index: Option<&CoreLookupIndex>,
@@ -777,4 +789,31 @@ pub(crate) fn lookup_def_path_rows(
         )),
         ExternLookupValue::String(path),
     ]]))
+}
+
+pub(crate) fn lookup_def_flag_rows(
+    request: &ExternLookupRequest,
+    core_index: Option<&CoreLookupIndex>,
+    predicate: &str,
+) -> Option<Vec<Vec<ExternLookupValue>>> {
+    let mut def = None::<DefId>;
+    for (idx, value) in request.bound_positions().iter().zip(request.bound_values()) {
+        match (*idx, value) {
+            (0, ExternLookupValue::Host(host))
+                if host.kind() == ExternLookupHostValueKind::Def =>
+            {
+                def = Some(DefId::new(host.stable_id()));
+            }
+            _ => return None,
+        }
+    }
+    let def = def?;
+    let flag = lookup_bound_def_flag_from_core_index(core_index, def, predicate)?;
+    if !flag {
+        return Some(Vec::new());
+    }
+    Some(vec![vec![ExternLookupValue::Host(ExternLookupHostValue::new(
+        ExternLookupHostValueKind::Def,
+        def.stable_id(),
+    ))]])
 }

@@ -206,6 +206,86 @@ hit(Name) :- def_name(T, "alpha"), is_fn(T), def_name(T, Name).
 }
 
 #[test]
+fn lang_run_supports_stdlib_exact_name_visibility_queries_on_the_daemon_path() {
+    let work = temp_dir("daemon_stdlib_exact_name_visibility");
+    let workspace = work.join("ws");
+    fs::create_dir_all(workspace.join("src")).expect("create src");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        r#"[package]
+name = "cli_daemon_visibility"
+version = "0.0.0"
+edition = "2021"
+"#,
+    )
+    .expect("write Cargo.toml");
+    fs::write(
+        workspace.join("src/lib.rs"),
+        r#"
+pub fn alpha() {}
+fn hidden() {}
+#[cfg(test)]
+mod tests {
+    pub fn helper() {}
+}
+"#,
+    )
+    .expect("write lib.rs");
+
+    let query = work.join("query.raql");
+    fs::write(
+        &query,
+        r#"
+.include "std.raql".
+.decl public_hit(Name: string).
+.decl hidden_hit(Name: string).
+public_hit(Name) :- def_name(T, "alpha"), is_public(T), def_name(T, Name).
+hidden_hit(Name) :- def_name(T, "hidden"), is_public(T), def_name(T, Name).
+"#,
+    )
+    .expect("write query");
+
+    let run = || {
+        Command::new(raql_bin())
+            .args([
+                "lang",
+                "run",
+                query.to_str().expect("utf8 query"),
+                "--rust-file",
+                workspace.to_str().expect("utf8 workspace"),
+                "--include-dir",
+                env!("CARGO_MANIFEST_DIR"),
+            ])
+            .output()
+            .expect("run raql")
+    };
+
+    let first = run();
+    assert!(
+        first.status.success(),
+        "stdlib exact-name visibility daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first_stdout.contains("daemon: cold"), "stdout={first_stdout}");
+    assert!(first_stdout.contains("public_hit(\"alpha\")"), "stdout={first_stdout}");
+    assert!(!first_stdout.contains("hidden_hit(\"hidden\")"), "stdout={first_stdout}");
+
+    let second = run();
+    assert!(
+        second.status.success(),
+        "warm stdlib exact-name visibility daemon-backed run should succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second_stdout.contains("daemon: warm"), "stdout={second_stdout}");
+    assert!(second_stdout.contains("public_hit(\"alpha\")"), "stdout={second_stdout}");
+    assert!(!second_stdout.contains("hidden_hit(\"hidden\")"), "stdout={second_stdout}");
+}
+
+#[test]
 fn lang_run_supports_stdlib_exact_name_seed_queries_with_duplicate_names_on_the_daemon_path() {
     let work = temp_dir("daemon_stdlib_exact_name_duplicates");
     let workspace = work.join("ws");

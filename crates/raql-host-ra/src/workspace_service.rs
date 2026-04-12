@@ -30,7 +30,7 @@ use crate::provider::calls::{
 };
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::defs::{
-    LocalFile, LookupDefRecord, lookup_def_kind_rows, lookup_def_name_rows,
+    LocalFile, LookupDefRecord, lookup_def_flag_rows, lookup_def_kind_rows, lookup_def_name_rows,
     lookup_def_path_rows, lookup_def_rows, lookup_def_span_rows, module_def_in_test,
     module_def_is_public, module_def_kind,
 };
@@ -379,6 +379,12 @@ impl WorkspaceService {
                 self.core_index.as_ref(),
                 &mut self.lookup_defs,
             ),
+            ("is_public", ExternLookupShape::RelationExactBindings) => {
+                Ok(lookup_def_flag_rows(request, self.core_index.as_ref(), "is_public"))
+            }
+            ("in_test", ExternLookupShape::RelationExactBindings) => {
+                Ok(lookup_def_flag_rows(request, self.core_index.as_ref(), "in_test"))
+            }
             ("call_edge", ExternLookupShape::RelationExactBindings) => {
                 self.lookup_call_edge_rows(request)
             }

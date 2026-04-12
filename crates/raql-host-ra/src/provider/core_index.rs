@@ -57,6 +57,14 @@ impl CoreLookupIndex {
         self.defs.get(&def_id).map(|metadata| metadata.path.as_ref())
     }
 
+    pub(crate) fn is_public(&self, def_id: DefId) -> Option<bool> {
+        self.defs.get(&def_id).and_then(|metadata| metadata.is_public)
+    }
+
+    pub(crate) fn in_test(&self, def_id: DefId) -> Option<bool> {
+        self.defs.get(&def_id).and_then(|metadata| metadata.in_test)
+    }
+
     pub(crate) fn contains_def(&self, def_id: DefId) -> bool {
         self.defs.contains_key(&def_id)
     }
