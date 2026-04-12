@@ -275,6 +275,77 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "omega").
 }
 
 #[test]
+fn workspace_service_preserves_core_host_on_incremental_edits_with_impl_facts() {
+    let root = temp_workspace_root("incremental_impl_overlay");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub trait Greeter {
+    fn greet(&self);
+}
+
+pub struct Person;
+
+impl Greeter for Person {
+    fn greet(&self) {}
+}
+
+pub fn helper() -> usize {
+    1
+}
+"#,
+    )
+    .expect("write lib.rs");
+
+    let mut service =
+        WorkspaceService::from_manifest_path(root.join("Cargo.toml").as_std_path()).expect("service");
+    let impl_query = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl implements(Type: Def, Trait: Def, ImplDef: Def) extern.
+.decl hit(Name: string).
+hit(Name) :- def(Person), def_name(Person, "Person"), implements(Person, Trait, _), def_name(Trait, Name).
+"#,
+    );
+    let first = service.run_planned(&impl_query).expect("first run");
+    assert!(first.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("Greeter".to_string())])
+    }));
+    assert!(service.has_core_host(), "core host should be populated after impl query");
+
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub trait Greeter {
+    fn greet(&self);
+}
+
+pub struct Person;
+
+impl Greeter for Person {
+    fn greet(&self) {}
+}
+
+pub fn helper() -> usize {
+    2
+}
+"#,
+    )
+    .expect("rewrite lib.rs");
+    service.sync().expect("sync after edit");
+    assert!(
+        service.has_core_host(),
+        "body-only edits with stable def identity should preserve impl-backed core host"
+    );
+
+    let second = service.run_planned(&impl_query).expect("second run");
+    assert!(second.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("Greeter".to_string())])
+    }));
+}
+
+#[test]
 fn workspace_service_excludes_import_and_alias_symbols_from_def_surface() {
     let root = temp_workspace_root("def_surface_excludes_aliases");
     fs::write(

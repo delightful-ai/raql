@@ -77,6 +77,22 @@ impl CoreLookupIndex {
         self.functions.get(&def_id).copied()
     }
 
+    pub(crate) fn def_fingerprints_for_paths(
+        &self,
+        changed_rel_paths: &BTreeSet<String>,
+    ) -> BTreeSet<(DefId, DefKind, Box<str>)> {
+        self.defs
+            .iter()
+            .filter_map(|(def_id, metadata)| {
+                metadata
+                    .source_rel_path
+                    .as_deref()
+                    .filter(|path| changed_rel_paths.contains(*path))
+                    .map(|_| (*def_id, metadata.kind, metadata.path.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn invalidate_paths(&mut self, changed_rel_paths: &BTreeSet<String>) {
         if changed_rel_paths.is_empty() {
             return;

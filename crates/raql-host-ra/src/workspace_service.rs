@@ -787,9 +787,6 @@ impl WorkspaceService {
         let Some(build_spec) = self.core_host_spec.clone() else {
             return Ok(false);
         };
-        if build_spec.impls {
-            return Ok(false);
-        }
         let changed_rel_paths = self.changed_rel_paths(changed_paths);
         let Some(core_host) = self.core_host.as_mut() else {
             return Ok(false);
@@ -811,6 +808,16 @@ impl WorkspaceService {
             self.content_revision,
             &build_spec,
         )?;
+        if build_spec.impls {
+            let Some(core_index) = self.core_index.as_ref() else {
+                return Ok(false);
+            };
+            let previous = core_index.def_fingerprints_for_paths(&changed_rel_paths);
+            let next = overlay.index.def_fingerprints_for_paths(&changed_rel_paths);
+            if previous != next {
+                return Ok(false);
+            }
+        }
         core_host.invalidate_paths(&changed_rel_paths);
         core_host.merge_from(overlay.host);
         if let Some(core_index) = self.core_index.as_mut() {
