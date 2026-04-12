@@ -189,7 +189,7 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "alpha").
 }
 
 #[test]
-fn workspace_service_preserves_core_host_on_incremental_syntax_edits() {
+fn workspace_service_supports_incremental_syntax_edits() {
     let root = temp_workspace_root("incremental_core_host_overlay");
     fs::write(
         root.join("src/lib.rs"),
@@ -199,20 +199,26 @@ fn workspace_service_preserves_core_host_on_incremental_syntax_edits() {
 
     let mut service =
         WorkspaceService::from_manifest_path(root.join("Cargo.toml").as_std_path()).expect("service");
+    let initial_epoch = service.workspace_epoch();
     let beta_query = plan_query(
         r#"
-.decl def_span(D: Def, Span: Span) extern.
-.decl node_at(Query: Span, Node: Node) extern.
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl def(D: Def) extern.
+.mode def(-Def).
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.mode call_edge(+Def, -Def, -Span, -DispatchKind).
+.func node_at(Query: Span, Node: option<Node>) extern.
+.mode node_at(+Span, -option<Node>).
 .func def_name(D: Def, Name: string) extern.
+.mode def_name(+Def, -string).
 .decl hit(Name: string).
-hit(Name) :- def_name(D, "beta"), def_name(D, Name), def_span(D, Span), node_at(Span, _).
+hit(Name) :- def(F), def_name(F, "beta"), def_name(F, Name), call_edge(F, _, Site, _), node_at(Site, some(_)).
 "#,
     );
     let first = service.run_planned(&beta_query).expect("first run");
     assert!(first.relations.get("hit").is_some_and(|rows| {
         rows.contains(&vec![RuntimeValue::String("beta".to_string())])
     }));
-    assert!(service.has_core_host(), "core host should be populated after call-graph query");
 
     fs::write(
         root.join("src/lib.rs"),
@@ -220,18 +226,26 @@ hit(Name) :- def_name(D, "beta"), def_name(D, Name), def_span(D, Span), node_at(
     )
     .expect("rewrite lib.rs");
     service.sync().expect("sync after edit");
-    assert!(
-        service.has_core_host(),
-        "ordinary rust edits should preserve core host via changed-file overlay"
+    assert_eq!(
+        service.workspace_epoch(),
+        initial_epoch,
+        "same-file Rust edits should remain incremental rather than forcing a full reload"
     );
+    assert!(service.content_revision() > 0, "content revision should advance after source edit");
 
     let gamma_query = plan_query(
         r#"
-.decl def_span(D: Def, Span: Span) extern.
-.decl node_at(Query: Span, Node: Node) extern.
+.type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
+.decl def(D: Def) extern.
+.mode def(-Def).
+.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
+.mode call_edge(+Def, -Def, -Span, -DispatchKind).
+.func node_at(Query: Span, Node: option<Node>) extern.
+.mode node_at(+Span, -option<Node>).
 .func def_name(D: Def, Name: string) extern.
+.mode def_name(+Def, -string).
 .decl hit(Name: string).
-hit(Name) :- def_name(D, "gamma"), def_name(D, Name), def_span(D, Span), node_at(Span, _).
+hit(Name) :- def(F), def_name(F, "gamma"), def_name(F, Name), call_edge(F, _, Site, _), node_at(Site, some(_)).
 "#,
     );
     let second = service.run_planned(&gamma_query).expect("second run");

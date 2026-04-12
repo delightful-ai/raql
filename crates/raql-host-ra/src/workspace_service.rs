@@ -35,10 +35,12 @@ use crate::provider::defs::{
     module_def_is_public, module_def_kind,
 };
 use crate::provider::syntax::{
-    extract_syntax_nodes, lookup_span_allowed_rows, lookup_span_key_rows,
+    LookupNodeRecord, extract_syntax_nodes, lookup_enclosing_control_rows, lookup_node_at_rows,
+    lookup_node_id_rows, lookup_node_kind_rows, lookup_node_parent_rows, lookup_node_span_rows,
+    lookup_span_allowed_rows, lookup_span_key_rows,
 };
 use crate::workspace_loader;
-use crate::{DefId, DeterministicRaHost, RaHostInitError, SpanId, StableHandle, WorldStamp};
+use crate::{DefId, DeterministicRaHost, NodeId, RaHostInitError, SpanId, StableHandle, WorldStamp};
 
 #[path = "workspace_service/build.rs"]
 mod build;
@@ -78,6 +80,7 @@ pub struct WorkspaceService {
     auxiliary_build_inputs: BTreeMap<PathBuf, Option<WatchedFileState>>,
     lookup_defs: BTreeMap<DefId, LookupDefRecord>,
     lookup_spans: BTreeMap<SpanId, SpanKey>,
+    lookup_nodes: BTreeMap<NodeId, LookupNodeRecord>,
     workspace_epoch: u64,
     content_revision: u64,
 }
@@ -178,7 +181,6 @@ impl CoreHostBuildSpec {
 
     pub(crate) fn supports_lookup_only_fast_path(&self) -> bool {
         !self.impls
-            && !self.syntax_nodes
             && !self.type_facts
             && !self.adt_structure
     }
@@ -244,6 +246,7 @@ impl WorkspaceService {
             auxiliary_build_inputs,
             lookup_defs: BTreeMap::new(),
             lookup_spans: BTreeMap::new(),
+            lookup_nodes: BTreeMap::new(),
             workspace_epoch: 0,
             content_revision: 0,
         })
@@ -427,6 +430,40 @@ impl WorkspaceService {
                     request,
                     self.core_index.as_ref(),
                     &mut self.lookup_spans,
+                )))
+            }
+            ("node_at", ExternLookupShape::FunctionExactBindings) => {
+                Ok(Some(lookup_node_at_rows(
+                    request,
+                    self.analysis_host.raw_database(),
+                    &self.vfs,
+                    self.workspace_root.as_path(),
+                    self.core_index.as_ref(),
+                    &mut self.lookup_spans,
+                    &mut self.lookup_nodes,
+                )))
+            }
+            ("node_kind", ExternLookupShape::FunctionExactBindings) => {
+                Ok(Some(lookup_node_kind_rows(request, &self.lookup_nodes)))
+            }
+            ("node_span", ExternLookupShape::FunctionExactBindings) => {
+                Ok(Some(lookup_node_span_rows(request, &self.lookup_nodes)))
+            }
+            ("node_parent", ExternLookupShape::FunctionExactBindings) => {
+                Ok(Some(lookup_node_parent_rows(request, &self.lookup_nodes)))
+            }
+            ("node_id", ExternLookupShape::FunctionExactBindings) => {
+                Ok(Some(lookup_node_id_rows(request, &self.lookup_nodes)))
+            }
+            ("enclosing_control", ExternLookupShape::RelationExactBindings) => {
+                Ok(Some(lookup_enclosing_control_rows(
+                    request,
+                    self.analysis_host.raw_database(),
+                    &self.vfs,
+                    self.workspace_root.as_path(),
+                    self.core_index.as_ref(),
+                    &mut self.lookup_spans,
+                    &mut self.lookup_nodes,
                 )))
             }
             _ => Ok(None),
@@ -749,6 +786,7 @@ impl WorkspaceService {
         self.auxiliary_build_inputs = auxiliary_build_inputs;
         self.lookup_defs.clear();
         self.lookup_spans.clear();
+        self.lookup_nodes.clear();
         self.workspace_epoch = self.workspace_epoch.saturating_add(1);
         self.content_revision = self.content_revision.saturating_add(1);
         Ok(())
@@ -810,6 +848,8 @@ impl WorkspaceService {
             let path: &Path = abs_path.as_ref();
             !changed_paths.contains(path)
         });
+        self.lookup_nodes
+            .retain(|_, record| !invalid_spans.contains(&record.span));
     }
 
     fn invalidate_core_index_for_paths(&mut self, changed_paths: &BTreeSet<PathBuf>) {

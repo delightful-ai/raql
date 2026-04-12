@@ -48,6 +48,12 @@ impl<'a> LazyRaRuntime<'a> {
                 | "in_test"
                 | "span_allowed"
                 | "span_key"
+                | "node_at"
+                | "node_kind"
+                | "node_span"
+                | "node_parent"
+                | "node_id"
+                | "enclosing_control"
                 | "call_edge"
         )
     }
