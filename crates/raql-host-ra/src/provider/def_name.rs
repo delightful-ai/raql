@@ -7,9 +7,7 @@ use raql_host::{
 };
 
 use crate::provider::core_index::CoreLookupIndex;
-use crate::provider::defs::{
-    LookupDefRecord, ensure_lookup_source_module_def, ensure_lookup_symbol_module_def,
-};
+use crate::provider::defs::{LookupDefRecord, ensure_lookup_symbol_module_def};
 use crate::{DefId, DeterministicRaHost, RaHostInitError, SpanId, SpanKey};
 
 pub(crate) fn lookup_def_name_rows(
@@ -110,54 +108,6 @@ pub(crate) fn lookup_def_name_rows(
         }
     };
     collect_symbol_rows(Query::new(requested_name.to_string()), false);
-    collect_symbol_rows(Query::new(format!("{requested_name}#")), true);
-    if !symbol_rows.is_empty() {
-        return Ok(symbol_rows.into_iter().collect());
-    }
-
-    let mut id_host = DeterministicRaHost::new();
-    let mut rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-    for krate in hir::Crate::all(db)
-        .into_iter()
-        .filter(|krate| krate.origin(db).is_local())
-    {
-        let mut modules = vec![krate.root_module(db)];
-        while let Some(module) = modules.pop() {
-            let query_name =
-                ide_db::imports::import_assets::NameToImport::Exact(requested_name.to_owned(), true);
-            let _ = ide_db::items_locator::items_with_name_in_module(
-                db,
-                module,
-                query_name,
-                ide_db::items_locator::AssocSearchMode::Include,
-                |item| {
-                    let def = item.into_module_def();
-                    let Some(def_id) = ensure_lookup_source_module_def(
-                        db,
-                        vfs,
-                        workspace_root,
-                        lookup_defs,
-                        lookup_spans,
-                        &mut id_host,
-                        def,
-                    ) else {
-                        return std::ops::ControlFlow::<()>::Continue(());
-                    };
-                    if def_filter.is_some_and(|expected| expected != def_id) {
-                        return std::ops::ControlFlow::<()>::Continue(());
-                    }
-                    rows.insert(vec![
-                        ExternLookupValue::Host(ExternLookupHostValue::new(
-                            ExternLookupHostValueKind::Def,
-                            def_id.stable_id(),
-                        )),
-                        ExternLookupValue::String(requested_name.to_owned().into_boxed_str()),
-                    ]);
-                    std::ops::ControlFlow::<()>::Continue(())
-                },
-            );
-            modules.extend(module.children(db));
-        }
-    }
-    Ok(rows.into_iter().collect())
+    collect_symbol_rows(Query::new(requested_name.to_string()), true);
+    Ok(symbol_rows.into_iter().collect())
 }
