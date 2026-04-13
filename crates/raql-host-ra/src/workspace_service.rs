@@ -29,8 +29,9 @@ use crate::provider::calls::{
     lookup_call_edge_rows as provider_lookup_call_edge_rows,
 };
 use crate::provider::core_index::CoreLookupIndex;
+use crate::provider::def_name::lookup_def_name_rows;
 use crate::provider::defs::{
-    LocalFile, LookupDefRecord, lookup_def_flag_rows, lookup_def_kind_rows, lookup_def_name_rows,
+    LocalFile, LookupDefRecord, lookup_def_flag_rows, lookup_def_kind_rows,
     lookup_def_handle_rows, lookup_def_path_rows, lookup_def_rows, lookup_def_span_rows, module_def_in_test,
     module_def_is_public, module_def_kind,
 };
