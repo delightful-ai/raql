@@ -1248,18 +1248,14 @@ fn build_core_index(
     content_revision: u64,
     build_spec: &CoreHostBuildSpec,
 ) -> Result<CoreLookupIndex, RaHostInitError> {
-    let build_started = Instant::now();
-    let artifacts = build_core_host(
+    let _ = (workspace_epoch, content_revision);
+    build::build_core_index_only(
         analysis_host,
         vfs,
         workspace_root,
         tracked_files,
-        workspace_epoch,
-        content_revision,
         build_spec,
-    )?;
-    trace_timing("workspace_service.build_core_index.total", build_started.elapsed());
-    Ok(artifacts.index)
+    )
 }
 
 fn trace_timing(label: &str, elapsed: std::time::Duration) {

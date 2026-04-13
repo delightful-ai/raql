@@ -1,10 +1,134 @@
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+use base_db::SourceDatabase;
 use hir::{Adt, AssocItem, HasSource, HasVisibility, Impl, Module, ModuleDef};
+use ide::AnalysisHost;
+use ide_db::symbol_index::{Query, world_symbols};
 use syntax::ast::{HasGenericArgs, HasName};
 use syntax::{ast, AstNode, Edition};
 
-use super::CoreFactsBuilder;
-use crate::provider::defs::{LocalFile, canonical_function_path, lookup_span_key_from_text};
-use crate::{DefId, DefKind, GenericArg, Mutability, TypeShape};
+use super::{CoreFactsBuilder, CoreHostBuildSpec, RaHostInitError, trace_timing};
+use crate::provider::core_index::CoreLookupIndex;
+use crate::provider::defs::{
+    LocalFile, canonical_function_path, lookup_span_key_from_text, module_def_in_test,
+    module_def_is_public, module_def_kind,
+};
+use crate::{DefId, DefKind, GenericArg, Mutability, SpanId, TypeShape, deterministic_stable_id};
+use hir::import_map::AssocSearchMode;
+
+pub(super) fn build_core_index_only(
+    analysis_host: &AnalysisHost,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    tracked_files: &std::collections::BTreeSet<PathBuf>,
+    build_spec: &CoreHostBuildSpec,
+) -> Result<CoreLookupIndex, RaHostInitError> {
+    let build_started = std::time::Instant::now();
+    let db = analysis_host.raw_database();
+    let mut files = BTreeMap::new();
+    for (file_id, path) in vfs.iter() {
+        let Some(abs) = path.as_path() else {
+            continue;
+        };
+        let abs_path: &Path = abs.as_ref();
+        let owned_path = abs_path.to_path_buf();
+        if !tracked_files.contains(&owned_path) {
+            continue;
+        }
+        let rel_path = if abs_path.starts_with(workspace_root) {
+            abs_path
+                .strip_prefix(workspace_root)
+                .unwrap_or(abs_path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        } else {
+            abs_path.to_string_lossy().replace('\\', "/")
+        };
+        let text = db.file_text(file_id).text(db).to_string();
+        files.insert(file_id, LocalFile { rel_path, text });
+    }
+
+    let query_started = std::time::Instant::now();
+    let mut query = Query::new(String::new());
+    query.exclude_imports();
+    query.assoc_search_mode(AssocSearchMode::Exclude);
+    let symbols = world_symbols(db, query);
+    trace_timing("workspace_service.build_core_index.world_symbols", query_started.elapsed());
+
+    let lower_started = std::time::Instant::now();
+    let mut core_index = CoreLookupIndex::default();
+    hir::attach_db(db, || {
+        let sema = hir::Semantics::new(db);
+        let mut parsed_by_file = HashMap::new();
+        for symbol in symbols {
+            if symbol.is_import || symbol.is_alias {
+                continue;
+            }
+            let Some(kind) = module_def_kind(symbol.def) else {
+                continue;
+            };
+            let editioned = symbol.loc.hir_file_id.original_file(db);
+            let Some(local) = files.get(&editioned.file_id(db)) else {
+                continue;
+            };
+            let name = symbol.name.as_str();
+            let path = match symbol.def {
+                ModuleDef::Function(function) => canonical_function_path(db, function),
+                def => def
+                    .canonical_path(db, Edition::CURRENT)
+                    .unwrap_or_else(|| format!("crate::{name}")),
+            };
+            let token = match symbol.def {
+                ModuleDef::Function(_) => format!("def:function:{path}"),
+                _ => format!("def:{kind:?}:{path}"),
+            };
+            let def_id = DefId::new(deterministic_stable_id("def", token.as_str()));
+            if core_index.contains_def(def_id) {
+                continue;
+            }
+            core_index.record_def(
+                def_id,
+                name,
+                kind,
+                path.as_str(),
+                Some(local.rel_path.as_str()),
+            );
+            if let ModuleDef::Function(function) = symbol.def {
+                core_index.record_function(def_id, function);
+            }
+            if build_spec.def_spans {
+                let root = parsed_by_file
+                    .entry(symbol.loc.hir_file_id)
+                    .or_insert_with(|| sema.parse_or_expand(symbol.loc.hir_file_id));
+                let syntax = symbol.loc.ptr.to_node(root);
+                let range = syntax.text_range();
+                if let Some(span_key) =
+                    lookup_span_key_from_text(local.rel_path.as_str(), local.text.as_str(), range)
+                {
+                    let file_id = editioned.editioned_file_id(db);
+                    let token = format!(
+                        "{}:{}..{}",
+                        file_id.as_u32(),
+                        u32::from(range.start()),
+                        u32::from(range.end())
+                    );
+                    let span = SpanId::new(deterministic_stable_id("span", token.as_str()));
+                    core_index.record_span(def_id, span, span_key);
+                }
+            }
+            if build_spec.def_publicity {
+                core_index.mark_public(def_id, module_def_is_public(symbol.def, db));
+            }
+            if build_spec.def_test_flags {
+                core_index.mark_in_test(def_id, module_def_in_test(symbol.def, db));
+            }
+        }
+    });
+    trace_timing("workspace_service.build_core_index.lower", lower_started.elapsed());
+    trace_timing("workspace_service.build_core_index.total", build_started.elapsed());
+    Ok(core_index)
+}
 
 impl<'db> CoreFactsBuilder<'db> {
     pub(super) fn process_adt(&mut self, adt: Adt, owner_def: DefId) {
