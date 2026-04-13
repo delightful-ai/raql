@@ -1931,6 +1931,36 @@ hit(Name) :- is_public(D), def_name(D, Name).
         }),
         "unbound visibility lookup should enumerate only public defs"
     );
+    assert!(
+        !service.has_core_host(),
+        "unbound visibility lookup should build only the RA-backed core index"
+    );
+}
+
+#[test]
+fn workspace_service_supports_unbound_def_lookup_rows_without_core_host() {
+    let root = temp_workspace_root("unbound_def_lookup_only");
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\nfn beta() {}\n").expect("write lib.rs");
+
+    let mut service = WorkspaceService::from_workspace_root(root.as_std_path()).expect("service");
+    let planned = plan_query(
+        r#"
+.decl def(D: Def) extern.
+.func def_name(D: Def, Name: string) extern.
+.decl hit(Name: string).
+hit(Name) :- def(D), def_name(D, Name).
+"#,
+    );
+    let result = service.run_planned(&planned).expect("run query");
+    assert!(matches!(result.status, EvalStatus::Ok), "{result:?}");
+    assert!(result.relations.get("hit").is_some_and(|rows| {
+        rows.contains(&vec![RuntimeValue::String("alpha".to_string())])
+            && rows.contains(&vec![RuntimeValue::String("beta".to_string())])
+    }));
+    assert!(
+        !service.has_core_host(),
+        "unbound def lookup should build only the RA-backed core index"
+    );
 }
 
 #[test]

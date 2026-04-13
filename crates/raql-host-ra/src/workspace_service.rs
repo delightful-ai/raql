@@ -69,6 +69,8 @@ pub struct WorkspaceService {
     _proc_macro_client: Option<Box<dyn workspace_loader::ProcMacroClientHandle>>,
     core_host: Option<DeterministicRaHost>,
     core_index: Option<CoreLookupIndex>,
+    core_index_spec: Option<CoreHostBuildSpec>,
+    core_index_complete: bool,
     core_host_spec: Option<CoreHostBuildSpec>,
     tracked_files: BTreeSet<PathBuf>,
     tracked_file_states: BTreeMap<PathBuf, WatchedFileState>,
@@ -235,6 +237,8 @@ impl WorkspaceService {
             _proc_macro_client: loaded.proc_macro_client,
             core_host: None,
             core_index: None,
+            core_index_spec: None,
+            core_index_complete: false,
             core_host_spec: None,
             tracked_files,
             tracked_file_states,
@@ -365,7 +369,7 @@ impl WorkspaceService {
             }
             ("def", ExternLookupShape::RelationExactBindings) => {
                 if request.bound_positions().is_empty() && self.core_index.is_none() {
-                    let _ = self.ensure_core_host(&CoreHostBuildSpec::default())?;
+                    let _ = self.ensure_core_index(&CoreHostBuildSpec::default())?;
                 }
                 Ok(Some(lookup_def_rows(
                     request,
@@ -402,14 +406,14 @@ impl WorkspaceService {
                 )))
             }
             ("is_public", ExternLookupShape::RelationExactBindings) => {
-                let _ = self.ensure_core_host(&CoreHostBuildSpec {
+                let _ = self.ensure_core_index(&CoreHostBuildSpec {
                     def_publicity: true,
                     ..CoreHostBuildSpec::default()
                 })?;
                 Ok(lookup_def_flag_rows(request, self.core_index.as_ref(), "is_public"))
             }
             ("in_test", ExternLookupShape::RelationExactBindings) => {
-                let _ = self.ensure_core_host(&CoreHostBuildSpec {
+                let _ = self.ensure_core_index(&CoreHostBuildSpec {
                     def_test_flags: true,
                     ..CoreHostBuildSpec::default()
                 })?;
@@ -575,11 +579,49 @@ impl WorkspaceService {
             )?;
             self.core_host = Some(artifacts.host);
             self.core_index = Some(artifacts.index);
+            self.core_index_spec = Some(build_spec.clone());
+            self.core_index_complete = true;
             trace_timing("workspace_service.ensure_core_host.build_core_host", build_started.elapsed());
             self.core_host_spec = Some(build_spec);
         }
         trace_timing("workspace_service.ensure_core_host.total", ensure_started.elapsed());
         Ok(self.core_host.as_mut().expect("core host initialized"))
+    }
+
+    fn ensure_core_index(
+        &mut self,
+        required_spec: &CoreHostBuildSpec,
+    ) -> Result<&CoreLookupIndex, RaHostInitError> {
+        let ensure_started = Instant::now();
+        let build_spec = self
+            .core_index_spec
+            .as_ref()
+            .map(|current| current.union(required_spec))
+            .unwrap_or_else(|| required_spec.clone());
+        if self.core_index.is_none()
+            || !self.core_index_complete
+            || self
+                .core_index_spec
+                .as_ref()
+                .is_none_or(|current| !current.covers(required_spec))
+        {
+            let build_started = Instant::now();
+            let index = build_core_index(
+                &self.analysis_host,
+                &self.vfs,
+                &self.workspace_root,
+                &self.tracked_files,
+                self.workspace_epoch,
+                self.content_revision,
+                &build_spec,
+            )?;
+            self.core_index = Some(index);
+            self.core_index_spec = Some(build_spec);
+            self.core_index_complete = true;
+            trace_timing("workspace_service.ensure_core_index.build_core_index", build_started.elapsed());
+        }
+        trace_timing("workspace_service.ensure_core_index.total", ensure_started.elapsed());
+        Ok(self.core_index.as_ref().expect("core index initialized"))
     }
 
     fn sync_workspace(&mut self) -> Result<(), RaHostInitError> {
@@ -775,6 +817,8 @@ impl WorkspaceService {
         self._proc_macro_client = proc_macro_client;
         self.core_host = None;
         self.core_index = None;
+        self.core_index_spec = None;
+        self.core_index_complete = false;
         self.core_host_spec = None;
         self.tracked_files = tracked_files;
         self.tracked_file_states = tracked_file_states;
@@ -858,6 +902,9 @@ impl WorkspaceService {
             return;
         };
         core_index.invalidate_paths(&changed_rel_paths);
+        if !changed_rel_paths.is_empty() {
+            self.core_index_complete = false;
+        }
     }
 
     fn try_overlay_core_host_for_paths(
@@ -906,6 +953,7 @@ impl WorkspaceService {
         } else {
             self.core_index = Some(overlay.index);
         }
+        self.core_index_complete = true;
         Ok(true)
     }
 
@@ -1189,6 +1237,29 @@ fn build_core_host(
         host: builder.host,
         index: builder.core_index,
     })
+}
+
+fn build_core_index(
+    analysis_host: &AnalysisHost,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    tracked_files: &BTreeSet<PathBuf>,
+    workspace_epoch: u64,
+    content_revision: u64,
+    build_spec: &CoreHostBuildSpec,
+) -> Result<CoreLookupIndex, RaHostInitError> {
+    let build_started = Instant::now();
+    let artifacts = build_core_host(
+        analysis_host,
+        vfs,
+        workspace_root,
+        tracked_files,
+        workspace_epoch,
+        content_revision,
+        build_spec,
+    )?;
+    trace_timing("workspace_service.build_core_index.total", build_started.elapsed());
+    Ok(artifacts.index)
 }
 
 fn trace_timing(label: &str, elapsed: std::time::Duration) {
