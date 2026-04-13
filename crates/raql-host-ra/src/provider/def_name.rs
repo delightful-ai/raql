@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use hir::{AssocItem, ModuleDef};
+use ide_db::imports::import_assets::NameToImport;
+use ide_db::items_locator::{self, AssocSearchMode};
 use raql_host::{
     ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
 };
@@ -69,105 +70,35 @@ pub(crate) fn lookup_def_name_rows(
             .into_iter()
             .filter(|krate| krate.origin(db).is_local())
         {
-            collect_exact_name_rows_in_module(
-                krate.root_module(db),
-                requested_name,
+            for (item, _complete) in items_locator::items_with_name(
                 db,
-                vfs,
-                workspace_root,
-                lookup_defs,
-                lookup_spans,
-                &mut id_host,
-                &mut rows,
-                def_filter,
-            );
-        }
-    });
-    Ok(rows.into_iter().collect())
-}
-
-fn collect_exact_name_rows_in_module(
-    module: hir::Module,
-    requested_name: &str,
-    db: &ide::RootDatabase,
-    vfs: &vfs::Vfs,
-    workspace_root: &Path,
-    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
-    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
-    id_host: &mut DeterministicRaHost,
-    rows: &mut BTreeSet<Vec<ExternLookupValue>>,
-    def_filter: Option<DefId>,
-) {
-    for def in module.declarations(db) {
-        push_exact_name_row(
-            def,
-            requested_name,
-            db,
-            vfs,
-            workspace_root,
-            lookup_defs,
-            lookup_spans,
-            id_host,
-            rows,
-            def_filter,
-        );
-        match def {
-            ModuleDef::Module(child) => collect_exact_name_rows_in_module(
-                child,
-                requested_name,
-                db,
-                vfs,
-                workspace_root,
-                lookup_defs,
-                lookup_spans,
-                id_host,
-                rows,
-                def_filter,
-            ),
-            ModuleDef::Trait(trait_def) => {
-                for assoc in trait_def.items(db) {
-                    if let AssocItem::Function(function) = assoc {
-                        push_exact_name_row(
-                            ModuleDef::Function(function),
-                            requested_name,
-                            db,
-                            vfs,
-                            workspace_root,
-                            lookup_defs,
-                            lookup_spans,
-                            id_host,
-                            rows,
-                            def_filter,
-                        );
-                    }
+                krate,
+                NameToImport::Exact(requested_name.to_owned(), true),
+                AssocSearchMode::Include,
+            ) {
+                if item.krate(db) != Some(krate) {
+                    continue;
                 }
-            }
-            _ => {}
-        }
-    }
-
-    for impl_def in module.impl_defs(db) {
-        for assoc in impl_def.items(db) {
-            if let AssocItem::Function(function) = assoc {
                 push_exact_name_row(
-                    ModuleDef::Function(function),
+                    item.into_module_def(),
                     requested_name,
                     db,
                     vfs,
                     workspace_root,
                     lookup_defs,
                     lookup_spans,
-                    id_host,
-                    rows,
+                    &mut id_host,
+                    &mut rows,
                     def_filter,
                 );
             }
         }
-    }
+    });
+    Ok(rows.into_iter().collect())
 }
 
 fn push_exact_name_row(
-    def: ModuleDef,
+    def: hir::ModuleDef,
     requested_name: &str,
     db: &ide::RootDatabase,
     vfs: &vfs::Vfs,
