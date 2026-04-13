@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use ide_db::imports::import_assets::NameToImport;
-use ide_db::items_locator::{self, AssocSearchMode};
+use hir::import_map::AssocSearchMode;
+use ide_db::symbol_index::{Query, world_symbols};
 use raql_host::{
     ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
 };
@@ -65,35 +65,32 @@ pub(crate) fn lookup_def_name_rows(
 
     let mut id_host = DeterministicRaHost::new();
     let mut rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-    hir::attach_db(db, || {
-        for krate in hir::Crate::all(db)
-            .into_iter()
-            .filter(|krate| krate.origin(db).is_local())
+    let mut query = Query::new(requested_name.to_owned());
+    query.exact();
+    query.case_sensitive();
+    query.exclude_imports();
+    query.assoc_search_mode(AssocSearchMode::Include);
+    for symbol in world_symbols(db, query) {
+        if symbol
+            .def
+            .module(db)
+            .is_none_or(|module| !module.krate(db).origin(db).is_local())
         {
-            for (item, _complete) in items_locator::items_with_name(
-                db,
-                krate,
-                NameToImport::Exact(requested_name.to_owned(), true),
-                AssocSearchMode::Include,
-            ) {
-                if item.krate(db) != Some(krate) {
-                    continue;
-                }
-                push_exact_name_row(
-                    item.into_module_def(),
-                    requested_name,
-                    db,
-                    vfs,
-                    workspace_root,
-                    lookup_defs,
-                    lookup_spans,
-                    &mut id_host,
-                    &mut rows,
-                    def_filter,
-                );
-            }
+            continue;
         }
-    });
+        push_exact_name_row(
+            symbol.def,
+            requested_name,
+            db,
+            vfs,
+            workspace_root,
+            lookup_defs,
+            lookup_spans,
+            &mut id_host,
+            &mut rows,
+            def_filter,
+        );
+    }
     Ok(rows.into_iter().collect())
 }
 
