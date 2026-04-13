@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use ide_db::symbol_index::{Query, world_symbols};
+use hir::{AssocItem, ModuleDef};
 use raql_host::{
     ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
 };
 
 use crate::provider::core_index::CoreLookupIndex;
-use crate::provider::defs::{LookupDefRecord, ensure_lookup_symbol_module_def};
+use crate::provider::defs::{LookupDefRecord, ensure_lookup_source_module_def};
 use crate::{DefId, DeterministicRaHost, RaHostInitError, SpanId, SpanKey};
 
 pub(crate) fn lookup_def_name_rows(
@@ -62,52 +62,147 @@ pub(crate) fn lookup_def_name_rows(
         return Ok(Vec::new());
     };
 
-    let mut symbol_id_host = DeterministicRaHost::new();
-    let mut symbol_rows = BTreeSet::<Vec<ExternLookupValue>>::new();
-    let mut collect_symbol_rows = |mut query: Query, include_functions: bool| {
-        query.exact();
-        query.exclude_imports();
-        for symbol in world_symbols(db, query) {
-            if symbol.is_alias || symbol.is_import {
-                continue;
-            }
-            let def = symbol.def;
-            if matches!(def, hir::ModuleDef::Function(_)) != include_functions {
-                continue;
-            }
-            let Some(module) = def.module(db) else {
-                continue;
-            };
-            if !module.krate(db).origin(db).is_local() {
-                continue;
-            }
-            let original = symbol.loc.hir_file_id.original_file_respecting_includes(db);
-            let Some(def_id) = ensure_lookup_symbol_module_def(
+    let mut id_host = DeterministicRaHost::new();
+    let mut rows = BTreeSet::<Vec<ExternLookupValue>>::new();
+    hir::attach_db(db, || {
+        for krate in hir::Crate::all(db)
+            .into_iter()
+            .filter(|krate| krate.origin(db).is_local())
+        {
+            collect_exact_name_rows_in_module(
+                krate.root_module(db),
+                requested_name,
                 db,
                 vfs,
                 workspace_root,
                 lookup_defs,
                 lookup_spans,
-                &mut symbol_id_host,
-                def,
-                original.editioned_file_id(db),
-                symbol.loc.ptr.text_range(),
-            ) else {
-                continue;
-            };
-            if def_filter.is_some_and(|expected| expected != def_id) {
-                continue;
-            }
-            symbol_rows.insert(vec![
-                ExternLookupValue::Host(ExternLookupHostValue::new(
-                    ExternLookupHostValueKind::Def,
-                    def_id.stable_id(),
-                )),
-                ExternLookupValue::String(requested_name.to_string().into_boxed_str()),
-            ]);
+                &mut id_host,
+                &mut rows,
+                def_filter,
+            );
         }
+    });
+    Ok(rows.into_iter().collect())
+}
+
+fn collect_exact_name_rows_in_module(
+    module: hir::Module,
+    requested_name: &str,
+    db: &ide::RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+    id_host: &mut DeterministicRaHost,
+    rows: &mut BTreeSet<Vec<ExternLookupValue>>,
+    def_filter: Option<DefId>,
+) {
+    for def in module.declarations(db) {
+        push_exact_name_row(
+            def,
+            requested_name,
+            db,
+            vfs,
+            workspace_root,
+            lookup_defs,
+            lookup_spans,
+            id_host,
+            rows,
+            def_filter,
+        );
+        match def {
+            ModuleDef::Module(child) => collect_exact_name_rows_in_module(
+                child,
+                requested_name,
+                db,
+                vfs,
+                workspace_root,
+                lookup_defs,
+                lookup_spans,
+                id_host,
+                rows,
+                def_filter,
+            ),
+            ModuleDef::Trait(trait_def) => {
+                for assoc in trait_def.items(db) {
+                    if let AssocItem::Function(function) = assoc {
+                        push_exact_name_row(
+                            ModuleDef::Function(function),
+                            requested_name,
+                            db,
+                            vfs,
+                            workspace_root,
+                            lookup_defs,
+                            lookup_spans,
+                            id_host,
+                            rows,
+                            def_filter,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for impl_def in module.impl_defs(db) {
+        for assoc in impl_def.items(db) {
+            if let AssocItem::Function(function) = assoc {
+                push_exact_name_row(
+                    ModuleDef::Function(function),
+                    requested_name,
+                    db,
+                    vfs,
+                    workspace_root,
+                    lookup_defs,
+                    lookup_spans,
+                    id_host,
+                    rows,
+                    def_filter,
+                );
+            }
+        }
+    }
+}
+
+fn push_exact_name_row(
+    def: ModuleDef,
+    requested_name: &str,
+    db: &ide::RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+    id_host: &mut DeterministicRaHost,
+    rows: &mut BTreeSet<Vec<ExternLookupValue>>,
+    def_filter: Option<DefId>,
+) {
+    if def
+        .name(db)
+        .is_none_or(|name| name.display(db, syntax::Edition::CURRENT).to_string() != requested_name)
+    {
+        return;
+    }
+    let Some(def_id) = ensure_lookup_source_module_def(
+        db,
+        vfs,
+        workspace_root,
+        lookup_defs,
+        lookup_spans,
+        id_host,
+        def,
+    ) else {
+        return;
     };
-    collect_symbol_rows(Query::new(requested_name.to_string()), false);
-    collect_symbol_rows(Query::new(requested_name.to_string()), true);
-    Ok(symbol_rows.into_iter().collect())
+    if def_filter.is_some_and(|expected| expected != def_id) {
+        return;
+    }
+    rows.insert(vec![
+        ExternLookupValue::Host(ExternLookupHostValue::new(
+            ExternLookupHostValueKind::Def,
+            def_id.stable_id(),
+        )),
+        ExternLookupValue::String(requested_name.to_string().into_boxed_str()),
+    ]);
 }

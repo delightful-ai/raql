@@ -388,7 +388,7 @@ pub(crate) fn collect_lookup_callers_for_function(
                 let Some(name_ref) = reference.name.as_name_ref().cloned() else {
                     continue;
                 };
-                let Some(caller_def) = lookup_callable_owner_def(
+                let Some((caller_def, site_range, dispatch)) = lookup_incoming_callsite(
                     db,
                     vfs,
                     workspace_root,
@@ -396,53 +396,97 @@ pub(crate) fn collect_lookup_callers_for_function(
                     lookup_defs,
                     lookup_spans,
                     id_host,
-                    name_ref.syntax().clone(),
+                    &name_ref,
                     editioned.editioned_file_id(db),
                     &local,
+                    function,
                 ) else {
                     continue;
                 };
-                let Some(callable) = name_ref
-                    .syntax()
-                    .ancestors()
-                    .find_map(ast::CallableExpr::cast)
-                else {
-                    continue;
-                };
-                match callable {
-                    ast::CallableExpr::MethodCall(method_call) => {
-                        push_lookup_call_edge_row(
-                            lookup_spans,
-                            id_host,
-                            rows,
-                            caller_def,
-                            callee_def,
-                            editioned.editioned_file_id(db),
-                            &local,
-                            method_call.syntax().text_range(),
-                            method_dispatch_kind(sema, &method_call, function, db),
-                            filters,
-                        );
-                    }
-                    ast::CallableExpr::Call(call) => {
-                        push_lookup_call_edge_row(
-                            lookup_spans,
-                            id_host,
-                            rows,
-                            caller_def,
-                            callee_def,
-                            editioned.editioned_file_id(db),
-                            &local,
-                            call.syntax().text_range(),
-                            crate::DispatchKind::Direct,
-                            filters,
-                        );
-                    }
-                }
+                push_lookup_call_edge_row(
+                    lookup_spans,
+                    id_host,
+                    rows,
+                    caller_def,
+                    callee_def,
+                    editioned.editioned_file_id(db),
+                    &local,
+                    site_range,
+                    dispatch,
+                    filters,
+                );
             }
         }
     }
     true
+}
+
+fn lookup_incoming_callsite(
+    db: &ide::RootDatabase,
+    vfs: &vfs::Vfs,
+    workspace_root: &Path,
+    sema: &hir::Semantics<'_, ide::RootDatabase>,
+    lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
+    lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
+    id_host: &mut DeterministicRaHost,
+    name_ref: &ast::NameRef,
+    file_id: span::EditionedFileId,
+    local: &LocalFile,
+    callee_function: hir::Function,
+) -> Option<(DefId, syntax::TextRange, crate::DispatchKind)> {
+    let mut callable = None::<ast::CallableExpr>;
+    for ancestor in sema.ancestors_with_macros(name_ref.syntax().clone()) {
+        if callable.is_none() {
+            callable = ast::CallableExpr::cast(ancestor.clone());
+        }
+        if let Some(closure) = ast::ClosureExpr::cast(ancestor.clone()) {
+            let caller_def = ensure_lookup_synthetic_callable_def(
+                lookup_defs,
+                lookup_spans,
+                id_host,
+                "closure",
+                closure.syntax(),
+                file_id,
+                local,
+            )?;
+            return classify_incoming_callable(callable?, caller_def, sema, callee_function, db);
+        }
+        if let Some(ast_fn) = ast::Fn::cast(ancestor) {
+            let function = sema.to_def(&ast_fn)?;
+            let caller_def = ensure_lookup_function_def(
+                db,
+                vfs,
+                workspace_root,
+                lookup_defs,
+                lookup_spans,
+                id_host,
+                function,
+            )?;
+            return classify_incoming_callable(callable?, caller_def, sema, callee_function, db);
+        }
+    }
+    None
+}
+
+fn classify_incoming_callable(
+    callable: ast::CallableExpr,
+    caller_def: DefId,
+    sema: &hir::Semantics<'_, ide::RootDatabase>,
+    callee_function: hir::Function,
+    db: &ide::RootDatabase,
+) -> Option<(DefId, syntax::TextRange, crate::DispatchKind)> {
+    match callable {
+        ast::CallableExpr::MethodCall(method_call) => Some((
+            caller_def,
+            method_call.syntax().text_range(),
+            method_dispatch_kind(sema, &method_call, callee_function, db),
+        )),
+        ast::CallableExpr::Call(call) => Some((
+            caller_def,
+            call.syntax().text_range(),
+            crate::DispatchKind::Direct,
+        )),
+    }
 }
 
 pub(crate) fn lookup_callable_owner_def(
