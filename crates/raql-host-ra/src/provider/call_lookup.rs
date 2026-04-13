@@ -388,58 +388,6 @@ pub(crate) fn collect_lookup_callers_for_function(
                 let Some(name_ref) = reference.name.as_name_ref().cloned() else {
                     continue;
                 };
-                if let Some(method_call) = name_ref
-                    .syntax()
-                    .ancestors()
-                    .find_map(ast::MethodCallExpr::cast)
-                {
-                    let Some(caller_def) = lookup_callable_owner_def(
-                        db,
-                        vfs,
-                        workspace_root,
-                        sema,
-                        lookup_defs,
-                        lookup_spans,
-                        id_host,
-                        name_ref.syntax().clone(),
-                        editioned.editioned_file_id(db),
-                        &local,
-                    ) else {
-                        continue;
-                    };
-                    push_lookup_call_edge_row(
-                        lookup_spans,
-                        id_host,
-                        rows,
-                        caller_def,
-                        callee_def,
-                        editioned.editioned_file_id(db),
-                        &local,
-                        method_call.syntax().text_range(),
-                        method_dispatch_kind(sema, &method_call, function, db),
-                        filters,
-                    );
-                    continue;
-                }
-                let path_segment: Option<ast::PathSegment> = name_ref
-                    .syntax()
-                    .ancestors()
-                    .find_map(ast::PathSegment::cast);
-                let Some(path) = path_segment.map(|segment| segment.parent_path()) else {
-                    continue;
-                };
-                let Some(path_parent) = path.syntax().parent() else {
-                    continue;
-                };
-                let Some(path_expr) = ast::PathExpr::cast(path_parent) else {
-                    continue;
-                };
-                let Some(call_parent) = path_expr.syntax().parent() else {
-                    continue;
-                };
-                let Some(call) = ast::CallExpr::cast(call_parent) else {
-                    continue;
-                };
                 let Some(caller_def) = lookup_callable_owner_def(
                     db,
                     vfs,
@@ -454,18 +402,43 @@ pub(crate) fn collect_lookup_callers_for_function(
                 ) else {
                     continue;
                 };
-                push_lookup_call_edge_row(
-                    lookup_spans,
-                    id_host,
-                    rows,
-                    caller_def,
-                    callee_def,
-                    editioned.editioned_file_id(db),
-                    &local,
-                    call.syntax().text_range(),
-                    crate::DispatchKind::Direct,
-                    filters,
-                );
+                let Some(callable) = name_ref
+                    .syntax()
+                    .ancestors()
+                    .find_map(ast::CallableExpr::cast)
+                else {
+                    continue;
+                };
+                match callable {
+                    ast::CallableExpr::MethodCall(method_call) => {
+                        push_lookup_call_edge_row(
+                            lookup_spans,
+                            id_host,
+                            rows,
+                            caller_def,
+                            callee_def,
+                            editioned.editioned_file_id(db),
+                            &local,
+                            method_call.syntax().text_range(),
+                            method_dispatch_kind(sema, &method_call, function, db),
+                            filters,
+                        );
+                    }
+                    ast::CallableExpr::Call(call) => {
+                        push_lookup_call_edge_row(
+                            lookup_spans,
+                            id_host,
+                            rows,
+                            caller_def,
+                            callee_def,
+                            editioned.editioned_file_id(db),
+                            &local,
+                            call.syntax().text_range(),
+                            crate::DispatchKind::Direct,
+                            filters,
+                        );
+                    }
+                }
             }
         }
     }
