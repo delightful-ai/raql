@@ -401,12 +401,6 @@ pub(crate) fn collect_lookup_callers_for_function(
                     .ancestors()
                     .find_map(ast::MethodCallExpr::cast)
                 {
-                    let Some(resolved) = sema.resolve_method_call(&method_call) else {
-                        continue;
-                    };
-                    if resolved != function {
-                        continue;
-                    }
                     let Some(caller_def) = lookup_callable_owner_def(
                         db,
                         vfs,
@@ -430,7 +424,7 @@ pub(crate) fn collect_lookup_callers_for_function(
                         editioned.editioned_file_id(db),
                         &local,
                         method_call.syntax().text_range(),
-                        method_dispatch_kind(sema, &method_call, resolved, db),
+                        method_dispatch_kind(sema, &method_call, function, db),
                         filters,
                     );
                     continue;
@@ -454,15 +448,6 @@ pub(crate) fn collect_lookup_callers_for_function(
                 let Some(call) = ast::CallExpr::cast(call_parent) else {
                     continue;
                 };
-                let Some(resolved) = sema.resolve_path(&path).and_then(|resolved| match resolved {
-                    hir::PathResolution::Def(ModuleDef::Function(resolved)) => Some(resolved),
-                    _ => None,
-                }) else {
-                    continue;
-                };
-                if resolved != function {
-                    continue;
-                }
                 let Some(caller_def) = lookup_callable_owner_def(
                     db,
                     vfs,
