@@ -24,10 +24,8 @@ use vfs::{AbsPathBuf, VfsPath};
 
 use crate::capability::{day_one_supported_capabilities, supports_day_one_capability};
 use crate::lazy_runtime::LazyRaRuntime;
-use crate::provider::calls::{
-    CallGraphProvider, extract_call_edges as provider_extract_call_edges,
-    lookup_call_edge_rows as provider_lookup_call_edge_rows,
-};
+use crate::provider::call_lookup::lookup_call_edge_rows as provider_lookup_call_edge_rows;
+use crate::provider::calls::{CallGraphProvider, extract_call_edges as provider_extract_call_edges};
 use crate::provider::core_index::CoreLookupIndex;
 use crate::provider::def_name::lookup_def_name_rows;
 use crate::provider::defs::{
