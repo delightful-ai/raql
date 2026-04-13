@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
-use base_db::SourceDatabase;
 use hir::{HasSource, ModuleDef};
-use ide_db::search::ReferenceCategory;
+use ide_db::{defs::Definition, search::ReferenceCategory};
 use raql_host::{
     ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
     SpanKey,
@@ -345,26 +344,7 @@ pub(crate) fn collect_lookup_callers_for_function(
     callee_def: DefId,
     filters: &CallLookupFilters,
 ) -> bool {
-    let function_krate = function.module(db).krate(db);
-    let mut search_files = Vec::new();
-    for rev_dep in function_krate.transitive_reverse_dependencies(db) {
-        let root_file = rev_dep.root_file(db);
-        let source_root_id = db.file_source_root(root_file).source_root_id(db);
-        let source_root = db.source_root(source_root_id).source_root(db);
-        if source_root.is_library {
-            continue;
-        }
-        search_files.extend(
-            source_root
-                .iter()
-                .map(|file_id| base_db::EditionedFileId::new(db, file_id, rev_dep.edition(db), rev_dep.into())),
-        );
-    }
-    let scope = ide_db::search::SearchScope::files(&search_files);
-    let mut pending_references = vec![ide_db::defs::Definition::Function(function)
-        .usages(sema)
-        .in_scope(&scope)
-        .all()];
+    let mut pending_references = vec![Definition::Function(function).usages(sema).all()];
     let mut seen_import_renames = BTreeSet::new();
     while let Some(references) = pending_references.pop() {
         for (editioned, file_references) in references {
@@ -397,10 +377,9 @@ pub(crate) fn collect_lookup_callers_for_function(
                     );
                     if seen_import_renames.insert(rename_key) {
                         pending_references.push(
-                            ide_db::defs::Definition::Function(function)
+                            Definition::Function(function)
                                 .usages(sema)
                                 .with_rename(Some(&rename))
-                                .in_scope(&scope)
                                 .all(),
                         );
                     }
