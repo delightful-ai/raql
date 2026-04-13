@@ -1,14 +1,9 @@
-use base_db::{RootQueryDb, SourceDatabase};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Instant;
 
-use hir::{HasSource, HasVisibility, ModuleDef};
-use ide_db::{
-    defs::Definition,
-    search::{ReferenceCategory, SearchScope},
-    EditionedFileId,
-};
+use hir::{HasSource, ModuleDef};
+use ide_db::{defs::Definition, search::ReferenceCategory};
 use raql_host::{
     ExternLookupHostValue, ExternLookupHostValueKind, ExternLookupRequest, ExternLookupValue,
     SpanKey,
@@ -349,9 +344,7 @@ pub(crate) fn collect_lookup_callers_for_function(
     callee_def: DefId,
     filters: &CallLookupFilters,
 ) -> bool {
-    let workspace_scope = function_usage_scope(db, function);
-    let mut pending_references =
-        vec![Definition::Function(function).usages(sema).in_scope(&workspace_scope).all()];
+    let mut pending_references = vec![Definition::Function(function).usages(sema).all()];
     let mut seen_import_renames = BTreeSet::new();
     while let Some(references) = pending_references.pop() {
         for (editioned, file_references) in references {
@@ -386,7 +379,6 @@ pub(crate) fn collect_lookup_callers_for_function(
                         pending_references.push(
                             Definition::Function(function)
                                 .usages(sema)
-                                .in_scope(&workspace_scope)
                                 .with_rename(Some(&rename))
                                 .all(),
                         );
@@ -478,67 +470,6 @@ pub(crate) fn collect_lookup_callers_for_function(
         }
     }
     true
-}
-
-fn workspace_local_search_scope(db: &ide::RootDatabase) -> SearchScope {
-    let mut files = Vec::new();
-    for &krate in db.all_crates().iter() {
-        let crate_data = krate.data(db);
-        let source_root_id = db.file_source_root(crate_data.root_file_id).source_root_id(db);
-        let source_root = db.source_root(source_root_id).source_root(db);
-        if source_root.is_library {
-            continue;
-        }
-        files.extend(
-            source_root
-                .iter()
-                .map(|file_id| EditionedFileId::new(db, file_id, crate_data.edition, krate)),
-        );
-    }
-    SearchScope::files(&files)
-}
-
-fn function_usage_scope(db: &ide::RootDatabase, function: hir::Function) -> SearchScope {
-    let local_scope = workspace_local_search_scope(db);
-    let module = function.module(db);
-    let semantic_scope = match function.visibility(db) {
-        hir::Visibility::Module(module, _) => SearchScope::module_and_children(db, module.into()),
-        hir::Visibility::PubCrate(krate) => crate_search_scope(db, krate.into()),
-        hir::Visibility::Public => reverse_dependency_search_scope(db, module.krate(db)),
-    };
-    semantic_scope.intersection(&local_scope)
-}
-
-fn crate_search_scope(db: &ide::RootDatabase, krate: hir::Crate) -> SearchScope {
-    let root_file = krate.root_file(db);
-    let source_root_id = db.file_source_root(root_file).source_root_id(db);
-    let source_root = db.source_root(source_root_id).source_root(db);
-    let files = source_root
-        .iter()
-        .filter_map(|file_id| {
-            (!source_root.is_library)
-                .then(|| EditionedFileId::new(db, file_id, krate.edition(db), krate.into()))
-        })
-        .collect::<Vec<_>>();
-    SearchScope::files(&files)
-}
-
-fn reverse_dependency_search_scope(db: &ide::RootDatabase, krate: hir::Crate) -> SearchScope {
-    let mut files = Vec::new();
-    for rev_dep in krate.transitive_reverse_dependencies(db) {
-        let root_file = rev_dep.root_file(db);
-        let source_root_id = db.file_source_root(root_file).source_root_id(db);
-        let source_root = db.source_root(source_root_id).source_root(db);
-        if source_root.is_library {
-            continue;
-        }
-        files.extend(
-            source_root
-                .iter()
-                .map(|file_id| EditionedFileId::new(db, file_id, rev_dep.edition(db), rev_dep.into())),
-        );
-    }
-    SearchScope::files(&files)
 }
 
 pub(crate) fn lookup_callable_owner_def(
