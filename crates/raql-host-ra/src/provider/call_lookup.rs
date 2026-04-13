@@ -252,7 +252,7 @@ pub(crate) fn collect_lookup_call_edges_for_function(
             lookup_defs,
             lookup_spans,
             id_host,
-            callable.syntax(),
+            callable.syntax().clone(),
             editioned.editioned_file_id(db),
             &local,
         );
@@ -401,7 +401,7 @@ pub(crate) fn collect_lookup_callers_for_function(
                         lookup_defs,
                         lookup_spans,
                         id_host,
-                        method_call.syntax(),
+                        name_ref.syntax().clone(),
                         editioned.editioned_file_id(db),
                         &local,
                     ) else {
@@ -448,7 +448,7 @@ pub(crate) fn collect_lookup_callers_for_function(
                     lookup_defs,
                     lookup_spans,
                     id_host,
-                    call.syntax(),
+                    name_ref.syntax().clone(),
                     editioned.editioned_file_id(db),
                     &local,
                 ) else {
@@ -480,11 +480,11 @@ pub(crate) fn lookup_callable_owner_def(
     lookup_defs: &mut BTreeMap<DefId, LookupDefRecord>,
     lookup_spans: &mut BTreeMap<SpanId, SpanKey>,
     id_host: &mut DeterministicRaHost,
-    syntax: &syntax::SyntaxNode,
+    node: syntax::SyntaxNode,
     file_id: span::EditionedFileId,
     local: &LocalFile,
 ) -> Option<DefId> {
-    for ancestor in syntax.ancestors().skip(1) {
+    for ancestor in sema.ancestors_with_macros(node) {
         if let Some(closure) = ast::ClosureExpr::cast(ancestor.clone()) {
             return ensure_lookup_synthetic_callable_def(
                 lookup_defs,
