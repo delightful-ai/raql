@@ -106,7 +106,10 @@ fn run_p2(db: &RootDatabase, workspace_root: &Path, name: &str) -> (usize, usize
             OperatorId::CanonicalPathOfDef,
             OperatorId::HandleOfDef,
         ] {
-            rows += ops.invoke(operator, &[def.clone()]).expect("projection succeeds").len();
+            rows += ops
+                .invoke(operator, std::slice::from_ref(&def))
+                .expect("projection succeeds")
+                .len();
         }
         let spans = ops.invoke(OperatorId::SpanOfDef, &[def]).expect("def_span succeeds");
         rows += spans.len();

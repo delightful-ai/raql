@@ -106,7 +106,7 @@ mod tests {
             for mode in predicate.modes {
                 assert_eq!(mode.pattern.len(), predicate.arity());
                 assert!(
-                    pure_filter || mode.pattern.iter().any(|b| *b == Binding::Free),
+                    pure_filter || mode.pattern.contains(&Binding::Free),
                     "`{}` declares an all-bound mode alongside freer modes — \
                      a redundant membership test",
                     predicate.name,

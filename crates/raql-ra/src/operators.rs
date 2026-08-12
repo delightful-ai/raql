@@ -172,7 +172,7 @@ fn no_inputs(operator: OperatorId, inputs: &[Value]) -> Result<(), OperatorError
     }
 }
 
-fn one_string<'i>(operator: OperatorId, inputs: &'i [Value]) -> Result<&'i str, OperatorError> {
+fn one_string(operator: OperatorId, inputs: &[Value]) -> Result<&str, OperatorError> {
     match inputs {
         [Value::String(s)] => Ok(s),
         _ => Err(OperatorError::InvalidInput { operator, expected: "(String)" }),

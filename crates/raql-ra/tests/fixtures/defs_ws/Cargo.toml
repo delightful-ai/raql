@@ -1,7 +1,7 @@
 [package]
 name = "defs_ws"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 # A non-member path dependency: present in the crate graph but not

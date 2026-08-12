@@ -68,6 +68,13 @@ pub fn plan(
 /// A binding pattern over a predicate's arguments: `true` = bound.
 type Pattern = Vec<bool>;
 
+/// A derived predicate specialization: predicate id + demanded pattern.
+type SpecKey = (usize, Pattern);
+
+/// Exact transitive cost, scan usage, and demand-graph edges for one
+/// specialization (computed by the [`Planner::finalize`] fixpoint).
+type SpecInfo = (CostClass, bool, Vec<SpecKey>);
+
 // ---------------------------------------------------------------------
 // Validation (defensive: the lang layer typechecks first)
 // ---------------------------------------------------------------------
@@ -167,7 +174,7 @@ fn infer_supports(
         }
         // Greatest fixpoint: remove unsupportable patterns until stable.
         loop {
-            let mut removals: Vec<(usize, Pattern)> = Vec::new();
+            let mut removals: Vec<SpecKey> = Vec::new();
             for &p in &scc {
                 for pattern in &supports[p] {
                     if !derived_orderable(program, catalog, &supports, p, pattern) {
@@ -460,7 +467,7 @@ impl Search<'_> {
             }
         }
         let mut pool = if non_scans.is_empty() { scans } else { non_scans };
-        pool.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        pool.sort_by_key(|a| (a.0, a.1, a.2));
 
         if pool.is_empty() {
             let depth = self.placed.len();
@@ -568,7 +575,7 @@ impl Search<'_> {
                     .zip(&flags)
                     .all(|(binding, bound)| *binding == Binding::Free || *bound);
                 let negated_ok = !goal.negated || flags.iter().all(|b| *b);
-                (required_bound && negated_ok).then(|| Candidate {
+                (required_bound && negated_ok).then_some(Candidate {
                     access: Access::Builtin { id: *id },
                     cost: CostClass::C0,
                     is_scan: false,
@@ -599,10 +606,10 @@ struct Planner<'p> {
     deny_scans: bool,
     supports: Vec<BTreeSet<Pattern>>,
     /// `None` marks an in-progress (recursive) specialization.
-    specs: BTreeMap<(usize, Pattern), Option<Vec<PlannedRule>>>,
+    specs: BTreeMap<SpecKey, Option<Vec<PlannedRule>>>,
     /// Specializations demanded from under a negation (§8.5: must end up
     /// scan-free).
-    negated_demands: BTreeSet<(usize, Pattern)>,
+    negated_demands: BTreeSet<SpecKey>,
 }
 
 impl Planner<'_> {
@@ -671,7 +678,7 @@ impl Planner<'_> {
 
     fn finalize(self, query: PlannedRule) -> Result<PhysicalPlan, PlanError> {
         let program = self.program;
-        let specs: BTreeMap<(usize, Pattern), Vec<PlannedRule>> = self
+        let specs: BTreeMap<SpecKey, Vec<PlannedRule>> = self
             .specs
             .into_iter()
             .map(|(key, draft)| (key, draft.expect("every demanded specialization is planned")))
@@ -680,7 +687,7 @@ impl Planner<'_> {
         // Fixpoint over the demand graph: exact max cost and transitive
         // scan usage per specialization (max/or are monotone, so
         // iteration converges even through recursion).
-        let local = |rules: &[PlannedRule]| -> (CostClass, bool, Vec<(usize, Pattern)>) {
+        let local = |rules: &[PlannedRule]| -> SpecInfo {
             let mut cost = CostClass::C0;
             let mut has_scan = false;
             let mut refs = Vec::new();
@@ -697,9 +704,9 @@ impl Planner<'_> {
             (cost, has_scan, refs)
         };
 
-        let mut cost: BTreeMap<&(usize, Pattern), CostClass> = BTreeMap::new();
-        let mut scan_flag: BTreeMap<&(usize, Pattern), bool> = BTreeMap::new();
-        let locals: BTreeMap<&(usize, Pattern), (CostClass, bool, Vec<(usize, Pattern)>)> =
+        let mut cost: BTreeMap<&SpecKey, CostClass> = BTreeMap::new();
+        let mut scan_flag: BTreeMap<&SpecKey, bool> = BTreeMap::new();
+        let locals: BTreeMap<&SpecKey, SpecInfo> =
             specs.iter().map(|(key, rules)| (key, local(rules))).collect();
         for (key, (c, s, _)) in &locals {
             cost.insert(key, *c);
@@ -743,7 +750,7 @@ impl Planner<'_> {
         // depth-first through the demand graph, deduplicated by name.
         let mut scans: Vec<ScanUse> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut visited: BTreeSet<&(usize, Pattern)> = BTreeSet::new();
+        let mut visited: BTreeSet<&SpecKey> = BTreeSet::new();
         collect_scans(
             program,
             &specs,
@@ -1052,12 +1059,12 @@ fn def_seed_predicates(catalog: &Catalog) -> Vec<&'static str> {
 #[allow(clippy::too_many_arguments)]
 fn collect_scans<'s>(
     program: &Program,
-    specs: &'s BTreeMap<(usize, Pattern), Vec<PlannedRule>>,
-    cost: &BTreeMap<&(usize, Pattern), CostClass>,
+    specs: &'s BTreeMap<SpecKey, Vec<PlannedRule>>,
+    cost: &BTreeMap<&SpecKey, CostClass>,
     rule: &PlannedRule,
     scans: &mut Vec<ScanUse>,
     seen: &mut BTreeSet<String>,
-    visited: &mut BTreeSet<&'s (usize, Pattern)>,
+    visited: &mut BTreeSet<&'s SpecKey>,
 ) {
     for goal in &rule.goals {
         match &goal.access {
