@@ -283,6 +283,8 @@ Costs are honest bands for planning and explain output, not measurements.
 
 Per §4.3: `ra_exact`, `ra_resolved` (with named caveats, e.g. `unresolved_callsites_absent`, `macro_expansion_spans`), `disabled`.
 
+An individual access path MAY carry additional named caveats of its own beyond the predicate's class, when that path's index cannot surface part of the predicate's domain (e.g. `def_name(-,+)`'s `fields_not_in_symbol_index`: the symbol index never surfaces fields, so a field is seeded via its owner, not by name). Mode caveats appear in capabilities output next to their mode.
+
 ### 8.5 Scans are explicit access paths
 
 - A scan is a declared mode like any other, marked `scan` and carrying `C3`/`C4`. It is never inferred and never a fallback: the old engine behavior (one unplannable goal anywhere silently flips the predicate to bulk materialization — `raql-engine/src/lib.rs:639,697` today) is deleted.
@@ -294,11 +296,13 @@ Per §4.3: `ra_exact`, `ra_resolved` (with named caveats, e.g. `unresolved_calls
   ```
 
   i.e. enumerate function defs (def-map traversal), expand each via the *outgoing* operator (body-local, narrow Salsa deps). Scan composition **MUST NOT** route through reference search (`caller`) — the wide direction is never the enumerator.
-- Negated goals **MUST NOT** contain scans in v0: after demand propagation, a goal under `not` must have a non-scan satisfiable mode. (Revisit once scan latency is characterized.)
+- Negated goals **MUST NOT** contain scans in v0: after demand propagation, a goal under `not` must have a non-scan satisfiable mode, and a demanded specialization reached from under `not` must be transitively scan-free (violation: `RAQL0311` at plan time). (Revisit once scan latency is characterized.)
 
 ### 8.6 v0 catalog (normative)
 
 The minimal vertical slice (build-sequence step 3). Types: `Def`, `Span`, `File`, `Position`, `Name = string`, enums per `std.raql`.
+
+"Workspace" scope for scans and seeds is RA's own local/library partition (`CrateOrigin::is_local`): workspace members **and** path dependencies — editable code — never registry/git dependencies or the sysroot. The `def_name(-,+)` seed and the enumeration scans MUST agree on this domain.
 
 | Predicate | Modes (cost) | Operator (RA primitives) | Completeness |
 |---|---|---|---|
@@ -377,7 +381,7 @@ error[RAQL0301]: no satisfiable access path for `call_edge(Caller, Callee, Site,
   fix: bind Caller or Callee first (e.g. via def_name/def_at), or allow scans
 ```
 
-`RAQL0310` (scan denied) and the capability error for `disabled` predicates follow the same shape.
+`RAQL0310` (scan denied) and the capability error for `disabled` predicates follow the same shape. Code assignments within the planning family (implemented in `raql-plan/src/error.rs`): `RAQL0302` disabled predicate, `RAQL0303` declared derived mode not inferable (§9.1), `RAQL0304` malformed planner input, `RAQL0311` scan under negation (§8.5).
 
 ### 10.4 Explain
 

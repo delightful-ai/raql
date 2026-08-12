@@ -15,13 +15,24 @@
 
 mod capabilities;
 mod catalog;
+mod error;
+mod logic;
 mod mode;
 mod operator;
+mod plan;
+mod planner;
 mod predicate;
 mod schema;
 
 pub use catalog::{Catalog, v0_catalog};
+pub use error::{ModeAlternative, PlanError, UnsatisfiableGoal};
+pub use logic::{
+    BuiltinDef, BuiltinId, DerivedDef, DerivedId, Goal, GoalRef, InputDef, InputId, Program,
+    Rule, Term, Var,
+};
 pub use mode::{AccessKind, Binding, CostClass, ModeDef};
 pub use operator::{OperatorId, OperatorSet};
+pub use plan::{Access, PhysicalPlan, PlannedGoal, PlannedRule, ScanUse, Specialization};
+pub use planner::{PlanOptions, plan};
 pub use predicate::{Completeness, PredicateDef};
 pub use schema::{ArgDef, ArgType};
