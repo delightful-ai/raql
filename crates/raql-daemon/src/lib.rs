@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use raql_compiler::{PlannedProgram, plan, required_extern_capabilities, resolve, typecheck};
-use raql_engine::{EvalResult, RuntimeValue};
 use raql_host::MissingCapabilitiesError;
 use raql_host_ra::daemon::{DaemonWorkspace, WarmupSnapshot, resolve_workspace_root};
+use raql_host_ra::{ProjectedRunResult, ProjectedValue};
 use raql_protocol::{
     DaemonEvent, DaemonRequest, DaemonState, ErrorEvent, PROTOCOL_VERSION, PlanSummary,
     ProtocolValue, RelationRows, RunNote, RunRequest, RunResult, SessionEvent,
@@ -792,13 +792,13 @@ fn plan_summary(program_path: &Utf8Path, planned: &PlannedProgram) -> PlanSummar
         program_path: program_path.as_str().to_string(),
         predicates: planned.predicates().len(),
         facts: planned.facts().len(),
-        rules: planned.planned_rules().len(),
+        rules: planned.rules().len(),
         strata,
         sccs: planned.sccs().len(),
     }
 }
 
-fn protocol_run_result(result: EvalResult) -> RunResult {
+fn protocol_run_result(result: ProjectedRunResult) -> RunResult {
     let mut relations = BTreeMap::new();
     for (name, rows) in result.relations {
         relations.insert(
@@ -830,19 +830,18 @@ fn protocol_run_result(result: EvalResult) -> RunResult {
     }
 }
 
-fn protocol_value(value: RuntimeValue) -> ProtocolValue {
+/// Projected values map to the wire vocabulary one-for-one: everything
+/// that leaves the host is already plain data (SPEC §13.1), so there is no
+/// host-identity variant to carry.
+fn protocol_value(value: ProjectedValue) -> ProtocolValue {
     match value {
-        RuntimeValue::Int(v) => ProtocolValue::Int(v),
-        RuntimeValue::String(v) => ProtocolValue::String(v),
-        RuntimeValue::Bool(v) => ProtocolValue::Bool(v),
-        RuntimeValue::Enum { name, variant } => ProtocolValue::Enum { name, variant },
-        RuntimeValue::Host { kind, id } => ProtocolValue::Host {
-            kind: kind.label().to_string(),
-            id,
-        },
-        RuntimeValue::None => ProtocolValue::None,
-        RuntimeValue::Some(inner) => ProtocolValue::Some(Box::new(protocol_value(*inner))),
-        RuntimeValue::List(items) => {
+        ProjectedValue::Int(v) => ProtocolValue::Int(v),
+        ProjectedValue::String(v) => ProtocolValue::String(v),
+        ProjectedValue::Bool(v) => ProtocolValue::Bool(v),
+        ProjectedValue::Enum { name, variant } => ProtocolValue::Enum { name, variant },
+        ProjectedValue::None => ProtocolValue::None,
+        ProjectedValue::Some(inner) => ProtocolValue::Some(Box::new(protocol_value(*inner))),
+        ProjectedValue::List(items) => {
             ProtocolValue::List(items.into_iter().map(protocol_value).collect())
         }
     }
@@ -1102,8 +1101,8 @@ edition = "2021"
             .expect("second load_and_plan");
 
         assert_eq!(
-            first.planned_rules().len(),
-            second.planned_rules().len(),
+            first.rules().len(),
+            second.rules().len(),
             "cached plan should match the original planned program"
         );
         assert_eq!(cache.entries.len(), 1, "query should occupy one cache entry");

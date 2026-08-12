@@ -215,7 +215,7 @@ fn plan_summary_from_planned(program_path: &Utf8Path, planned: &PlannedProgram) 
         program_path: program_path.as_str().to_string(),
         predicates: planned.predicates().len(),
         facts: planned.facts().len(),
-        rules: planned.planned_rules().len(),
+        rules: planned.rules().len(),
         strata,
         sccs: planned.sccs().len(),
     }

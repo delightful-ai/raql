@@ -8,16 +8,14 @@ doctest = false
 
 [dependencies]
 raql-host = { path = "../raql-host" }
-raql-ir = { path = "../raql-ir" }
 raql-engine = { path = "../raql-engine" }
 raql-compiler = { path = "../raql-compiler" }
+raql-ra = { path = "../raql-ra" }
 
 # rust-analyzer crates
 ide.workspace = true
 ide-db.workspace = true
 hir.workspace = true
-syntax.workspace = true
-span.workspace = true
 vfs.workspace = true
 base-db.workspace = true
 load-cargo.workspace = true
@@ -25,8 +23,6 @@ project-model.workspace = true
 vfs-notify.workspace = true
 
 # utilities
-line-index.workspace = true
-rustc-hash.workspace = true
 thiserror.workspace = true
 camino.workspace = true
 toml = "0.8"

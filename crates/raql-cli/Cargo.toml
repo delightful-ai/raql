@@ -9,9 +9,6 @@ doctest = false
 [dependencies]
 raql-syntax = { path = "../raql-syntax" }
 raql-compiler = { path = "../raql-compiler" }
-raql-engine = { path = "../raql-engine" }
-raql-host = { path = "../raql-host" }
-raql-host-ra = { path = "../raql-host-ra" }
 raql-daemon = { path = "../raql-daemon" }
 raql-protocol = { path = "../raql-protocol" }
 

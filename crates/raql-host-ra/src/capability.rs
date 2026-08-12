@@ -1,62 +1,43 @@
+//! The catalog extern predicates this host can answer.
+//!
+//! A capability is a catalog name (SPEC §8.1), and the set below is
+//! exactly the set `raql_ra::SnapshotOperators` implements operators for.
+//! Catalog entries whose completeness is `Disabled` are absent on purpose:
+//! demanding one fails at plan time (RAQL0302), and this gate is the
+//! daemon's backstop for anything that reaches execution anyway.
+//!
+//! When `raql-ra` grows an operator family, add its catalog name here in
+//! the same change — a supported set wider than the operator dispatch is a
+//! lie the daemon would report to clients.
+
 use raql_host::{CapabilityId, CapabilitySet};
 
-const DAY_ONE_SUPPORTED_CAPABILITIES: &[&str] = &[
+const SUPPORTED_CATALOG_PREDICATES: &[&str] = &[
+    // Definition identity + projections
     "def",
-    "def_name",
+    "def_at",
     "def_kind",
-    "def_span",
+    "def_name",
     "def_path",
+    "def_span",
+    "fn_def",
+    // Call family
     "call_edge",
-    "method_of",
-    "field",
-    "variant",
-    "method",
-    "trait_method",
-    "implements",
-    "from_impl",
-    "fn_error_type",
-    "fn_return_type",
-    "ty_app",
-    "ty_arg",
-    "ty_ref",
-    "ty_ptr",
-    "ty_tuple",
-    "ty_slice",
-    "ty_param",
-    "ty_prim",
-    "ty_unknown",
-    "typeref_id",
-    "dispatch_str",
-    "call_id",
-    "impl_id",
-    // TODO(ra-native-audit): `search` stays disabled until rebuilt from RA-native symbol/query
-    // search rather than the current legacy name/path token index.
-    // TODO(ra-native-audit): `ref_id`, `compares`, and `writes` stay disabled until rebuilt
-    // from RA-native reference truth rather than the current approximate event summary.
-    // TODO(ra-native-audit): `constructs`, `propagates`, `converts`, and `handles` stay
-    // disabled until rebuilt from RA-native error semantics rather than the current
-    // Result/From-shaped approximation.
-    "node_at",
-    "node_kind",
-    "node_span",
-    "node_parent",
-    "enclosing_control",
-    "node_id",
-    "span_allowed",
-    "is_public",
+    "callee",
+    "caller",
+    // Filters
     "in_test",
+    "is_public",
+    "span_allowed",
+    // Output-boundary predicates
     "handle",
     "span_key",
 ];
 
-pub fn day_one_supported_capabilities() -> CapabilitySet {
-    DAY_ONE_SUPPORTED_CAPABILITIES
+pub fn supported_capabilities() -> CapabilitySet {
+    SUPPORTED_CATALOG_PREDICATES
         .iter()
         .copied()
         .map(CapabilityId::from)
         .collect()
-}
-
-pub fn supports_day_one_capability(predicate: &str) -> bool {
-    DAY_ONE_SUPPORTED_CAPABILITIES.contains(&predicate)
 }
