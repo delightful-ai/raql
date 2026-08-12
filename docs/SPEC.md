@@ -548,3 +548,4 @@ System-level:
 5. **`search` as a predicate** — needs a ranking-determinism contract before re-entering the catalog.
 6. **Resumable scans under edit churn** — future work once `E_CANCELLED` starvation is observed in practice.
 7. **RAQL-program Salsa upgrade** — only if `.raql` programs grow large enough that content-addressed caching thrashes.
+8. **Tracked `raql_callers`** — ide-db's `Definition::usages` is typed over concrete `RootDatabase`, which a dyn-db tracked body cannot name, so `caller` runs as an untracked operator (per-request recompute; §6.2's default). Revisit via an upstream dyn-ification patch or an identity-first reimplementation of reference search, with warm-latency evidence deciding whether tracking is worth it (its dependency set is inherently wide, §6.2).
