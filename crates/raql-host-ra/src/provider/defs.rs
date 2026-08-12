@@ -82,7 +82,7 @@ pub(crate) fn module_def_kind(def: ModuleDef) -> Option<DefKind> {
         ModuleDef::Adt(Adt::Struct(_)) => DefKind::Struct,
         ModuleDef::Adt(Adt::Enum(_)) => DefKind::Enum,
         ModuleDef::Adt(Adt::Union(_)) => DefKind::Union,
-        ModuleDef::Variant(_) => DefKind::Variant,
+        ModuleDef::EnumVariant(_) => DefKind::Variant,
         ModuleDef::Const(_) => DefKind::Const,
         ModuleDef::Static(_) => DefKind::Static,
         ModuleDef::Trait(_) => DefKind::Trait,
@@ -146,7 +146,7 @@ pub(crate) fn module_def_is_public(def: ModuleDef, db: &dyn hir::db::HirDatabase
         ModuleDef::Module(module) => module.visibility(db) == hir::Visibility::Public,
         ModuleDef::Function(function) => function.visibility(db) == hir::Visibility::Public,
         ModuleDef::Adt(adt) => adt.visibility(db) == hir::Visibility::Public,
-        ModuleDef::Variant(variant) => variant.visibility(db) == hir::Visibility::Public,
+        ModuleDef::EnumVariant(variant) => variant.visibility(db) == hir::Visibility::Public,
         ModuleDef::Const(const_) => const_.visibility(db) == hir::Visibility::Public,
         ModuleDef::Static(static_) => static_.visibility(db) == hir::Visibility::Public,
         ModuleDef::Trait(trait_) => trait_.visibility(db) == hir::Visibility::Public,
@@ -163,7 +163,7 @@ pub(crate) fn module_def_in_test(def: ModuleDef, db: &dyn hir::db::HirDatabase) 
             return function.is_test(db) || module_is_test_scope(function.module(db), db);
         }
         ModuleDef::Adt(adt) => adt.module(db),
-        ModuleDef::Variant(variant) => variant.module(db),
+        ModuleDef::EnumVariant(variant) => variant.module(db),
         ModuleDef::Const(const_) => const_.module(db),
         ModuleDef::Static(static_) => static_.module(db),
         ModuleDef::Trait(trait_) => trait_.module(db),
@@ -252,61 +252,61 @@ pub(crate) fn ensure_lookup_source_module_def(
             let range = module
                 .declaration_source_range(db)
                 .unwrap_or_else(|| module.definition_source_range(db));
-            (range.file_id.original_file(db).editioned_file_id(db), range.value)
+            (range.file_id.original_file(db).span_file_id(db), range.value)
         }
         ModuleDef::Function(function) => {
             let source = function.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }
         ModuleDef::Adt(adt) => {
             let source = adt.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }
-        ModuleDef::Variant(variant) => {
+        ModuleDef::EnumVariant(variant) => {
             let source = variant.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }
         ModuleDef::Const(const_) => {
             let source = const_.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }
         ModuleDef::Static(static_) => {
             let source = static_.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }
         ModuleDef::Trait(trait_) => {
             let source = trait_.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }
         ModuleDef::TypeAlias(alias) => {
             let source = alias.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }
         ModuleDef::Macro(mac) => {
             let source = mac.source(db)?;
             (
-                source.file_id.original_file(db).editioned_file_id(db),
+                source.file_id.original_file(db).span_file_id(db),
                 source.value.syntax().text_range(),
             )
         }

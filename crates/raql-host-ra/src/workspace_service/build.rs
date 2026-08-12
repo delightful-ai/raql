@@ -96,7 +96,7 @@ impl<'db> CoreFactsBuilder<'db> {
             Adt::Union(union) => self.insert_union_fields(owner_def, union),
             Adt::Enum(enum_) => {
                 for variant in enum_.variants(self.db) {
-                    let Some(variant_def) = self.register_module_def(ModuleDef::Variant(variant), false) else {
+                    let Some(variant_def) = self.register_module_def(ModuleDef::EnumVariant(variant), false) else {
                         continue;
                     };
                     let variant_name = variant.name(self.db).display(self.db, Edition::CURRENT).to_string();
@@ -119,7 +119,7 @@ impl<'db> CoreFactsBuilder<'db> {
                     self.insert_field(
                         owner_def,
                         name.as_str(),
-                        hir_field.ty(self.db).to_type(self.db),
+                        hir_field.ty(self.db),
                         source_field.ty(),
                     );
                 }
@@ -132,7 +132,7 @@ impl<'db> CoreFactsBuilder<'db> {
                     self.insert_field(
                         owner_def,
                         name.as_str(),
-                        hir_field.ty(self.db).to_type(self.db),
+                        hir_field.ty(self.db),
                         source_field.ty(),
                     );
                 }
@@ -155,7 +155,7 @@ impl<'db> CoreFactsBuilder<'db> {
             self.insert_field(
                 owner_def,
                 name.as_str(),
-                hir_field.ty(self.db).to_type(self.db),
+                hir_field.ty(self.db),
                 source_field.ty(),
             );
         }
@@ -221,7 +221,7 @@ impl<'db> CoreFactsBuilder<'db> {
                     impl_def
                         .trait_ref(self.db)
                         .and_then(|trait_ref| trait_ref.get_type_argument(1))
-                        .and_then(|src_ty| src_ty.to_type(self.db).as_adt())
+                        .and_then(|src_ty| src_ty.as_adt())
                         .and_then(|adt| self.register_module_def(ModuleDef::Adt(adt), false)),
                 )
             {
@@ -484,7 +484,7 @@ impl<'db> CoreFactsBuilder<'db> {
         let span = self
             .host
             .intern_span_from_text(
-                editioned.editioned_file_id(self.db),
+                editioned.span_file_id(self.db),
                 rel_path.clone(),
                 local.text.as_str(),
                 range,
@@ -589,7 +589,7 @@ impl<'db> CoreFactsBuilder<'db> {
                     .intern_def_from_token(format!("def:{kind:?}:{path}").as_str());
                 (kind, path, def_id)
             }
-            ModuleDef::Variant(_) => {
+            ModuleDef::EnumVariant(_) => {
                 let kind = DefKind::Variant;
                 let path = def
                     .canonical_path(self.db, Edition::CURRENT)
@@ -673,7 +673,7 @@ impl<'db> CoreFactsBuilder<'db> {
                     let local = self.files.get(&editioned.file_id(self.db))?;
                     (editioned, local.rel_path.clone(), source.value.syntax().text_range())
                 }
-                ModuleDef::Variant(variant) => {
+                ModuleDef::EnumVariant(variant) => {
                     let source = variant.source(self.db)?;
                     let editioned = source.file_id.original_file(self.db);
                     let local = self.files.get(&editioned.file_id(self.db))?;
@@ -715,7 +715,7 @@ impl<'db> CoreFactsBuilder<'db> {
             let span = self
                 .host
                 .intern_span_from_text(
-                    editioned_file.editioned_file_id(self.db),
+                    editioned_file.span_file_id(self.db),
                     rel_path,
                     local.text.as_str(),
                     range,
@@ -756,7 +756,7 @@ impl<'db> CoreFactsBuilder<'db> {
                     .get(&editioned.file_id(self.db))
                     .map(|local| local.rel_path.clone())
             }),
-            ModuleDef::Variant(variant) => variant.source(self.db).and_then(|source| {
+            ModuleDef::EnumVariant(variant) => variant.source(self.db).and_then(|source| {
                 let editioned = source.file_id.original_file(self.db);
                 self.files
                     .get(&editioned.file_id(self.db))
@@ -809,7 +809,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 ModuleDef::Module(module) => module.visibility(self.db) == hir::Visibility::Public,
                 ModuleDef::Function(function) => function.visibility(self.db) == hir::Visibility::Public,
                 ModuleDef::Adt(adt) => adt.visibility(self.db) == hir::Visibility::Public,
-                ModuleDef::Variant(variant) => variant.visibility(self.db) == hir::Visibility::Public,
+                ModuleDef::EnumVariant(variant) => variant.visibility(self.db) == hir::Visibility::Public,
                 ModuleDef::Const(const_) => const_.visibility(self.db) == hir::Visibility::Public,
                 ModuleDef::Static(static_) => static_.visibility(self.db) == hir::Visibility::Public,
                 ModuleDef::Trait(trait_) => trait_.visibility(self.db) == hir::Visibility::Public,
@@ -827,7 +827,7 @@ impl<'db> CoreFactsBuilder<'db> {
                 }
                 ModuleDef::Module(module) => self.module_is_test(module),
                 ModuleDef::Adt(adt) => self.module_is_test(adt.module(self.db)),
-                ModuleDef::Variant(variant) => self.module_is_test(variant.module(self.db)),
+                ModuleDef::EnumVariant(variant) => self.module_is_test(variant.module(self.db)),
                 ModuleDef::Const(const_) => self.module_is_test(const_.module(self.db)),
                 ModuleDef::Static(static_) => self.module_is_test(static_.module(self.db)),
                 ModuleDef::Trait(trait_) => self.module_is_test(trait_.module(self.db)),

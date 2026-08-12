@@ -11,7 +11,7 @@ pub(crate) trait CallGraphProvider {
     fn local_file(&self, file_id: vfs::FileId) -> Option<LocalFile>;
     fn register_function_def_for_call_graph(&mut self, function: hir::Function) -> Option<DefId>;
     fn register_adt_def_for_call_graph(&mut self, adt: Adt) -> DefId;
-    fn register_variant_def_for_call_graph(&mut self, variant: hir::Variant) -> Option<DefId>;
+    fn register_variant_def_for_call_graph(&mut self, variant: hir::EnumVariant) -> Option<DefId>;
     fn register_synthetic_callable_for_call_graph(
         &mut self,
         prefix: &str,
@@ -83,7 +83,7 @@ pub(crate) fn extract_call_edges<P: CallGraphProvider>(
                         &sema,
                         caller_def,
                         &call,
-                        editioned.editioned_file_id(db),
+                        editioned.span_file_id(db),
                         &local,
                     );
                 }
@@ -94,7 +94,7 @@ pub(crate) fn extract_call_edges<P: CallGraphProvider>(
                         &sema,
                         caller_def,
                         &method_call,
-                        editioned.editioned_file_id(db),
+                        editioned.span_file_id(db),
                         &local,
                     );
                 }

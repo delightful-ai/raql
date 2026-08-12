@@ -86,12 +86,12 @@ pub struct WorkspaceService {
     content_revision: u64,
 }
 
-pub struct WarmupSnapshot(ide::Analysis);
+pub struct WarmupSnapshot(ide::Analysis, std::sync::Arc<[ide::Crate]>);
 
 impl WarmupSnapshot {
     pub fn parallel_prime_caches(&self, worker_threads: usize) -> Result<(), String> {
         self.0
-            .parallel_prime_caches(worker_threads, |_| {})
+            .parallel_prime_caches(&self.1, worker_threads, |_| {})
             .map_err(|err| format!("rust-analyzer cache priming cancelled: {err:?}"))
     }
 }
@@ -271,7 +271,9 @@ impl WorkspaceService {
 
 
     pub fn analysis_snapshot(&self) -> WarmupSnapshot {
-        WarmupSnapshot(self.analysis_host.analysis())
+        // TODO(ra-bump b2d445b22a): `parallel_prime_caches` now takes an explicit crate scope; `all_crates` keeps the previous prime-everything behavior.
+        let prime_scope = base_db::all_crates(self.analysis_host.raw_database());
+        WarmupSnapshot(self.analysis_host.analysis(), prime_scope)
     }
 
     pub fn content_revision(&self) -> u64 {
@@ -313,9 +315,11 @@ impl WorkspaceService {
                     .map(|threads| threads.get().min(4))
                     .unwrap_or(1)
             });
+        // TODO(ra-bump b2d445b22a): `parallel_prime_caches` now takes an explicit crate scope; `all_crates` keeps the previous prime-everything behavior.
+        let prime_scope = base_db::all_crates(self.analysis_host.raw_database());
         self.analysis_host
             .analysis()
-            .parallel_prime_caches(worker_threads, |_| {})
+            .parallel_prime_caches(&prime_scope, worker_threads, |_| {})
             .map_err(|err| RaHostInitError::SemanticBuild {
                 details: format!("rust-analyzer cache priming cancelled: {err:?}"),
             })?;
@@ -1085,7 +1089,7 @@ impl<'db> CoreFactsBuilder<'db> {
                     let span = self
                         .host
                         .intern_span_from_text(
-                            editioned.editioned_file_id(self.db),
+                            editioned.span_file_id(self.db),
                             local_rel_path.clone(),
                             local.text.as_str(),
                             syntax.text_range(),
@@ -1290,8 +1294,8 @@ impl<'db> CallGraphProvider for CoreFactsBuilder<'db> {
         CoreFactsBuilder::register_adt_def(self, adt)
     }
 
-    fn register_variant_def_for_call_graph(&mut self, variant: hir::Variant) -> Option<DefId> {
-        CoreFactsBuilder::register_module_def(self, ModuleDef::Variant(variant), false)
+    fn register_variant_def_for_call_graph(&mut self, variant: hir::EnumVariant) -> Option<DefId> {
+        CoreFactsBuilder::register_module_def(self, ModuleDef::EnumVariant(variant), false)
     }
 
     fn register_synthetic_callable_for_call_graph(

@@ -10,7 +10,7 @@ This crate owns the rust-analyzer-backed host runtime: RA-native identity, works
 - Put exact-name/bound-def logic in a defs-oriented provider module.
 - Put caller/callee and dispatch logic in a call-oriented provider module.
 - Put structure, type, syntax, and search logic in their own provider modules once they have distinct proof loops.
-- Use `tmp/rust-analyzer` to copy RA integration patterns before inventing local substitutes.
+- Use `vendor/rust-analyzer` to copy RA integration patterns before inventing local substitutes.
 
 ## Keep out
 

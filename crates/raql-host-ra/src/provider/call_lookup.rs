@@ -253,7 +253,7 @@ pub(crate) fn collect_lookup_call_edges_for_function(
             lookup_spans,
             id_host,
             callable.syntax().clone(),
-            editioned.editioned_file_id(db),
+            editioned.span_file_id(db),
             &local,
         );
         if owner != Some(caller_def) {
@@ -279,7 +279,7 @@ pub(crate) fn collect_lookup_call_edges_for_function(
                     id_host,
                     &callable,
                     &callee_expr,
-                    editioned.editioned_file_id(db),
+                    editioned.span_file_id(db),
                     &local,
                 ) else {
                     return false;
@@ -290,7 +290,7 @@ pub(crate) fn collect_lookup_call_edges_for_function(
                     rows,
                     caller_def,
                     callee_def,
-                    editioned.editioned_file_id(db),
+                    editioned.span_file_id(db),
                     &local,
                     call.syntax().text_range(),
                     dispatch,
@@ -319,7 +319,7 @@ pub(crate) fn collect_lookup_call_edges_for_function(
                     rows,
                     caller_def,
                     callee_def,
-                    editioned.editioned_file_id(db),
+                    editioned.span_file_id(db),
                     &local,
                     method_call.syntax().text_range(),
                     dispatch,
@@ -397,7 +397,7 @@ pub(crate) fn collect_lookup_callers_for_function(
                     lookup_spans,
                     id_host,
                     &name_ref,
-                    editioned.editioned_file_id(db),
+                    editioned.span_file_id(db),
                     &local,
                     function,
                 ) else {
@@ -409,7 +409,7 @@ pub(crate) fn collect_lookup_callers_for_function(
                     rows,
                     caller_def,
                     callee_def,
-                    editioned.editioned_file_id(db),
+                    editioned.span_file_id(db),
                     &local,
                     site_range,
                     dispatch,

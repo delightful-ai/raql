@@ -86,6 +86,10 @@ fn load_from_manifest(manifest: ProjectManifest) -> Result<LoadedWorkspace, RaHo
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
         prefill_caches: false,
+        // `num_worker_threads` only drives load-cargo's own priming, which `prefill_caches: false`
+        // skips; raql primes caches itself in `workspace_service::prewarm_semantics`.
+        num_worker_threads: 1,
+        proc_macro_processes: 1,
     };
 
     let workspace_load_started = Instant::now();

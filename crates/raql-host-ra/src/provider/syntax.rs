@@ -30,12 +30,12 @@ pub(crate) fn extract_syntax_nodes(
     let sema = hir::Semantics::new(db);
     let files = files.clone();
     for (file_id, local) in files {
-        let editioned_file = base_db::EditionedFileId::current_edition_guess_origin(db, file_id);
+        let editioned_file = base_db::EditionedFileId::current_edition(db, file_id);
         let root = sema.parse(editioned_file).syntax().clone();
         record_syntax_node(
             host,
             &root,
-            editioned_file.editioned_file_id(db),
+            editioned_file.span_file_id(db),
             &local,
             None,
         );
@@ -442,7 +442,7 @@ fn ensure_lookup_node_for_span(
         &query_range,
         query_key.rel_path(),
         source_text.as_str(),
-        editioned_file.editioned_file_id(db),
+        editioned_file.span_file_id(db),
         &mut temp_host,
         &mut candidates,
     );
@@ -456,7 +456,7 @@ fn ensure_lookup_node_for_span(
         node,
         query_key.rel_path(),
         source_text.as_str(),
-        editioned_file.editioned_file_id(db),
+        editioned_file.span_file_id(db),
         lookup_spans,
         lookup_nodes,
     )
@@ -480,7 +480,7 @@ fn lookup_file_and_range(
     let end = offset_for_coord(text.as_str(), key.end())?;
     let range = TextRange::new(TextSize::from(start as u32), TextSize::from(end as u32));
     Some((
-        base_db::EditionedFileId::current_edition_guess_origin(db, file_id),
+        base_db::EditionedFileId::current_edition(db, file_id),
         text,
         range,
     ))

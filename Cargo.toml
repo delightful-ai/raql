@@ -52,16 +52,16 @@ serde                    = { version = "1.0", features = ["derive"] }
 serde_json               = "1.0"
 crossbeam-channel        = "0.5"
 
-ide                      = { package = "ide", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-ide-db                   = { package = "ide-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-hir                      = { package = "hir", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-syntax                   = { package = "syntax", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-span                     = { package = "span", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-vfs                      = { package = "vfs", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-base-db                  = { package = "base-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-load-cargo               = { package = "load-cargo", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-project-model            = { package = "project-model", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
-vfs-notify               = { package = "vfs-notify", git = "https://github.com/rust-lang/rust-analyzer", rev = "adbff8baedae53f9955fe60c0d470ecd77b4f548" }
+ide                      = { package = "ide", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+ide-db                   = { package = "ide-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+hir                      = { package = "hir", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+syntax                   = { package = "syntax", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+span                     = { package = "span", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+vfs                      = { package = "vfs", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+base-db                  = { package = "base-db", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+load-cargo               = { package = "load-cargo", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+project-model            = { package = "project-model", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
+vfs-notify               = { package = "vfs-notify", git = "https://github.com/rust-lang/rust-analyzer", rev = "b2d445b22a2dd4c3469dfeddc2d5eb533c42baf6" }
 
 [dependencies]
 raql-cli = { path = "crates/raql-cli" }

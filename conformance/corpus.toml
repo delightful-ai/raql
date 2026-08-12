@@ -24,7 +24,7 @@ kind = "huge_monorepo"
 repo = "https://github.com/rust-lang/rust-analyzer.git"
 rev = "797b1f61e5531f2b67dc9b45dcc51a4e36e3c445"
 workspace = "."
-local_path = "tmp/rust-analyzer"
+local_path = "vendor/rust-analyzer"
 expected_symbol = "RootDatabase"
 expected_path = "crate::RootDatabase"
 

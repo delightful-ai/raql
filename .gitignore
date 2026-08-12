@@ -2,3 +2,5 @@
 .jj/**
 
 tmp/**
+vendor/**
+.DS_Store
