@@ -9,7 +9,7 @@
 use std::fmt::Write as _;
 
 use crate::logic::{BuiltinId, DerivedId, Goal, InputId, Program, Rule};
-use crate::mode::{AccessKind, CostClass, ModeDef};
+use crate::mode::{AccessKind, CostClass, ModeDef, Pattern};
 
 /// The chosen access path of one planned goal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub enum Access {
     },
     /// A demanded derived call: evaluated through the specialization for
     /// `(id, pattern)`.
-    Derived { id: DerivedId, pattern: Vec<bool> },
+    Derived { id: DerivedId, pattern: Pattern },
     Input { id: InputId },
     Builtin { id: BuiltinId },
 }
@@ -51,7 +51,7 @@ pub struct PlannedRule {
 pub struct Specialization {
     pub predicate: DerivedId,
     /// Which head arguments arrive bound.
-    pub pattern: Vec<bool>,
+    pub pattern: Pattern,
     pub rules: Vec<PlannedRule>,
     /// A call under the empty pattern is a scan of a derived predicate
     /// (SPEC §9.2) and is reported with the scans.
@@ -93,17 +93,12 @@ impl PhysicalPlan {
         render_rule(&mut out, program, &program.query, &self.query);
         for spec in &self.specializations {
             let derived = &program.derived[spec.predicate.0];
-            let pattern = spec
-                .pattern
-                .iter()
-                .map(|bound| if *bound { "+" } else { "-" })
-                .collect::<Vec<_>>()
-                .join(",");
             let scan = if spec.is_scan { "  scan" } else { "" };
             writeln!(
                 out,
-                "specialization {}({pattern}){scan} [{}]:",
+                "specialization {}{}{scan} [{}]:",
                 derived.name,
+                spec.pattern.render(),
                 spec.max_cost.name(),
             )
             .unwrap();
@@ -144,33 +139,20 @@ fn render_rule_goals(
         let rendered = program.render_goal(rule, source);
         let access = match &goal.access {
             Access::Extern { mode, .. } => {
-                let pattern = mode
-                    .pattern
-                    .iter()
-                    .map(|b| match b {
-                        crate::mode::Binding::Bound => "+",
-                        crate::mode::Binding::Free => "-",
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
                 let kind = match mode.access {
                     AccessKind::Scan => "scan",
                     AccessKind::Keyed => "keyed",
                 };
                 format!(
-                    "{} ({pattern}) {kind} [{}] via [{}]",
+                    "{} {} {kind} [{}] via [{}]",
                     mode.operator.name(),
+                    Pattern::from_bindings(mode.pattern).render(),
                     mode.cost.name(),
                     mode.ra_primitives.join(", "),
                 )
             }
             Access::Derived { id, pattern } => {
-                let pattern = pattern
-                    .iter()
-                    .map(|bound| if *bound { "+" } else { "-" })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("derived {}({pattern})", program.derived[id.0].name)
+                format!("derived {}{}", program.derived[id.0].name, pattern.render())
             }
             Access::Input { id } => format!("input {}", program.inputs[id.0].name),
             Access::Builtin { id } => format!("builtin {}", program.builtins[id.0].name),

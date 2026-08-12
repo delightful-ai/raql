@@ -20,6 +20,9 @@ Contract: `docs/SPEC.md` §8–§10.
 
 - Planner input is `logic::Program` — the lang layer lowers to it; the
   planner never sees compiler IR. Selector bindings are input relations.
+- Binding patterns are the `Pattern` newtype (`mode.rs`): demand keys,
+  support sets, satisfiability checks all speak it. Never reintroduce bare
+  `Vec<bool>` at a boundary.
 - Derived-mode inference is a greatest fixpoint per call-graph SCC
   (SPEC §9.1); declared `.mode` assertions are checked against the inferred
   set and then *replace* it as the public contract.

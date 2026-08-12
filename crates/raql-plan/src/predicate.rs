@@ -1,6 +1,6 @@
 //! Predicate declarations and their completeness contract (SPEC §4.3, §8.1).
 
-use crate::mode::{AccessKind, ModeDef};
+use crate::mode::{AccessKind, ModeDef, Pattern};
 use crate::schema::ArgDef;
 
 /// Completeness class of an extern predicate (SPEC §4.3). There is no fourth
@@ -39,8 +39,8 @@ impl PredicateDef {
     /// The declared modes whose `+` set is a subset of `bound` (SPEC §8.2:
     /// a goal is plannable if the bound set is a superset of some declared
     /// mode's `+` set), cheapest first; scans always sort last (SPEC §10.2).
-    pub fn satisfiable_modes(&self, bound: &[bool]) -> Vec<&'static ModeDef> {
-        assert_eq!(bound.len(), self.arity(), "binding vector arity mismatch");
+    pub fn satisfiable_modes(&self, bound: &Pattern) -> Vec<&'static ModeDef> {
+        assert_eq!(bound.arity(), self.arity(), "binding pattern arity mismatch");
         let mut modes: Vec<&'static ModeDef> = self
             .modes
             .iter()
@@ -54,7 +54,7 @@ impl PredicateDef {
 #[cfg(test)]
 mod tests {
     use crate::catalog::v0_catalog;
-    use crate::mode::Binding;
+    use crate::mode::{Binding, Pattern};
     use crate::operator::OperatorId;
 
     #[test]
@@ -62,24 +62,24 @@ mod tests {
         let def_name = v0_catalog().predicate("def_name").expect("def_name in catalog");
 
         // Def bound: the C0 projection wins.
-        let modes = def_name.satisfiable_modes(&[true, false]);
+        let modes = def_name.satisfiable_modes(&Pattern::from(vec![true, false]));
         assert_eq!(modes[0].operator, OperatorId::NameOfDef);
 
         // Name bound: the C2 seed wins; the scan is satisfiable but always
         // sorts last (SPEC §10.2).
-        let modes = def_name.satisfiable_modes(&[false, true]);
+        let modes = def_name.satisfiable_modes(&Pattern::from(vec![false, true]));
         assert_eq!(
             modes.iter().map(|m| m.operator).collect::<Vec<_>>(),
             vec![OperatorId::DefsByExactName, OperatorId::DefNamesScan],
         );
 
         // Both bound: every mode satisfiable, cheapest first.
-        let modes = def_name.satisfiable_modes(&[true, true]);
+        let modes = def_name.satisfiable_modes(&Pattern::from(vec![true, true]));
         assert_eq!(modes[0].operator, OperatorId::NameOfDef);
 
         // Nothing bound: only the declared scan applies — a scan is never
         // inferred, but a declared one is a legal (visible) access path.
-        let modes = def_name.satisfiable_modes(&[false, false]);
+        let modes = def_name.satisfiable_modes(&Pattern::from(vec![false, false]));
         assert_eq!(
             modes.iter().map(|m| m.operator).collect::<Vec<_>>(),
             vec![OperatorId::DefNamesScan],

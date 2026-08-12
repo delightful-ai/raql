@@ -5,7 +5,7 @@
 
 use raql_plan::{
     Access, Binding, BuiltinDef, CostClass, DerivedDef, DerivedId, Goal, GoalRef, InputDef,
-    OperatorId, PlanError, PlanOptions, Program, Rule, Term, Var, plan, v0_catalog,
+    OperatorId, Pattern, PlanError, PlanOptions, Program, Rule, Term, Var, plan, v0_catalog,
 };
 
 fn v(i: u32) -> Term {
@@ -152,7 +152,7 @@ fn seeded_is_fn_causes_no_enumeration() {
     );
     // One specialization: is_fn demanded under (+) only.
     assert_eq!(physical.specializations.len(), 1);
-    assert_eq!(physical.specializations[0].pattern, vec![true]);
+    assert_eq!(physical.specializations[0].pattern, Pattern::from(vec![true]));
     assert!(!physical.specializations[0].is_scan);
     assert_eq!(physical.max_cost, CostClass::C0);
     // And the same program plans under --no-scan.
@@ -315,7 +315,7 @@ fn recursion_supports_both_seeded_directions() {
     let forward = plan(&build(0), &v0_catalog(), PlanOptions::default()).expect("plans");
     assert!(forward.scans.is_empty());
     assert_eq!(forward.specializations.len(), 1);
-    assert_eq!(forward.specializations[0].pattern, vec![true, false]);
+    assert_eq!(forward.specializations[0].pattern, Pattern::from(vec![true, false]));
     let forward_ops = planned_operators(&build(0));
     assert!(forward_ops.contains(&OperatorId::CallEdgesByCaller));
     assert!(!forward_ops.contains(&OperatorId::CallEdgesByCallee));

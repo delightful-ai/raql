@@ -30,7 +30,7 @@ pub use logic::{
     BuiltinDef, BuiltinId, DerivedDef, DerivedId, Goal, GoalRef, InputDef, InputId, Program,
     Rule, Term, Var,
 };
-pub use mode::{AccessKind, Binding, CostClass, ModeDef};
+pub use mode::{AccessKind, Binding, CostClass, ModeDef, Pattern};
 pub use operator::{OperatorId, OperatorSet};
 pub use plan::{Access, PhysicalPlan, PlannedGoal, PlannedRule, ScanUse, Specialization};
 pub use planner::{PlanOptions, plan};
