@@ -9,6 +9,8 @@
 //! - [`snapshot`] — the typed attachment discipline (`Snapshot`/`Attached`).
 //! - [`calls`] — the call family: Salsa-tracked `raql_callees`, untracked
 //!   `callers_of`, dispatch classification.
+//! - [`crate_defs`] — Salsa-tracked crate-level definition enumeration
+//!   (the scan substrate).
 //! - [`def`] — the `Def` union of RA definition handles and its projections.
 //! - [`value`] — the engine value model (SPEC §7), snapshot-scoped.
 //! - [`operators`] — catalog operator dispatch over one snapshot.
@@ -16,6 +18,7 @@
 //!   values become text.
 
 mod calls;
+mod crate_defs;
 mod def;
 mod operators;
 mod projection;
@@ -23,6 +26,7 @@ mod snapshot;
 mod value;
 
 pub use calls::{CallSite, DispatchKind, callers_of, raql_callees, raql_callees_execution_count};
+pub use crate_defs::{raql_crate_defs, raql_crate_defs_execution_count};
 pub use def::{Def, DefKind};
 pub use operators::{OperatorError, SnapshotOperators};
 pub use projection::{Projected, ProjectedDef, project_def, project_file_range};

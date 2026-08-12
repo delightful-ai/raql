@@ -34,6 +34,27 @@ pub enum OperatorId {
     /// `call_edge(-Caller, +Callee, -Site, -Disp)` — composition over the
     /// incoming direction.
     CallEdgesByCallee,
+    /// `def(-D)` — scan: enumerate every definition in scope.
+    DefsScan,
+    /// `fn_def(-D)` — scan: `def` filtered to functions during enumeration.
+    FnDefsScan,
+    /// `def_name(-D, -Name)` — scan: enumeration × name projection.
+    DefNamesScan,
+    /// `call_edge(-,-,-,-)` — scan: the SPEC §8.5 rewrite
+    /// `fn_def(C), callee(C, K, S, D)`. Never routes through reference
+    /// search.
+    CallEdgesScan,
+    /// `is_public(+D)` — filter: the definition's visibility is `pub`.
+    IsPublicFilter,
+    /// `in_test(+D)` — filter: the definition is test code.
+    InTestFilter,
+    /// `span_allowed(+S)` — filter: the span is in the request scope.
+    SpanAllowedFilter,
+    /// `handle(+D, -H)` — the §13.2 handle projection as a predicate.
+    HandleOfDef,
+    /// `span_key(+S, -Path, -L0, -C0, -L1, -C1)` — workspace-relative
+    /// location projection of a span.
+    SpanKeyOfSpan,
 }
 
 impl OperatorId {
@@ -50,6 +71,15 @@ impl OperatorId {
             OperatorId::CallersOfFn => "caller/callers-of-fn",
             OperatorId::CallEdgesByCaller => "call_edge/by-caller",
             OperatorId::CallEdgesByCallee => "call_edge/by-callee",
+            OperatorId::DefsScan => "def/defs-scan",
+            OperatorId::FnDefsScan => "fn_def/fn-defs-scan",
+            OperatorId::DefNamesScan => "def_name/def-names-scan",
+            OperatorId::CallEdgesScan => "call_edge/scan",
+            OperatorId::IsPublicFilter => "is_public/visibility-filter",
+            OperatorId::InTestFilter => "in_test/test-scope-filter",
+            OperatorId::SpanAllowedFilter => "span_allowed/scope-filter",
+            OperatorId::HandleOfDef => "handle/handle-of-def",
+            OperatorId::SpanKeyOfSpan => "span_key/span-key-of-span",
         }
     }
 }

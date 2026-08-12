@@ -57,6 +57,10 @@ pub struct ModeDef {
     pub operator: OperatorId,
     /// RA primitives this access path is built on (capabilities output).
     pub ra_primitives: &'static [&'static str],
+    /// Completeness caveats of *this access path* beyond the predicate's
+    /// own (SPEC §8.4) — e.g. a seed index that cannot surface some of the
+    /// predicate's domain. Empty for most modes.
+    pub caveats: &'static [&'static str],
 }
 
 impl ModeDef {

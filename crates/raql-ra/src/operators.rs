@@ -14,6 +14,10 @@ mod calls;
 mod def_at;
 mod def_meta;
 mod def_name;
+mod scans;
+mod span;
+
+use std::path::PathBuf;
 
 use ide_db::RootDatabase;
 use raql_plan::{OperatorId, OperatorSet};
@@ -43,15 +47,18 @@ impl std::fmt::Display for OperatorError {
 
 impl std::error::Error for OperatorError {}
 
-/// The catalog operators evaluated against one snapshot. Holds only the
-/// snapshot — no state, no caches (Salsa is the only memoization).
+/// The catalog operators evaluated against one snapshot. Holds the
+/// snapshot plus request-level normalization config (the workspace root,
+/// for workspace-relative projections) — no semantic state, no caches
+/// (Salsa is the only memoization).
 pub struct SnapshotOperators<'db> {
     snapshot: Snapshot<'db>,
+    workspace_root: PathBuf,
 }
 
 impl<'db> SnapshotOperators<'db> {
-    pub fn new(db: &'db RootDatabase) -> Self {
-        Self { snapshot: Snapshot::new(db) }
+    pub fn new(db: &'db RootDatabase, workspace_root: impl Into<PathBuf>) -> Self {
+        Self { snapshot: Snapshot::new(db), workspace_root: workspace_root.into() }
     }
 }
 
@@ -100,6 +107,45 @@ impl OperatorSet for SnapshotOperators<'_> {
                 let def = one_def(operator, inputs)?;
                 self.snapshot.attached(|att| calls::call_edges_by_callee(att, def))
             }
+            OperatorId::DefsScan => {
+                no_inputs(operator, inputs)?;
+                self.snapshot.attached(scans::defs_scan)
+            }
+            OperatorId::FnDefsScan => {
+                no_inputs(operator, inputs)?;
+                self.snapshot.attached(scans::fn_defs_scan)
+            }
+            OperatorId::DefNamesScan => {
+                no_inputs(operator, inputs)?;
+                self.snapshot.attached(scans::def_names_scan)
+            }
+            OperatorId::CallEdgesScan => {
+                no_inputs(operator, inputs)?;
+                self.snapshot.attached(scans::call_edges_scan)
+            }
+            OperatorId::IsPublicFilter => {
+                let def = one_def(operator, inputs)?;
+                self.snapshot.attached(|att| def_meta::is_public_filter(att, def))
+            }
+            OperatorId::InTestFilter => {
+                let def = one_def(operator, inputs)?;
+                self.snapshot.attached(|att| def_meta::in_test_filter(att, def))
+            }
+            OperatorId::SpanAllowedFilter => {
+                let range = one_span(operator, inputs)?;
+                self.snapshot.attached(|att| span::span_allowed(att, range))
+            }
+            OperatorId::HandleOfDef => {
+                let def = one_def(operator, inputs)?;
+                let workspace_root = &self.workspace_root;
+                self.snapshot
+                    .attached(|att| def_meta::handle_of_def(att, workspace_root, def))
+            }
+            OperatorId::SpanKeyOfSpan => {
+                let range = one_span(operator, inputs)?;
+                let workspace_root = &self.workspace_root;
+                self.snapshot.attached(|att| span::span_key(att, workspace_root, range))
+            }
         }
     }
 }
@@ -108,6 +154,21 @@ fn one_def(operator: OperatorId, inputs: &[Value]) -> Result<Def, OperatorError>
     match inputs {
         [Value::Def(def)] => Ok(*def),
         _ => Err(OperatorError::InvalidInput { operator, expected: "(Def)" }),
+    }
+}
+
+fn one_span(operator: OperatorId, inputs: &[Value]) -> Result<ide_db::FileRange, OperatorError> {
+    match inputs {
+        [Value::FileRange(range)] => Ok(*range),
+        _ => Err(OperatorError::InvalidInput { operator, expected: "(Span)" }),
+    }
+}
+
+fn no_inputs(operator: OperatorId, inputs: &[Value]) -> Result<(), OperatorError> {
+    if inputs.is_empty() {
+        Ok(())
+    } else {
+        Err(OperatorError::InvalidInput { operator, expected: "()" })
     }
 }
 

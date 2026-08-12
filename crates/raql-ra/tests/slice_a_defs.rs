@@ -11,7 +11,7 @@ mod common;
 
 use common::{Fixture, def_by_path, position_of};
 use raql_plan::{OperatorId, OperatorSet, v0_catalog};
-use raql_ra::{Def, Projected, SnapshotOperators, Value, project_def};
+use raql_ra::{Def, Projected, Value, project_def};
 
 const WIDGETS_RS: &str = include_str!("fixtures/defs_ws/src/widgets.rs");
 const LIB_RS: &str = include_str!("fixtures/defs_ws/src/lib.rs");
@@ -19,7 +19,7 @@ const LIB_RS: &str = include_str!("fixtures/defs_ws/src/lib.rs");
 /// Seed defs by exact name and return their projected canonical paths,
 /// sorted. Every row must echo the name and carry a Def.
 fn paths_named(fixture: &Fixture, name: &str) -> Vec<String> {
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let rows = ops
         .invoke(OperatorId::DefsByExactName, &[Value::string(name)])
         .expect("seeding succeeds");
@@ -40,7 +40,7 @@ fn paths_named(fixture: &Fixture, name: &str) -> Vec<String> {
 }
 
 fn kind_tag(fixture: &Fixture, def: Def) -> &'static str {
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let rows = ops
         .invoke(OperatorId::KindOfDef, &[Value::Def(def)])
         .expect("def_kind succeeds");
@@ -56,7 +56,7 @@ fn kind_tag(fixture: &Fixture, def: Def) -> &'static str {
 }
 
 fn location_of(fixture: &Fixture, def: Def) -> String {
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let rows = ops
         .invoke(OperatorId::SpanOfDef, &[Value::Def(def)])
         .expect("def_span succeeds");
@@ -133,7 +133,7 @@ fn def_kind_matrix() {
 #[test]
 fn def_path_and_name_echo() {
     let fixture = Fixture::load("defs_ws");
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
 
     let def = def_by_path(&fixture, "Deep", "defs_ws::gadgets::inner::Deep");
     let rows = ops.invoke(OperatorId::CanonicalPathOfDef, &[Value::Def(def)]).unwrap();
@@ -168,7 +168,7 @@ fn def_span_is_macro_aware() {
 #[test]
 fn def_at_classifies_positions() {
     let fixture = Fixture::load("defs_ws");
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let file = fixture.file_id("src/widgets.rs");
 
     let mut defs_at = |pos| {

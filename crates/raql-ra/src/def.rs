@@ -186,6 +186,44 @@ impl Def {
         }
     }
 
+    /// `is_public` projection (SPEC §8.6): the declared visibility is
+    /// exactly `pub` — `pub(crate)`/`pub(super)`/private are not public.
+    /// Impls have no visibility. Ported from the old host's
+    /// `module_def_is_public`.
+    pub fn is_public(self, db: &dyn HirDatabase) -> bool {
+        use hir::HasVisibility;
+        let visibility = match self {
+            Def::Function(it) => it.visibility(db),
+            Def::Adt(it) => it.visibility(db),
+            Def::Trait(it) => it.visibility(db),
+            Def::Module(it) => it.visibility(db),
+            Def::Const(it) => it.visibility(db),
+            Def::Static(it) => it.visibility(db),
+            Def::TypeAlias(it) => it.visibility(db),
+            Def::Macro(it) => it.visibility(db),
+            Def::Impl(_) => return false,
+            Def::Field(it) => it.visibility(db),
+            Def::Variant(it) => it.visibility(db),
+        };
+        visibility == hir::Visibility::Public
+    }
+
+    /// `in_test` projection (SPEC §8.6): a `#[test]` function, or declared
+    /// under a module named `tests` anywhere up its module path. Ported
+    /// from the old host's `module_def_in_test`; `ra_resolved`, caveat
+    /// `test_modules_detected_by_name_only`.
+    pub fn in_test(self, db: &dyn HirDatabase) -> bool {
+        if let Def::Function(function) = self
+            && function.is_test(db)
+        {
+            return true;
+        }
+        self.module(db)
+            .path_to_root(db)
+            .into_iter()
+            .any(|module| module.name(db).is_some_and(|name| name.as_str() == "tests"))
+    }
+
     /// The module owning this definition.
     pub fn module(self, db: &dyn HirDatabase) -> hir::Module {
         match self {

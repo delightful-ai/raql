@@ -16,7 +16,7 @@ use crate::operators::OperatorError;
 use crate::snapshot::Attached;
 use crate::value::{EnumTag, Value};
 
-fn dispatch_value(site: &CallSite) -> Value {
+pub(super) fn dispatch_value(site: &CallSite) -> Value {
     Value::Enum(EnumTag { ty: "DispatchKind", variant: site.dispatch.tag() })
 }
 

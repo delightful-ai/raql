@@ -47,8 +47,7 @@ pub struct ProjectedDef {
     /// `workspace-relative-path:line:col-line:col` (1-based, primary source
     /// location).
     pub location: Projected,
-    /// SPEC §13.2 handle. Impl handles are unprojectable until the `handle`
-    /// predicate lands with source-order ordinals.
+    /// SPEC §13.2 handle.
     pub handle: Projected,
 }
 
@@ -63,10 +62,9 @@ fn project_def_attached(db: &RootDatabase, workspace_root: &Path, def: Def) -> P
     let location = def
         .original_span(db)
         .and_then(|range| project_file_range(db, workspace_root, range));
-    let handle = match (&canonical_path, def) {
-        (_, Def::Impl(_)) => Projected::Unprojectable("impl-handle-ordinal-not-implemented"),
-        (Some(path), _) => Projected::Text(format!("@H:{}:{path}", kind.handle_kind())),
-        (None, _) => Projected::Unprojectable("no-canonical-path"),
+    let handle = match handle_text(db, workspace_root, def) {
+        Ok(text) => Projected::Text(text),
+        Err(reason) => Projected::Unprojectable(reason),
     };
     ProjectedDef {
         kind,
@@ -74,6 +72,70 @@ fn project_def_attached(db: &RootDatabase, workspace_root: &Path, def: Def) -> P
         location: Projected::from_option(location, "no-primary-location"),
         handle,
     }
+}
+
+/// The SPEC §13.2 handle text of a definition, or the typed reason there is
+/// none. Callers must hold an attached scope. Shared by [`project_def`] and
+/// the `handle` operator, so the predicate and the output boundary cannot
+/// drift.
+pub(crate) fn handle_text(
+    db: &RootDatabase,
+    workspace_root: &Path,
+    def: Def,
+) -> Result<String, &'static str> {
+    if let Def::Impl(impl_) = def {
+        return impl_handle_text(db, workspace_root, impl_);
+    }
+    let path = def.canonical_path(db).ok_or("no-canonical-path")?;
+    Ok(format!("@H:{}:{path}", def.kind(db).handle_kind()))
+}
+
+/// Impl handles (SPEC §13.2): the self-type's canonical path, with a
+/// `#ordinal` suffix only when several impls share it, numbered in stable
+/// source order (workspace-relative path, then range start). Impls on
+/// non-ADT self types (references, tuples, type params) have no honest
+/// path and no handle.
+fn impl_handle_text(
+    db: &RootDatabase,
+    workspace_root: &Path,
+    impl_: hir::Impl,
+) -> Result<String, &'static str> {
+    let no_path = "impl-self-type-has-no-canonical-path";
+    let self_adt = impl_.self_ty(db).as_adt().ok_or(no_path)?;
+    let path = Def::Adt(self_adt).canonical_path(db).ok_or(no_path)?;
+
+    // Peers = impls whose self type is the same ADT constructor (RA's own
+    // "impls for type" notion, filtered to exact ADT identity — blanket
+    // impls and other constructors drop out).
+    let mut peers: Vec<hir::Impl> = hir::Impl::all_for_type(db, impl_.self_ty(db))
+        .into_iter()
+        .filter(|peer| peer.self_ty(db).as_adt() == Some(self_adt))
+        .collect();
+    if peers.len() <= 1 {
+        return Ok(format!("@H:impl:{path}"));
+    }
+    peers.sort_by_cached_key(|peer| impl_source_key(db, workspace_root, *peer));
+    let ordinal = peers
+        .iter()
+        .position(|peer| *peer == impl_)
+        .ok_or("impl-outside-peer-enumeration")?;
+    Ok(format!("@H:impl:{path}#{ordinal}"))
+}
+
+/// Deterministic source-order key for impl ordinals: primary-source
+/// location projected to workspace-relative path + range start (stable
+/// across sessions, unlike raw `FileId`s). Impls without a primary
+/// location sort last.
+fn impl_source_key(
+    db: &RootDatabase,
+    workspace_root: &Path,
+    impl_: hir::Impl,
+) -> (u8, String, u32) {
+    let Some(range) = Def::Impl(impl_).original_span(db) else {
+        return (1, String::new(), 0);
+    };
+    let path = workspace_relative_path(db, workspace_root, range.file_id).unwrap_or_default();
+    (0, path, u32::from(range.range.start()))
 }
 
 /// Project a file range as `workspace-relative-path:line:col-line:col`
@@ -99,7 +161,7 @@ pub fn project_file_range(
 
 /// The workspace-relative path of a file, from RA's own source roots (no
 /// filesystem access, no VFS handle needed).
-fn workspace_relative_path(
+pub(crate) fn workspace_relative_path(
     db: &RootDatabase,
     workspace_root: &Path,
     file_id: ide_db::FileId,

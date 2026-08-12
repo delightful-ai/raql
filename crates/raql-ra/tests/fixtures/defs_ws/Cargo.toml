@@ -3,5 +3,13 @@ name = "defs_ws"
 version = "0.0.0"
 edition = "2021"
 
-# Keep this fixture out of the enclosing raql workspace.
+[dependencies]
+# A non-member path dependency: present in the crate graph but not
+# workspace-local, so scans must not enumerate it and its spans are out of
+# the request scope.
+dep_lib = { path = "dep_lib" }
+
+# Keep this fixture out of the enclosing raql workspace, and the
+# dependency out of this one (non-member on purpose).
 [workspace]
+exclude = ["dep_lib"]

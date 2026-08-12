@@ -151,6 +151,7 @@ fn g5_no_shadow_state() {
     let sources = [
         ("lib.rs", include_str!("../src/lib.rs")),
         ("calls.rs", include_str!("../src/calls.rs")),
+        ("crate_defs.rs", include_str!("../src/crate_defs.rs")),
         ("def.rs", include_str!("../src/def.rs")),
         ("value.rs", include_str!("../src/value.rs")),
         ("snapshot.rs", include_str!("../src/snapshot.rs")),
@@ -159,6 +160,8 @@ fn g5_no_shadow_state() {
         ("operators/def_meta.rs", include_str!("../src/operators/def_meta.rs")),
         ("operators/def_at.rs", include_str!("../src/operators/def_at.rs")),
         ("operators/calls.rs", include_str!("../src/operators/calls.rs")),
+        ("operators/scans.rs", include_str!("../src/operators/scans.rs")),
+        ("operators/span.rs", include_str!("../src/operators/span.rs")),
         ("projection.rs", include_str!("../src/projection.rs")),
     ];
     for (name, src) in sources {

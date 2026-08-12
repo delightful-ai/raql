@@ -65,20 +65,25 @@ mod tests {
         let modes = def_name.satisfiable_modes(&[true, false]);
         assert_eq!(modes[0].operator, OperatorId::NameOfDef);
 
-        // Name bound: the C2 seed is the only satisfiable mode.
+        // Name bound: the C2 seed wins; the scan is satisfiable but always
+        // sorts last (SPEC §10.2).
         let modes = def_name.satisfiable_modes(&[false, true]);
         assert_eq!(
             modes.iter().map(|m| m.operator).collect::<Vec<_>>(),
-            vec![OperatorId::DefsByExactName],
+            vec![OperatorId::DefsByExactName, OperatorId::DefNamesScan],
         );
 
         // Both bound: every mode satisfiable, cheapest first.
         let modes = def_name.satisfiable_modes(&[true, true]);
         assert_eq!(modes[0].operator, OperatorId::NameOfDef);
 
-        // Nothing bound: no keyed mode applies and no scan is declared yet,
-        // so the goal is unplannable (RAQL0301 territory, SPEC §10.3).
-        assert!(def_name.satisfiable_modes(&[false, false]).is_empty());
+        // Nothing bound: only the declared scan applies — a scan is never
+        // inferred, but a declared one is a legal (visible) access path.
+        let modes = def_name.satisfiable_modes(&[false, false]);
+        assert_eq!(
+            modes.iter().map(|m| m.operator).collect::<Vec<_>>(),
+            vec![OperatorId::DefNamesScan],
+        );
     }
 
     #[test]
@@ -89,17 +94,44 @@ mod tests {
 
     #[test]
     fn mode_patterns_never_use_bound_wildcards() {
-        // Every declared pattern spells out each position (SPEC §8.2).
+        // Every declared pattern spells out each position (SPEC §8.2). A
+        // pure filter (every mode all-bound: `is_public(+)`) is legitimate;
+        // an all-bound mode next to a freer mode is a redundant membership
+        // test, which the freer mode already answers.
         for predicate in v0_catalog().entries() {
+            let pure_filter = predicate
+                .modes
+                .iter()
+                .all(|mode| mode.pattern.iter().all(|b| *b == Binding::Bound));
             for mode in predicate.modes {
                 assert_eq!(mode.pattern.len(), predicate.arity());
                 assert!(
-                    mode.pattern.iter().any(|b| *b == Binding::Free) || predicate.arity() == 0,
-                    "`{}` declares a mode binding every argument and freeing none — \
-                     that is a membership test, which every keyed mode already answers",
+                    pure_filter || mode.pattern.iter().any(|b| *b == Binding::Free),
+                    "`{}` declares an all-bound mode alongside freer modes — \
+                     a redundant membership test",
                     predicate.name,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn filters_and_scans_are_declared() {
+        let catalog = v0_catalog();
+        // Scans exist only where SPEC §8.6 declares them.
+        let scan_predicates: Vec<&str> = catalog
+            .entries()
+            .iter()
+            .filter(|p| p.modes.iter().any(|m| m.access == crate::mode::AccessKind::Scan))
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(scan_predicates, vec!["def_name", "def", "fn_def", "call_edge"]);
+
+        // The roadmap families are present but disabled: no modes.
+        for name in ["constructs", "propagates", "converts", "handles", "compares", "writes"] {
+            let predicate = catalog.predicate(name).expect("roadmap entry exists");
+            assert!(predicate.is_disabled());
+            assert!(predicate.modes.is_empty());
         }
     }
 }

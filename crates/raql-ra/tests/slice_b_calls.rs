@@ -10,7 +10,7 @@ mod common;
 
 use common::{Fixture, def_by_path, position_of};
 use raql_plan::{OperatorId, OperatorSet};
-use raql_ra::{Def, SnapshotOperators, Value, project_def};
+use raql_ra::{Def, Value, project_def};
 
 const LIB_RS: &str = include_str!("fixtures/calls_ws/src/lib.rs");
 
@@ -23,7 +23,7 @@ fn edge_summary(
     seed: Def,
     peer_index: usize,
 ) -> Vec<(String, &'static str)> {
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let rows = ops
         .invoke(operator, &[Value::Def(seed)])
         .expect("call operator succeeds");
@@ -155,7 +155,7 @@ fn call_edge_composes_both_directions() {
     // Incoming composition reorders `caller` rows into
     // `(Caller, Callee, Site, Disp)` — the peer sits in column 0 and the
     // seed echoes in column 1.
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let rows = ops
         .invoke(OperatorId::CallEdgesByCallee, &[Value::Def(helper)])
         .expect("call_edge by callee succeeds");
@@ -177,7 +177,7 @@ fn call_sites_project_to_call_lines() {
     let fixture = Fixture::load("calls_ws");
     let static_call = def_by_path(&fixture, "static_call", "calls_ws::static_call");
 
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let rows = ops
         .invoke(OperatorId::CalleesOfFn, &[Value::Def(static_call)])
         .expect("callee succeeds");

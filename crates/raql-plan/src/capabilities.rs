@@ -44,9 +44,14 @@ impl Catalog {
                     AccessKind::Scan => " scan",
                     AccessKind::Keyed => "",
                 };
+                let caveats = if mode.caveats.is_empty() {
+                    String::new()
+                } else {
+                    format!(" caveats: {}", mode.caveats.join(", "))
+                };
                 writeln!(
                     out,
-                    "  ({pattern}) {}{scan} via {} [{}]",
+                    "  ({pattern}) {}{scan} via {} [{}]{caveats}",
                     mode.cost.name(),
                     mode.operator.name(),
                     mode.ra_primitives.join(", "),

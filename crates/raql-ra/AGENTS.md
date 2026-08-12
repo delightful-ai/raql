@@ -43,6 +43,21 @@ future request boundary may hoist attachment around whole-plan execution —
 the panic is query-content dependent and will not show up until a plan
 mixes the wrong operators.
 
+## Domain facts worth not re-deriving
+
+- "Workspace-local" is RA's notion (`CrateOrigin::is_local`): members
+  *and* path dependencies — editable code — never registry/git deps or the
+  sysroot. The scans (`raql_crate_defs` union) and the `def_name(-,+)`
+  symbol-index seed must agree on this domain.
+- `Module::declarations` covers the types/values scopes only;
+  `macro_rules!` definitions live in the legacy-macro scope and are
+  attributed to their defining module (`crate_defs.rs`).
+- The symbol index never surfaces fields — declared as the catalog mode
+  caveat `fields_not_in_symbol_index`, not worked around.
+- Impl handles are the self-type's canonical path with a `#ordinal` only
+  when several impls share it, ordered by (workspace-relative path, range
+  start) — stable across sessions, unlike `FileId`s (`projection.rs`).
+
 ## Bait / keep out
 
 - No RAQL-side revision counters, fingerprints, mtime state, or caches of RA
@@ -60,6 +75,11 @@ mixes the wrong operators.
 ## Verify
 
 - `cargo test -p raql-ra` — spike gates G1–G6 (load, memoize, precise
-  invalidation, cancellation, no-shadow-state, key stability).
-- Timing claims: release-only, via the quarantined
-  `examples/spike_timings.rs` probe.
+  invalidation, cancellation, no-shadow-state, key stability), the slice
+  truth fixtures (`slice_a_defs`, `slice_b_calls`, `slice_c_scans`), and
+  the `raql_crate_defs` incrementality assertions
+  (`crate_defs_incremental`, its own binary so the execution counter is
+  isolated).
+- Timing claims: release-only, via the quarantined examples
+  `spike_timings.rs` (cold/warm `raql_callees`) and `p2_probe.rs` (SPEC
+  §15 P2: exact-name seed + projections, p50/p95).

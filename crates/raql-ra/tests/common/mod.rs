@@ -48,6 +48,12 @@ impl Fixture {
         PathBuf::from(self.root.to_string())
     }
 
+    /// The catalog operators over this fixture's database, rooted for
+    /// workspace-relative projections.
+    pub fn operators(&self) -> raql_ra::SnapshotOperators<'_> {
+        raql_ra::SnapshotOperators::new(&self.db, self.workspace_root())
+    }
+
     pub fn file_id(&self, rel_path: &str) -> ide_db::FileId {
         let path = self.root.join(rel_path);
         let (file_id, excluded) = self
@@ -116,9 +122,9 @@ pub fn find_adt(db: &RootDatabase, name: &str) -> hir::Adt {
 /// found through the catalog seeding operator.
 pub fn def_by_path(fixture: &Fixture, name: &str, path: &str) -> raql_ra::Def {
     use raql_plan::{OperatorId, OperatorSet};
-    use raql_ra::{SnapshotOperators, Value, project_def};
+    use raql_ra::{Value, project_def};
 
-    let mut ops = SnapshotOperators::new(&fixture.db);
+    let mut ops = fixture.operators();
     let rows = ops
         .invoke(OperatorId::DefsByExactName, &[Value::string(name)])
         .expect("seeding succeeds");
@@ -135,6 +141,33 @@ pub fn def_by_path(fixture: &Fixture, name: &str, path: &str) -> raql_ra::Def {
     });
     let found = matches.next().unwrap_or_else(|| panic!("def `{path}` found by name `{name}`"));
     assert!(matches.next().is_none(), "`{path}` is unique");
+    found
+}
+
+/// The unique def whose projected canonical path is `path`, found through
+/// the `def` scan. Covers defs the symbol-index seed cannot surface
+/// (fields — catalog caveat `fields_not_in_symbol_index`).
+pub fn def_by_scan_path(fixture: &Fixture, path: &str) -> raql_ra::Def {
+    use raql_plan::{OperatorId, OperatorSet};
+    use raql_ra::{Value, project_def};
+
+    let rows = fixture
+        .operators()
+        .invoke(OperatorId::DefsScan, &[])
+        .expect("def scan succeeds");
+    let mut matches = rows.into_iter().filter_map(|row| match row.as_slice() {
+        [Value::Def(def)]
+            if project_def(&fixture.db, &fixture.workspace_root(), *def)
+                .path
+                .to_string()
+                == path =>
+        {
+            Some(*def)
+        }
+        _ => None,
+    });
+    let found = matches.next().unwrap_or_else(|| panic!("def `{path}` in the def scan"));
+    assert!(matches.next().is_none(), "`{path}` is unique in the def scan");
     found
 }
 
