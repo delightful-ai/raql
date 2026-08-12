@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 
 use raql_syntax::{
-    AggregateName, Constraint, DeclarationKind, Expr, Goal, RelOp, Rule, Spanned, SrcSpan, Term,
+    AggregateName, Constraint, DeclAttr, DeclarationKind, Expr, Goal, RelOp, Rule, Spanned,
+    SrcSpan, Term,
 };
 
 use crate::diagnostics::{
@@ -276,6 +277,37 @@ pub fn typecheck(mut resolved: ResolvedProgram) -> Result<TypedProgram, DiagBund
     for (pred, sigs) in &resolved.modes {
         if let Some(decl) = resolved.predicates.get(pred) {
             let spans = resolved.mode_spans.get(pred);
+            if decl.span.file == crate::externs::CATALOG_FILE {
+                let mode_span = spans.and_then(|items| items.first()).copied();
+                diagnostics.push(
+                    CompilerDiagnostic::error(
+                        "RAQL0105",
+                        format!(
+                            "`.mode` on the extern predicate `{pred}` — extern access paths \
+                             come from the catalog (SPEC §8.1), not from program text",
+                        ),
+                        mode_span,
+                    )
+                    .with_help("delete the `.mode` directive; see `raql capabilities`"),
+                );
+                continue;
+            }
+            if decl.attrs.contains(&DeclAttr::Input) {
+                let mode_span = spans.and_then(|items| items.first()).copied();
+                diagnostics.push(
+                    CompilerDiagnostic::error(
+                        "RAQL0106",
+                        format!(
+                            "`.mode` on the input relation `{pred}` — input relations are \
+                             pre-materialized, so every binding pattern is available; binding \
+                             modes are contracts on derived predicates (SPEC §9.1)",
+                        ),
+                        mode_span,
+                    )
+                    .with_help("delete the `.mode` directive"),
+                );
+                continue;
+            }
             for (mode_idx, sig) in sigs.iter().enumerate() {
                 let mode_span = spans
                     .and_then(|items| items.get(mode_idx))

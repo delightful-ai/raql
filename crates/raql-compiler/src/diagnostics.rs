@@ -146,19 +146,3 @@ pub(crate) fn format_span_brief(sources: &raql_syntax::SourceMap, span: SrcSpan)
     }
 }
 
-pub(crate) fn format_span_excerpt(sources: &raql_syntax::SourceMap, span: SrcSpan) -> String {
-    let Some(file) = sources.get(span.file) else {
-        return "<unknown>".to_string();
-    };
-    let start = clamp_to_char_boundary(file.text(), u32::from(span.range.start()) as usize);
-    let end = clamp_to_char_boundary(file.text(), u32::from(span.range.end()) as usize);
-    let Some(snippet) = file.text().get(start..end) else {
-        return "<unknown>".to_string();
-    };
-    let normalized = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        "<unknown>".to_string()
-    } else {
-        normalized
-    }
-}

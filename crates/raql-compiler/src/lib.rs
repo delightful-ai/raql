@@ -3,6 +3,8 @@
 
 mod diagnostics;
 mod expand;
+mod externs;
+mod lower;
 mod plan;
 mod program;
 mod resolve;
@@ -10,9 +12,11 @@ mod strata;
 mod typecheck;
 
 pub use diagnostics::{CompilerDiagnostic, DiagBundle};
+pub use lower::{
+    DerivedProvenance, GoalPath, InputKind, InputProvenance, LoweredProgram, RuleProvenance,
+};
 pub use plan::{
-    ExternLookupPlan, GoalPlan, PlannedProgram, PlannedRule, RulePlan, plan, reachable_predicates,
-    required_extern_capabilities,
+    PlannedProgram, plan, plan_with_options, reachable_predicates, required_extern_capabilities,
 };
 pub use program::{
     CompilerType, EnumDecl, ModeDir, ModeSig, PredicateDecl, ResolvedProgram, TypedProgram,

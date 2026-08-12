@@ -4,7 +4,6 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
-use raql_host::ExternLookupShape;
 use raql_syntax::{Directive, Goal, Stmt, parse_program, parse_program_from_file};
 
 use crate::diagnostics::format_span_brief;
@@ -81,7 +80,7 @@ fn resolve_diagnostic_carries_include_stack_for_included_file_error() {
 #[test]
 fn plan_diagnostic_carries_include_stack_for_included_file_error() {
     let (root_utf8, expected_stack, temp_dir) = write_include_chain_fixture(
-        ".decl edge(A: int, B: int) input.\n.mode edge(+int, -int).\n.decl blocked(B: int).\nblocked(B) :- edge(A, B).\n",
+        ".decl blocked(B: Def).\nblocked(B) :- caller(A, B, S, K).\n",
     );
     let parsed = parse_program_from_file(root_utf8.as_path(), &[]).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
@@ -107,7 +106,7 @@ reach(A, B) :- edge(A, B).
     let resolved = resolve(parsed).expect("resolve");
     let typed = typecheck(resolved).expect("type");
     let planned = plan(typed).expect("plan");
-    assert_eq!(planned.planned_rules().len(), 1);
+    assert_eq!(planned.rules().len(), 1);
 }
 
 #[test]
@@ -222,7 +221,7 @@ p(1).
 #[test]
 fn mode_arity_mismatch_points_to_mode_span_with_contextual_message() {
     let src = r#"
-.decl edge(A: int, B: int) input.
+.decl edge(A: int, B: int).
 .mode edge(+int).
 "#;
     let parsed_for_spans = parse_program(src).expect("parse");
@@ -257,7 +256,7 @@ fn mode_arity_mismatch_points_to_mode_span_with_contextual_message() {
 #[test]
 fn mode_type_mismatch_reports_argument_direction_and_types() {
     let src = r#"
-.decl edge(A: int, B: int) input.
+.decl edge(A: int, B: int).
 .mode edge(+string, -int).
 "#;
     let parsed_for_spans = parse_program(src).expect("parse");
@@ -280,14 +279,20 @@ fn mode_type_mismatch_reports_argument_direction_and_types() {
     assert!(diag.message.contains("provides `string`"));
 }
 
+/// The RAQL0301 message is raql-plan's SPEC §10.3 contract, and the
+/// diagnostic points at the offending goal's span.
 #[test]
 fn planner_reports_stuck_mode_with_context_and_exact_code() {
     let src = r#"
-.decl edge(A: int, B: int) input.
-.mode edge(+int, -int).
-.decl blocked(B: int).
-blocked(B) :- edge(A, B).
+.decl blocked(B: Def).
+blocked(B) :- caller(A, B, S, K).
 "#;
+    let parsed_for_spans = parse_program(src).expect("parse");
+    let goal_span = match &parsed_for_spans.phase().statements[1].value {
+        Stmt::Rule(rule) => rule.body[0].span,
+        _ => panic!("expected rule"),
+    };
+
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
     let typed = typecheck(resolved).expect("type");
@@ -296,46 +301,20 @@ blocked(B) :- edge(A, B).
         .iter()
         .find(|d| d.code_str() == "RAQL0301")
         .expect("must contain RAQL0301");
-    assert!(diag.message.contains("first blocked goal"));
-    assert!(diag.message.contains("`edge(A, B)`"));
-    assert!(
-        diag.message
-            .contains("goal kind `atom`: `edge/2` cannot run")
-    );
-    assert!(diag.message.contains("mode 1 `(+int, -int)`"));
-    assert!(diag.message.contains("missing or ungrounded inputs:"));
-    assert!(diag.message.contains("arg 1 `A` (+ input `int`)"));
-    assert!(diag.message.contains("missing grounded vars: A"));
-    assert!(diag.message.contains("current variable context:"));
-    assert!(diag.message.contains("bound vars: none"));
-    assert!(diag.message.contains("grounded vars: none"));
-    assert!(diag.span().is_some());
-    assert!(
-        diag.help
-            .as_deref()
-            .is_some_and(|h| h.contains("to make `edge(A, B)` runnable"))
-    );
-    assert!(
-        diag.help
-            .as_deref()
-            .is_some_and(|h| h.contains("selected mode: mode 1 `(+int, -int)`"))
-    );
-    assert!(
-        diag.help
-            .as_deref()
-            .is_some_and(|h| h.contains("bind required inputs earlier or add mode declarations"))
-    );
+    assert!(diag.message.contains("no satisfiable access path for `caller(A, B, S, K)`"));
+    assert!(diag.message.contains("bound here: (none)"));
+    assert!(diag.message.contains("caller(+A, -, -, -)"));
+    assert!(diag.message.contains("[C2]"));
+    assert!(diag.message.contains("fix: bind A first (e.g. via def_name/def_at)"));
+    assert_eq!(diag.span(), Some(goal_span));
 }
 
 #[test]
-fn planner_reports_current_bound_and_grounded_context_when_stuck() {
+fn planner_reports_current_bound_context_when_stuck() {
     let src = r#"
-.decl src(A: int) input.
-.mode src(-int).
-.decl edge(A: int, B: int) input.
-.mode edge(+int, +int).
-.decl blocked(B: int).
-blocked(B) :- src(A), edge(A, B).
+.decl src(D: Def) input.
+.decl blocked(B: Def).
+blocked(B) :- src(B), caller(A, B, S, K).
 "#;
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
@@ -346,13 +325,9 @@ blocked(B) :- src(A), edge(A, B).
         .find(|d| d.code_str() == "RAQL0301")
         .expect("must contain RAQL0301");
 
-    assert!(diag.message.contains("`edge(A, B)`"));
-    assert!(diag.message.contains("missing or ungrounded inputs:"));
-    assert!(diag.message.contains("arg 2 `B` (+ input `int`)"));
-    assert!(diag.message.contains("missing grounded vars: B"));
-    assert!(diag.message.contains("current variable context:"));
-    assert!(diag.message.contains("bound vars: A"));
-    assert!(diag.message.contains("grounded vars: A"));
+    assert!(diag.message.contains("no satisfiable access path for `caller(A, B, S, K)`"));
+    assert!(diag.message.contains("bound here: B"));
+    assert!(diag.message.contains("fix: bind A first"));
 }
 
 #[test]
@@ -809,8 +784,6 @@ q(X) :- p(X), choose_topk("tag", 1, 1, S, I : base(I), S := I), X = I.
 fn witness_path_is_forbidden_inside_recursive_scc() {
     let src = r#"
 .decl graph_edge(Graph: string, From: Def, To: Def, EdgeKind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
 .decl p(X: Def).
 .decl q(X: Def).
 p(X) :- q(X).
@@ -827,8 +800,6 @@ q(X) :- p(X), witness_path("g", X, X, _).
 fn witness_path_induces_selection_dependency_on_graph_edge() {
     let src = r#"
 .decl graph_edge(Graph: string, From: Def, To: Def, EdgeKind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
 .decl seed(D: Def) input.
 .decl hop(P: Path).
 hop(P) :- seed(D), witness_path("g", D, D, P).
@@ -850,8 +821,6 @@ hop(P) :- seed(D), witness_path("g", D, D, P).
 fn path_hop_induces_selection_dependency_on_graph_edge() {
     let src = r#"
 .decl graph_edge(Graph: string, From: Def, To: Def, EdgeKind: string, Evidence: Span) input.
-.decl path_hop(P: Path, Seq: int, From: Def, To: Def, Kind: string, Evidence: Span) extern.
-.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
 .decl seed_path(P: Path) input.
 .decl hops(Seq: int).
 hops(Seq) :- seed_path(P), path_hop(P, Seq, _, _, _, _).
@@ -895,76 +864,48 @@ q(X) :- X = Y, p(Y).
     let resolved = resolve(parsed).expect("resolve");
     let typed = typecheck(resolved).expect("type");
     let planned = plan(typed).expect("plan");
-    let order = planned.planned_rules()[0]
-        .ordered_goals()
-        .iter()
-        .map(|g| g.index())
-        .collect::<Vec<_>>();
-    assert_eq!(order, vec![1, 0]);
+    let explain = planned.explain();
+    let input_at = explain.find("input p").expect("input goal in explain");
+    let eq_at = explain.find("builtin =").expect("eq builtin in explain");
+    assert!(input_at < eq_at, "p(Y) must run before X = Y:\n{explain}");
 }
 
+/// Catalog mode selection: a bound `Def` takes the C0 projection; a bound
+/// name constant takes the C2 symbol-index seed. (The old per-goal lookup
+/// metadata is gone — the physical plan's operator choice is the truth.)
 #[test]
-fn planner_marks_function_extern_bound_input_for_pushdown() {
+fn planner_selects_catalog_operator_per_binding() {
     let src = r#"
-.decl src(A: int) input.
-.func f(A: int, Name: string) extern.
+.decl src(D: Def) input.
 .decl hit(Name: string).
-hit(Name) :- src(A), f(A, Name).
+hit(Name) :- src(D), def_name(D, Name).
 "#;
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
     let typed = typecheck(resolved).expect("type");
     let planned = plan(typed).expect("plan");
-    let lookup = planned.planned_rules()[0].ordered_goals()[1]
-        .extern_lookup()
-        .expect("lookup metadata");
+    let explain = planned.explain();
+    assert!(explain.contains("def_name/name-of-def"), "{explain}");
 
-    assert_eq!(lookup.shape(), ExternLookupShape::FunctionExactBindings);
-    assert_eq!(lookup.bound_positions(), &[0]);
-}
-
-#[test]
-fn planner_marks_function_extern_bound_output_constant_for_pushdown() {
     let src = r#"
-.func def_name(D: Def, Name: string) extern.
-.decl hit().
-hit() :- def_name(_, "alpha").
+.decl hit(D: Def).
+hit(D) :- def_name(D, "alpha").
 "#;
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
     let typed = typecheck(resolved).expect("type");
     let planned = plan(typed).expect("plan");
-    let lookup = planned.planned_rules()[0].ordered_goals()[0]
-        .extern_lookup()
-        .expect("lookup metadata");
-
-    assert_eq!(lookup.shape(), ExternLookupShape::FunctionExactBindings);
-    assert_eq!(lookup.bound_positions(), &[1]);
+    let explain = planned.explain();
+    assert!(explain.contains("def_name/defs-by-exact-name"), "{explain}");
+    assert!(planned.physical().scans.is_empty(), "{explain}");
 }
 
+/// The zero-bound allowlist is gone: enumeration happens only through
+/// declared catalog scans, visibly; a pure filter with nothing bound is an
+/// honest RAQL0301 refusal.
 #[test]
-fn planner_leaves_unbound_function_extern_without_pushdown_metadata() {
+fn zero_bound_enumeration_is_scan_or_refusal() {
     let src = r#"
-.func f(Name: string) extern.
-.decl hit(Name: string).
-hit(Name) :- f(Name).
-"#;
-    let parsed = parse_program(src).expect("parse");
-    let resolved = resolve(parsed).expect("resolve");
-    let typed = typecheck(resolved).expect("type");
-    let planned = plan(typed).expect("plan");
-
-    assert!(
-        planned.planned_rules()[0].ordered_goals()[0]
-            .extern_lookup()
-            .is_none()
-    );
-}
-
-#[test]
-fn planner_marks_zero_bound_def_relation_for_lookup() {
-    let src = r#"
-.decl def(D: Def) extern.
 .decl hit(D: Def).
 hit(D) :- def(D).
 "#;
@@ -972,29 +913,164 @@ hit(D) :- def(D).
     let resolved = resolve(parsed).expect("resolve");
     let typed = typecheck(resolved).expect("type");
     let planned = plan(typed).expect("plan");
-    let lookup = planned.planned_rules()[0].ordered_goals()[0]
-        .extern_lookup()
-        .expect("lookup metadata");
+    assert_eq!(planned.physical().scans.len(), 1);
+    assert_eq!(planned.physical().scans[0].predicate, "def");
+    assert!(planned.explain().contains("def/defs-scan"), "{}", planned.explain());
 
-    assert_eq!(lookup.shape(), ExternLookupShape::RelationExactBindings);
-    assert!(lookup.bound_positions().is_empty());
-}
-
-#[test]
-fn planner_marks_zero_bound_visibility_relation_for_lookup() {
     let src = r#"
-.decl is_public(D: Def) extern.
 .decl hit(D: Def).
 hit(D) :- is_public(D).
 "#;
     let parsed = parse_program(src).expect("parse");
     let resolved = resolve(parsed).expect("resolve");
     let typed = typecheck(resolved).expect("type");
-    let planned = plan(typed).expect("plan");
-    let lookup = planned.planned_rules()[0].ordered_goals()[0]
-        .extern_lookup()
-        .expect("lookup metadata");
+    let err = plan(typed).expect_err("unbound filter must refuse");
+    let diag = err
+        .iter()
+        .find(|d| d.code_str() == "RAQL0301")
+        .expect("must contain RAQL0301");
+    assert!(diag.message.contains("no satisfiable access path for `is_public(D)`"));
+}
 
-    assert_eq!(lookup.shape(), ExternLookupShape::RelationExactBindings);
-    assert!(lookup.bound_positions().is_empty());
+/// Scans are deniable per request (SPEC §8.5): `deny_scans` turns the same
+/// plan into RAQL0310.
+#[test]
+fn deny_scans_refuses_enumeration() {
+    let src = r#"
+.decl hit(D: Def).
+hit(D) :- def(D).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("type");
+    let err = crate::plan_with_options(typed, raql_plan::PlanOptions { deny_scans: true })
+        .expect_err("scan must be denied");
+    let diag = err
+        .iter()
+        .find(|d| d.code_str() == "RAQL0310")
+        .expect("must contain RAQL0310");
+    assert!(diag.message.contains("`def`"));
+}
+
+/// Disabled roadmap predicates fail at compile time with RAQL0302 naming
+/// them, anchored at the offending goal (SPEC §4.3).
+#[test]
+fn disabled_predicate_is_a_compile_error() {
+    let src = r#"
+.decl seed(D: Def) input.
+.decl bad(D: Def) output.
+bad(D) :- seed(D), converts(D, _, _, _).
+"#;
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("type");
+    let err = plan(typed).expect_err("disabled predicate must refuse");
+    let diag = err
+        .iter()
+        .find(|d| d.code_str() == "RAQL0302")
+        .expect("must contain RAQL0302");
+    assert!(diag.message.contains("`converts`"));
+    assert!(diag.span().is_some());
+}
+
+/// Catalog names cannot be redeclared, extern declarations are gone from
+/// the language, and `.mode` belongs to derived predicates only.
+#[test]
+fn catalog_surface_is_not_program_writable() {
+    let src = ".decl def_name(D: Def, Name: string).\n";
+    let parsed = parse_program(src).expect("parse");
+    let err = resolve(parsed).expect_err("catalog redeclaration must fail");
+    assert!(has_code(&err, "RAQL0101"));
+
+    let src = ".decl f(Name: string) extern.\n";
+    let parsed = parse_program(src).expect("parse");
+    let err = resolve(parsed).expect_err("user extern must fail");
+    assert!(has_code(&err, "RAQL0105"));
+
+    let src = ".mode def_name(+Def, -string).\n";
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let err = typecheck(resolved).expect_err("mode on extern must fail");
+    assert!(has_code(&err, "RAQL0105"));
+
+    let src = ".decl seed(D: Def) input.\n.mode seed(+Def).\n";
+    let parsed = parse_program(src).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let err = typecheck(resolved).expect_err("mode on input must fail");
+    assert!(has_code(&err, "RAQL0106"));
+}
+
+fn compile_view(name: &str) -> crate::PlannedProgram {
+    let repo_root = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize_utf8()
+        .expect("repo root");
+    let path = repo_root.join("views").join(name);
+    let parsed = parse_program_from_file(path.as_path(), &[repo_root]).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    plan(typed).unwrap_or_else(|diags| panic!("plan {name}: {diags:#?}"))
+}
+
+/// The P1 probe view compiles through the whole new pipeline: catalog
+/// externs, bound-first stdlib, aggregate lowering, demand planning. Its
+/// plan is seeded (the only reported scans are unseeded derived calls,
+/// bounded by the C2 name seed — no extern enumeration).
+#[test]
+fn stdlib_callers_view_compiles_and_plans_seeded() {
+    let planned = compile_view("stdlib_callers_load_and_plan.raql");
+    let explain = planned.explain();
+    assert!(explain.contains("root caller_report"), "{explain}");
+    assert!(explain.contains("caller/callers-of-fn"), "{explain}");
+    assert!(explain.contains("def_name/defs-by-exact-name"), "{explain}");
+    assert!(!explain.contains("defs-scan"), "no enumeration: {explain}");
+    assert!(
+        planned.physical().scans.iter().all(|scan| scan.cost <= raql_plan::CostClass::C2),
+        "P1 stays name-seed bounded: {:?}",
+        planned.physical().scans,
+    );
+}
+
+/// The dispatch-hotspots view runs on the explicit `call_edge` scan
+/// (SPEC §8.5): visible in the plan, C4, via the outgoing direction.
+#[test]
+fn dispatch_hotspots_view_uses_the_declared_scan() {
+    let planned = compile_view("stdlib_dispatch_hotspots.raql");
+    assert!(
+        planned.physical().scans.iter().any(|scan| scan.predicate == "call_edge"),
+        "{:?}",
+        planned.physical().scans,
+    );
+    assert_eq!(planned.physical().max_cost, raql_plan::CostClass::C4);
+    assert!(planned.explain().contains("call_edge/scan"), "{}", planned.explain());
+}
+
+/// The callers demo exercises choose_topk, arithmetic binds, handles, and
+/// the output helpers end to end.
+#[test]
+fn callers_demo_view_compiles() {
+    let planned = compile_view("callers_demo.raql");
+    let explain = planned.explain();
+    assert!(explain.contains("#topk:view.callers.top_fn"), "{explain}");
+    assert!(explain.contains("handle/handle-of-def"), "{explain}");
+}
+
+/// The error-conversions view stays dark until the error-flow family
+/// leaves `disabled` (SPEC §17.1): RAQL0302 naming `converts`.
+#[test]
+fn error_conversions_view_is_dark() {
+    let repo_root = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize_utf8()
+        .expect("repo root");
+    let path = repo_root.join("views/stdlib_error_conversions.raql");
+    let parsed = parse_program_from_file(path.as_path(), &[repo_root]).expect("parse");
+    let resolved = resolve(parsed).expect("resolve");
+    let typed = typecheck(resolved).expect("typecheck");
+    let err = plan(typed).expect_err("must stay dark");
+    let diag = err
+        .iter()
+        .find(|d| d.code_str() == "RAQL0302")
+        .expect("must contain RAQL0302");
+    assert!(diag.message.contains("`converts`"));
 }

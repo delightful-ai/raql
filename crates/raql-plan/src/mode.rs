@@ -31,7 +31,7 @@ impl CostClass {
 }
 
 /// Binding state of one argument position within a mode (SPEC §8.2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Binding {
     /// `+` — must be bound when the goal runs.
     Bound,

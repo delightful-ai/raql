@@ -200,6 +200,40 @@ pub struct TypedProgram {
     pub(crate) rules: Vec<TypedRule>,
 }
 
+impl TypedProgram {
+    pub fn sources(&self) -> &raql_syntax::SourceMap {
+        &self.sources
+    }
+
+    pub fn predicates(&self) -> &BTreeMap<String, PredicateDecl> {
+        &self.predicates
+    }
+
+    pub fn enum_decl(&self, name: &str) -> Option<&EnumDecl> {
+        self.enums.get(name)
+    }
+
+    pub fn modes(&self, predicate: &str) -> Option<&[ModeSig]> {
+        self.modes.get(predicate).map(Vec::as_slice)
+    }
+
+    pub fn pragma_i64(&self, name: &str) -> Option<i64> {
+        self.pragmas.get(name).copied()
+    }
+
+    pub fn facts(&self) -> &[Spanned<raql_syntax::Fact>] {
+        &self.facts
+    }
+
+    pub fn rules(&self) -> &[TypedRule] {
+        &self.rules
+    }
+
+    pub(crate) fn set_rules(&mut self, rules: Vec<TypedRule>) {
+        self.rules = rules;
+    }
+}
+
 pub(crate) fn parse_type_ast(
     ast: &TypeAst,
     _span: Option<SrcSpan>,

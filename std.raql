@@ -1,22 +1,17 @@
-% RAQL Standard Library v0.1
+% RAQL Standard Library v0.2 (native-native)
 %
 % .include "std.raql".
 %
-% Each predicate is a claim you'd make in a code review:
+% Extern predicates are NOT declared here: their signatures, binding
+% modes, costs, and completeness come from the predicate catalog
+% (SPEC §8.1; `raql capabilities` renders it). This file retains what the
+% catalog cannot own: language enums, runtime inputs, derived rules, and
+% the output helpers.
 %
-%   "run_pipeline calls process through a trait bound"
-%   "the ? at line 82 converts ProcessError to MyError via From"
-%   "StoreId is compared with == in is_same_store"
-%
-% Four shapes, no exceptions:
-%
-%   Property:     def_name(+Def, -string)                .func, one per subject
-%   Relationship: caller(+Def, -Def, -Span, -Dispatch)   .decl, many per subject
-%   Bridge:       type_head_def(+TypeRef, -Def)           .func, connects worlds
-%   Filter:       is_fn(+Def)                             .decl, succeed or fail
-%
-% Argument 1 is always the subject. Modes guessable from names.
-% Level 1 = Def/Span space. Level 2 (bottom of file) adds TypeRef/Node.
+% Derived filters are bound-first (SPEC §9.3): a filter takes an already
+% bound subject; enumeration intent is the explicit scan predicate
+% (`def(D)`, `fn_def(F)`, unbound `call_edge`), never a filter that
+% happens to enumerate.
 
 % ═══════════════════════════════════════════════════════════════════
 % Enums
@@ -33,9 +28,6 @@
 }.
 
 .type DispatchKind = { DIRECT, THROUGH_TRAIT, DYN, CLOSURE, FN_POINTER }.
-.type RefKind      = { READ, WRITE, COMPARE, PASS, MOVE, FIELD }.
-.type Mutability   = { IMM, MUT }.
-.type NodeKind     = { IF, MATCH, WHILE, FOR, LOOP, BLOCK, TRY, ARM, OTHER }.
 .type RenderMode   = { DOC_SIG, ITEM, HEADER, LINE, STMT, BLOCK, EXPR }.
 .type FragTarget   = { DEF, SPAN }.
 
@@ -45,110 +37,14 @@
 
 .decl target_def(D: Def) input.
 
+% The call-graph predicates (`call_edge`, and the subject-first `caller`/
+% `callee`) are catalog externs — they need no stdlib aliases.
+
 % ═══════════════════════════════════════════════════════════════════
-% Level 1: Code review claims — Def/Span space
+% Error flow (dark until the error-flow family leaves `disabled`;
+% querying these fails at plan time with RAQL0302 naming the predicate)
 % ═══════════════════════════════════════════════════════════════════
 
-% ── Enumeration + search ──────────────────────────────────────────
-
-% Every def in the host's index. Seeds exploration queries.
-.decl def(D: Def) extern.
-.mode def(-Def).
-
-% Host-implemented fuzzy search. Replaces rg for semantic entities.
-.decl search(Q: string, D: Def, Score: int) extern.
-.mode search(+string, -Def, -int).
-
-% ── Identity ──────────────────────────────────────────────────────
-
-.func def_name(D: Def, Name: string) extern.
-.mode def_name(+Def, -string).
-
-.func def_kind(D: Def, K: DefKind) extern.
-.mode def_kind(+Def, -DefKind).
-
-.func def_span(D: Def, S: Span) extern.
-.mode def_span(+Def, -Span).
-
-.func def_path(D: Def, Path: string) extern.
-.mode def_path(+Def, -string).
-
-% "Method belongs to Type or Trait" — none for free fns.
-.func method_of(M: Def, Owner: option<Def>) extern.
-.mode method_of(+Def, -option<Def>).
-
-% ── Functions ─────────────────────────────────────────────────────
-
-% "Fn returns an error type" — none if not -> Result<_, E>.
-% Level 1 convenience; use fn_return_type (§L2) for full TypeRef.
-.func fn_error_type(F: Def, Err: option<Def>) extern.
-.mode fn_error_type(+Def, -option<Def>).
-
-% ── Call graph ────────────────────────────────────────────────────
-
-% The raw edge. Both modes for bidirectional queries.
-.decl call_edge(Caller: Def, Callee: Def, Site: Span, Dispatch: DispatchKind) extern.
-.mode call_edge(+Def, -Def, -Span, -DispatchKind).
-.mode call_edge(-Def, +Def, -Span, -DispatchKind).
-.mode call_edge(-Def, -Def, -Span, -DispatchKind).
-
-% Subject-first aliases.
-.decl caller(Target: Def, CallerFn: Def, Site: Span, Dispatch: DispatchKind).
-.mode caller(+Def, -Def, -Span, -DispatchKind).
-
-caller(Target, CallerFn, Site, Dispatch) :-
-  call_edge(CallerFn, Target, Site, Dispatch).
-
-.decl callee(Fn: Def, Target: Def, Site: Span, Dispatch: DispatchKind).
-.mode callee(+Def, -Def, -Span, -DispatchKind).
-
-callee(Fn, Target, Site, Dispatch) :-
-  call_edge(Fn, Target, Site, Dispatch).
-
-% ── Structure ─────────────────────────────────────────────────────
-
-.decl field(Struct: Def, Name: string, FieldType: TypeRef) extern.
-.mode field(+Def, -string, -TypeRef).
-
-.decl variant(Enum: Def, Name: string, VariantDef: Def) extern.
-.mode variant(+Def, -string, -Def).
-
-.decl method(Type: Def, M: Def) extern.
-.mode method(+Def, -Def).
-
-.decl trait_method(Trait: Def, M: Def) extern.
-.mode trait_method(+Def, -Def).
-
-% ── Traits ────────────────────────────────────────────────────────
-
-.decl implements(Type: Def, Trait: Def, ImplDef: Def) extern.
-.mode implements(+Def, -Def, -Def).
-.mode implements(-Def, +Def, -Def).
-
-.decl from_impl(Src: Def, Dst: Def, ImplDef: Def) extern.
-.mode from_impl(+Def, -Def, -Def).
-.mode from_impl(-Def, +Def, -Def).
-
-% ── Error flow ────────────────────────────────────────────────────
-
-.decl constructs(ErrType: Def, Variant: string, Site: Span, Fn: Def) extern.
-.mode constructs(+Def, -string, -Span, -Def).
-.mode constructs(-Def, -string, -Span, -Def).
-
-.decl propagates(ErrType: Def, Site: Span, Fn: Def) extern.
-.mode propagates(+Def, -Span, -Def).
-.mode propagates(-Def, -Span, -Def).
-
-.decl converts(SrcErr: Def, DstErr: Def, Site: Span, Fn: Def) extern.
-.mode converts(+Def, -Def, -Span, -Def).
-.mode converts(-Def, +Def, -Span, -Def).
-.mode converts(-Def, -Def, -Span, -Def).
-
-.decl handles(ErrType: Def, Variant: option<string>, Site: Span, Fn: Def) extern.
-.mode handles(+Def, -option<string>, -Span, -Def).
-.mode handles(-Def, -option<string>, -Span, -Def).
-
-% Derived: error graph edges for trace views.
 .decl error_edge(From: Def, To: Def, EdgeKind: string, Evidence: Span).
 
 error_edge(Err, Err, "construct", Site) :- constructs(Err, _, Site, _).
@@ -156,42 +52,30 @@ error_edge(Err, Err, "propagate", Site) :- propagates(Err, Site, _).
 error_edge(Src, Dst, "convert", Site)   :- converts(Src, Dst, Site, _).
 error_edge(Err, Err, "handle", Site)    :- handles(Err, _, Site, _).
 
-% ── Reference events ──────────────────────────────────────────────
-
-.decl compares(Type: Def, Site: Span, Op: string, Fn: Def) extern.
-.mode compares(+Def, -Span, -string, -Def).
-
-.decl writes(Subject: Def, Site: Span, Fn: Def) extern.
-.mode writes(+Def, -Span, -Def).
-
-% ── Scope ─────────────────────────────────────────────────────────
-
-.decl span_allowed(S: Span) extern.
-.mode span_allowed(+Span).
+% ═══════════════════════════════════════════════════════════════════
+% Scope + filters (bound-first, SPEC §9.3)
+% ═══════════════════════════════════════════════════════════════════
 
 .decl def_allowed(D: Def).
-def_allowed(D) :- def(D), def_span(D, S), span_allowed(S).
-
-% ── Filters ───────────────────────────────────────────────────────
+.mode def_allowed(+Def).
+def_allowed(D) :- def_span(D, S), span_allowed(S).
 
 .decl is_fn(D: Def).
-is_fn(D) :- def(D), def_kind(D, DefKind::FN).
-is_fn(D) :- def(D), def_kind(D, DefKind::METHOD).
+.mode is_fn(+Def).
+is_fn(D) :- def_kind(D, DefKind::FN).
+is_fn(D) :- def_kind(D, DefKind::METHOD).
 
 .decl is_struct(D: Def).
-is_struct(D) :- def(D), def_kind(D, DefKind::STRUCT).
+.mode is_struct(+Def).
+is_struct(D) :- def_kind(D, DefKind::STRUCT).
 
 .decl is_enum(D: Def).
-is_enum(D) :- def(D), def_kind(D, DefKind::ENUM).
+.mode is_enum(+Def).
+is_enum(D) :- def_kind(D, DefKind::ENUM).
 
 .decl is_trait(D: Def).
-is_trait(D) :- def(D), def_kind(D, DefKind::TRAIT).
-
-.decl is_public(D: Def) extern.
-.mode is_public(+Def).
-
-.decl in_test(D: Def) extern.
-.mode in_test(+Def).
+.mode is_trait(+Def).
+is_trait(D) :- def_kind(D, DefKind::TRAIT).
 
 % ═══════════════════════════════════════════════════════════════════
 % Output helpers
@@ -254,147 +138,9 @@ out_metric_str(Sec, Name, Val) :- emit_label(Sec, Name, Val).
 .decl out_note(Section: string, Message: string) output.
 
 % ═══════════════════════════════════════════════════════════════════
-% Utility
-% ═══════════════════════════════════════════════════════════════════
-
-.func dispatch_str(D: DispatchKind, S: string) extern.
-.mode dispatch_str(+DispatchKind, -string).
-
-% ═══════════════════════════════════════════════════════════════════
-% Graph + witness path (§11.2)
+% Graph + witness path (§11.2) — `witness_path`/`path_hop` are
+% engine-managed builtins; views add `graph_edge` rules.
 % ═══════════════════════════════════════════════════════════════════
 
 .decl graph_edge(Graph: string, From: Def, To: Def,
                  EdgeKind: string, Evidence: Span).
-
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-
-.decl path_hop(P: Path, Seq: int, From: Def, To: Def,
-               EdgeKind: string, Evidence: Span) extern.
-.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
-
-% ═══════════════════════════════════════════════════════════════════
-% String helpers (§15)
-% ═══════════════════════════════════════════════════════════════════
-
-.decl contains(Haystack: string, Needle: string) extern.
-.mode contains(+string, +string).
-
-.decl starts_with(S: string, Prefix: string) extern.
-.mode starts_with(+string, +string).
-
-% ═══════════════════════════════════════════════════════════════════
-% Level 2: Compiler internals — TypeRef/Node space
-% ═══════════════════════════════════════════════════════════════════
-
-% ── Type navigation ───────────────────────────────────────────────
-
-.func fn_return_type(F: Def, TR: TypeRef) extern.
-.mode fn_return_type(+Def, -TypeRef).
-
-% ── Type decomposition ────────────────────────────────────────────
-
-.decl ty_app(TR: TypeRef, Head: Def) extern.
-.mode ty_app(+TypeRef, -Def).
-.mode ty_app(-TypeRef, -Def).
-
-.decl ty_arg(TR: TypeRef, Index: int, Arg: TypeRef) extern.
-.mode ty_arg(+TypeRef, -int, -TypeRef).
-.mode ty_arg(+TypeRef, +int, -TypeRef).
-
-.decl ty_ref(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
-.mode ty_ref(+TypeRef, -Mutability, -TypeRef).
-
-.decl ty_ptr(TR: TypeRef, Mut: Mutability, Inner: TypeRef) extern.
-.mode ty_ptr(+TypeRef, -Mutability, -TypeRef).
-
-.decl ty_tuple(TR: TypeRef, Index: int, Elem: TypeRef) extern.
-.mode ty_tuple(+TypeRef, -int, -TypeRef).
-.mode ty_tuple(+TypeRef, +int, -TypeRef).
-
-.decl ty_slice(TR: TypeRef, Elem: TypeRef) extern.
-.mode ty_slice(+TypeRef, -TypeRef).
-
-.decl ty_param(TR: TypeRef, Param: Def) extern.
-.mode ty_param(+TypeRef, -Def).
-
-.decl ty_prim(TR: TypeRef, Name: string) extern.
-.mode ty_prim(+TypeRef, -string).
-
-.decl ty_unknown(TR: TypeRef) extern.
-.mode ty_unknown(+TypeRef).
-
-% ── Derived type helpers ──────────────────────────────────────────
-
-.decl type_head_def(TR: TypeRef, D: Def).
-.mode type_head_def(+TypeRef, -Def).
-type_head_def(TR, D) :- ty_app(TR, D).
-
-.decl type_head_path(TR: TypeRef, Path: string).
-.mode type_head_path(+TypeRef, -string).
-.mode type_head_path(-TypeRef, -string).
-type_head_path(TR, Path) :- ty_app(TR, Head), def_path(Head, Path).
-
-.decl type_is(TR: TypeRef, Path: string).
-.mode type_is(+TypeRef, +string).
-.mode type_is(-TypeRef, +string).
-type_is(TR, Path) :- type_head_path(TR, Path).
-
-.decl type_is_result(TR: TypeRef, Ok: TypeRef, Err: TypeRef).
-.mode type_is_result(+TypeRef, -TypeRef, -TypeRef).
-type_is_result(TR, Ok, Err) :-
-  (type_is(TR, "std::result::Result") ; type_is(TR, "core::result::Result")),
-  ty_arg(TR, 0, Ok), ty_arg(TR, 1, Err).
-
-.decl type_is_option(TR: TypeRef, Inner: TypeRef).
-.mode type_is_option(+TypeRef, -TypeRef).
-type_is_option(TR, Inner) :-
-  (type_is(TR, "core::option::Option") ; type_is(TR, "std::option::Option")),
-  ty_arg(TR, 0, Inner).
-
-% ── Node tree ─────────────────────────────────────────────────────
-
-.func node_at(S: Span, N: option<Node>) extern.
-.mode node_at(+Span, -option<Node>).
-
-.func node_kind(N: Node, K: NodeKind) extern.
-.mode node_kind(+Node, -NodeKind).
-
-.func node_span(N: Node, S: Span) extern.
-.mode node_span(+Node, -Span).
-
-.func node_parent(N: Node, P: option<Node>) extern.
-.mode node_parent(+Node, -option<Node>).
-
-.decl enclosing_control(S: Span, K: NodeKind, ControlS: Span, Dist: int) extern.
-.mode enclosing_control(+Span, -NodeKind, -Span, -int).
-
-% ── Stable ordering keys ─────────────────────────────────────────
-
-.func handle(D: Def, H: string) extern.
-.mode handle(+Def, -string).
-
-.func span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
-.mode span_key(+Span, -string, -int, -int, -int, -int).
-
-.func typeref_id(TR: TypeRef, H: string) extern.
-.mode typeref_id(+TypeRef, -string).
-
-.func node_id(N: Node, H: string) extern.
-.mode node_id(+Node, -string).
-
-.decl call_id(C: Call, H: string) extern.
-.mode call_id(+Call, -string).
-.mode call_id(-Call, -string).
-
-.decl ref_id(R: Ref, H: string) extern.
-.mode ref_id(+Ref, -string).
-.mode ref_id(-Ref, -string).
-
-.decl impl_id(I: Impl, H: string) extern.
-.mode impl_id(+Impl, -string).
-.mode impl_id(-Impl, -string).
-
-.func world_stamp(Stamp: string) extern.
-.mode world_stamp(-string).

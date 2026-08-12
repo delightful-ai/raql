@@ -1,8 +1,9 @@
 //! Resolution: statements to a `ResolvedProgram`.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
-use raql_syntax::{AstPhase, Directive, ModeDirection, Program, Spanned, SrcSpan, Stmt};
+use raql_syntax::{AstPhase, DeclAttr, Directive, ModeDirection, Program, Spanned, SrcSpan, Stmt};
 
 use crate::diagnostics::{CompilerDiagnostic, DiagBundle, enrich_include_stack_context};
 use crate::program::{
@@ -99,6 +100,19 @@ pub fn resolve(program: Program<AstPhase>) -> Result<ResolvedProgram, DiagBundle
                     ));
                 }
                 let attrs = d.attrs.iter().map(|a| a.value).collect::<Vec<_>>();
+                if attrs.contains(&DeclAttr::Extern) {
+                    diagnostics.push(
+                        CompilerDiagnostic::error(
+                            "RAQL0105",
+                            format!(
+                                "`{name}` is declared `extern` — extern predicates come from \
+                                 the catalog (SPEC §8.1), not from program text",
+                            ),
+                            Some(d.name.span),
+                        )
+                        .with_help("see `raql capabilities` for the available predicates"),
+                    );
+                }
                 if predicates
                     .insert(
                         name.clone(),
@@ -122,6 +136,28 @@ pub fn resolve(program: Program<AstPhase>) -> Result<ResolvedProgram, DiagBundle
             }
             Stmt::Fact(f) => facts.push(Spanned::new(stmt.span, f.clone())),
             Stmt::Rule(r) => rules.push(Spanned::new(stmt.span, r.clone())),
+        }
+    }
+
+    // Catalog externs and injected engine builtins (SPEC §8.1): the
+    // program receives these without declaring them, and may not
+    // redeclare them.
+    for (name, decl) in crate::externs::injected_declarations() {
+        match predicates.entry(name) {
+            Entry::Occupied(user) => {
+                diagnostics.push(CompilerDiagnostic::error(
+                    "RAQL0101",
+                    format!(
+                        "`{}` redeclares a catalog extern predicate — extern signatures come \
+                         from the catalog (SPEC §8.1), not from program text",
+                        user.key(),
+                    ),
+                    Some(user.get().span),
+                ));
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(decl);
+            }
         }
     }
 
