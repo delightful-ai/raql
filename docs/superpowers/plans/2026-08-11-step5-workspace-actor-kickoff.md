@@ -47,6 +47,44 @@ deliberately don't.
   reference was cold ~4.1s / warm ~59–69ms — warm regressed ~2x (no
   join batching, per-env operator invokes); see next-work item 3.
 
+## How much to trust this (a reviewer's attack list)
+
+The suites are green, but read the green correctly: **the implementation
+and the test oracle were replaced on the same day, by the same session.**
+Priorities for anyone auditing:
+
+1. **No old-vs-new parity was ever run.** The §17.2 step-8 shadow-run
+   became impossible the moment std.raql stopped compiling on the old
+   path; the old engine's 60 tests (the accumulated behavioral record)
+   died with the API they were written against. The conformance corpus
+   (hashbrown, serde, rust-analyzer, tokio) has NOT been executed on the
+   new runtime. Today's tests prove self-consistency, not correctness.
+   Running the corpus is the cheapest large trust gain available.
+2. **`raql-engine/src/eval.rs` is the scariest file.** The mutual-
+   recursion scheme (in-progress partials, don't-memoize-if-an-ancestor
+   was-touched, iterate the head to fixpoint) was derived in one pass
+   with no mutual-recursion test and no property test. Its failure mode
+   is silently missing rows, not a crash. Read it with hostile eyes.
+3. **The latency numbers are toy-sized.** Cold 3.17s / warm 124ms is a
+   4-row query. Evaluation is O(env-rows × operator invokes) with env
+   clones and zero join indexing — on a fat intermediate relation the
+   regression could be 50x, not 2x. No claim survives until P2/P4 run on
+   something rust-analyzer-sized.
+4. **Commit `497bd95` (the ~5k-line host-ra deletion + daemon rewire)
+   was verified by its gates (build/tests/e2e), not read line-by-line.**
+   The projection module and the deletion boundary deserve a real review.
+5. Cancellation: nothing anywhere catches the Salsa unwind; an edit
+   landing mid-query kills the daemon thread. Pre-existing, but the new
+   path holds queries open longer.
+
+Also: a handful of e2e expectations were pinned from observed output
+(impl ordinals, closure attribution) — each was checked against SPEC
+§13.2/§6.3 and the classification source, but treat them as witnessed,
+not derived. And the `handles` catalog column was mistranscribed once
+(`string` vs the old `option<string>`), so the §8.6 transcription of the
+*disabled* families should be diffed against the old surface before any
+of them is enabled.
+
 ## Decisions made (don't relitigate)
 
 - **Demand roots** replace the single query rule: a view's outputs are
@@ -107,23 +145,42 @@ deliberately don't.
 
 ## Next work, in order
 
-1. **Step 5 workspace actor** (SPEC §12): `raql-daemon` → `raql-server`;
+1. **Make the tool self-describing** (cheap, do first): CLI verbs
+   `raql capabilities` (print `Catalog::capabilities_text()`, no daemon)
+   and `raql lang explain <query>` (print `PlannedProgram::explain()`,
+   offline like `lang check`), plus a `--no-scan` flag wiring
+   `plan_with_options(deny_scans)`. All three are existing library
+   functions with no CLI surface — an agent currently cannot discover
+   the predicate surface or preview a plan's cost without reading Rust.
+   Also run the conformance corpus (attack-list item 1) — it needs no
+   new code, only time.
+2. **Regenerate the catalog reference into `std.raql`** (the "one file
+   teaches the language" property): the old std.raql was accidentally
+   the API reference — every extern sat there with `.decl`/`.mode` — and
+   the catalog move deliberately destroyed that discoverability. Restore
+   it without drift: render `capabilities_text()` (or a `.raql`-comment
+   flavor of it) into a fenced, clearly-marked GENERATED comment block in
+   std.raql, and add a registry-walking test that fails when the block
+   is stale (same doctrine as §8.1's "reference documentation is
+   generated"). Truth stays in the catalog; the file you already read
+   when writing queries shows the whole surface again.
+3. **Step 5 workspace actor** (SPEC §12): `raql-daemon` → `raql-server`;
    the §12.2 change pipeline as a recognizable `GlobalState::
    process_changes` adaptation; structural reloads (§12.3); snapshot-per-
    request with `catch_unwind` + the §11.2 retry ladder (the engine is
    already unwind-safe; nobody catches today); delete host-ra's
    `sync_workspace` sweep at that point. Warmup must respect the typed-
    attachment rule (`raql-ra/AGENTS.md`).
-2. **Output boundary completion** (§13): fragments/metrics/JSONL per
+4. **Output boundary completion** (§13): fragments/metrics/JSONL per
    `spec_sketch.md`, response stamping (§13.3), selector resolution
    (§13.2 `resolve()` with Alternatives) — `target_def` request bindings
    are currently always empty; P1-style views self-seed by name.
-3. **Latency evidence** (§15): P1 through the new path is cold 3.17s /
+5. **Latency evidence** (§15): P1 through the new path is cold 3.17s /
    warm 124ms (2026-08-11, this repo). Warm sits ~2x above the old-path
    reference (~60ms) — the engine invokes operators per env row with no
    join batching; §11.1's join-indexing quality bar is the likely fix.
    Re-run P2 and add `tests/latency_smoke.rs` (mandatory at cutover).
-4. Remaining §17.1 hygiene: the `raql-host` crate is now mostly dead
+6. Remaining §17.1 hygiene: the `raql-host` crate is now mostly dead
    vocabulary (host-ra keeps `CapabilityId`; raql-cli no longer depends
    on it); `ProtocolValue::Host` is unreachable from the daemon path;
    `views/stdlib_error_conversions.raql` stays dark by design.
