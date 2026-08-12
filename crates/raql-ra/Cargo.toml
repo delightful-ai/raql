@@ -1,0 +1,28 @@
+[package]
+name = "raql-ra"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+raql-plan = { path = "../raql-plan" }
+
+# rust-analyzer crates (pinned; see workspace Cargo.toml)
+hir.workspace = true
+ide-db.workspace = true
+syntax.workspace = true
+
+# The salsa version must match the pinned rust-analyzer's own.
+salsa.workspace = true
+
+[dev-dependencies]
+# Workspace loading for spike-gate tests and the dev-only timing probe.
+# These stay dev-only: raql-ra must never own process lifecycle (that is
+# raql-server's job).
+base-db.workspace = true
+ide.workspace = true
+load-cargo.workspace = true
+project-model.workspace = true
+vfs.workspace = true

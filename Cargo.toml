@@ -16,6 +16,8 @@ members = [
   "crates/raql-cli",
   "crates/raql-protocol",
   "crates/raql-daemon",
+  "crates/raql-ra",
+  "crates/raql-plan",
 ]
 default-members = [
   ".",
@@ -28,9 +30,13 @@ default-members = [
   "crates/raql-cli",
   "crates/raql-protocol",
   "crates/raql-daemon",
+  "crates/raql-ra",
+  "crates/raql-plan",
 ]
 
 [workspace.dependencies]
+# Must track the salsa version used by the pinned rust-analyzer rev (see vendor/rust-analyzer/Cargo.toml).
+salsa                    = { version = "0.28.2", default-features = false, features = ["rayon", "salsa_unstable", "macros", "inventory"] }
 camino                   = "1.2.1"
 bitflags                 = "2.6.0"
 chumsky                  = "0.9.3"

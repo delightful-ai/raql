@@ -1,6 +1,6 @@
 ## raql
 
-We have the full rust-analyzer workspace in `tmp/rust-analyzer` for reference and perusal. TAKE ADVANTAGE OF THIS WHENEVER RUST ANALYZER FEATURES WOULD HELP OUR LOGIC.
+We have the full rust-analyzer workspace in `vendor/rust-analyzer` for reference and perusal. TAKE ADVANTAGE OF THIS WHENEVER RUST ANALYZER FEATURES WOULD HELP OUR LOGIC.
 
 IMPORTANT: we do not care about backwards compatibility here. This is an unpublished local crate. Prefer long-term maintainability, fewer lies, and the right ownership boundaries over compatibility shims.
 
@@ -14,11 +14,13 @@ IMPORTANT: we do not care about backwards compatibility here. This is an unpubli
 
 ## Route work
 
-- `crates/raql-host-ra/` owns RA-native providers, workspace integration, lookup/index logic, and the boundary between RAQL and rust-analyzer.
+- `crates/raql-plan/` owns the predicate catalog (single source of truth for extern predicates) and, later, the binding-aware planner (SPEC §8–§10). No RA types, no execution.
+- `crates/raql-ra/` owns the new-architecture RA-native layer (SPEC §6): Salsa-tracked queries over `RootDatabase` and catalog operator bodies. Growing alongside the old host path until cutover; read its `AGENTS.md` before adding queries.
+- `crates/raql-host-ra/` owns RA-native providers, workspace integration, lookup/index logic, and the boundary between RAQL and rust-analyzer. (Legacy path: scheduled for deletion at cutover, SPEC §17; mechanical maintenance only.)
 - `crates/raql-daemon/` owns process lifecycle, warmup, socket/protocol, and request scheduling. It must not grow semantic extraction logic.
 - `crates/raql-cli/` stays a thin client over the daemon-backed path.
 - `crates/raql-engine/` owns RAQL execution semantics and host lookup contracts, not Rust semantic discovery.
-- `tmp/rust-analyzer/` is the reference tree for API choice, invariants, and integration patterns. Prefer matching RA's own patterns over inventing local approximations.
+- `vendor/rust-analyzer/` is the reference tree for API choice, invariants, and integration patterns. Prefer matching RA's own patterns over inventing local approximations.
 
 ## Invariants / keep out
 

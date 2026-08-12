@@ -1,0 +1,11 @@
+[package]
+name = "raql-plan"
+version = "0.0.0"
+edition = "2024"
+
+[lib]
+doctest = false
+
+[dependencies]
+# Intentionally empty: the catalog is declarative data plus planning logic.
+# This crate must never depend on rust-analyzer (SPEC §5.1).
