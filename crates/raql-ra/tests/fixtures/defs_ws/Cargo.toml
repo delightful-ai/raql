@@ -4,9 +4,9 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
-# A non-member path dependency: present in the crate graph but not
-# workspace-local, so scans must not enumerate it and its spans are out of
-# the request scope.
+# A non-member path dependency. RA's local/library partition counts path
+# deps as local, editable code — so scans DO enumerate it and its spans
+# are in scope (pinned by slice_c_scans).
 dep_lib = { path = "dep_lib" }
 
 # Keep this fixture out of the enclosing raql workspace, and the
