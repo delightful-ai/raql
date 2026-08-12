@@ -13,7 +13,19 @@
 
 use std::fmt;
 
+use crate::logic::DerivedId;
 use crate::mode::CostClass;
+
+/// Where an unsatisfiable goal lives in the planner input, so the lang
+/// layer can map the error back to a source span: the owning derived
+/// predicate, the rule index within it, and the goal's index in that
+/// rule's body. Not part of the rendered message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoalLocation {
+    pub predicate: DerivedId,
+    pub rule_index: usize,
+    pub source_index: usize,
+}
 
 /// One access-path alternative in a `RAQL0301` listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +59,9 @@ pub struct UnsatisfiableGoal {
     /// True when a scan mode would have satisfied the goal but scans are
     /// denied for this request.
     pub scans_denied: bool,
+    /// Where the goal lives in the planner input (`None` for a root
+    /// demand, which has no call site).
+    pub location: Option<GoalLocation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

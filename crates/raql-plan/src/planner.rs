@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::Catalog;
-use crate::error::{ModeAlternative, PlanError, UnsatisfiableGoal};
+use crate::error::{GoalLocation, ModeAlternative, PlanError, UnsatisfiableGoal};
 use crate::logic::{DerivedId, Goal, GoalRef, Program, Rule, Term, Var};
 use crate::mode::{AccessKind, Binding, CostClass, Pattern};
 use crate::plan::{Access, PhysicalPlan, PlannedGoal, PlannedRule, ScanUse, Specialization};
@@ -677,6 +677,7 @@ impl Planner<'_> {
                 unlock_sets,
                 seed_hint: Vec::new(),
                 scans_denied: false,
+                location: None,
             })));
         }
         self.demand(root.predicate, root.pattern.clone(), false, false)
@@ -684,6 +685,7 @@ impl Planner<'_> {
 
     fn plan_rule(
         &mut self,
+        owner: DerivedId,
         rule: &Rule,
         initially_bound: BTreeSet<Var>,
         rule_index: usize,
@@ -696,7 +698,7 @@ impl Planner<'_> {
             initially_bound,
             self.deny_scans,
         )
-        .map_err(|failure| self.order_error(rule, &failure))?;
+        .map_err(|failure| self.order_error(owner, rule, rule_index, &failure))?;
 
         for goal in &placed {
             if let Access::Derived { id, pattern } = &goal.access {
@@ -739,7 +741,7 @@ impl Planner<'_> {
         let mut rules = Vec::new();
         for (rule_index, rule) in program.derived[id.0].rules.iter().enumerate() {
             let bound = head_bound_vars(rule, &pattern);
-            rules.push(self.plan_rule(rule, bound, rule_index)?);
+            rules.push(self.plan_rule(id, rule, bound, rule_index)?);
         }
         self.specs.insert(key, Some(rules));
         Ok(())
@@ -871,7 +873,13 @@ impl Planner<'_> {
     /// goal is a pure-scan predicate under `deny_scans` (the plan cannot
     /// exist without that scan), RAQL0301 (the full message contract)
     /// otherwise.
-    fn order_error(&self, rule: &Rule, failure: &OrderFailure) -> PlanError {
+    fn order_error(
+        &self,
+        owner: DerivedId,
+        rule: &Rule,
+        rule_index: usize,
+        failure: &OrderFailure,
+    ) -> PlanError {
         let program = self.program;
 
         // A stuck pure-scan predicate under --no-scan *is* the scan
@@ -1066,6 +1074,11 @@ impl Planner<'_> {
             unlock_sets,
             seed_hint: if needs_def { def_seed_predicates(self.catalog) } else { Vec::new() },
             scans_denied,
+            location: Some(GoalLocation {
+                predicate: owner,
+                rule_index,
+                source_index: offending,
+            }),
         }))
     }
 

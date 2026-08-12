@@ -25,7 +25,7 @@ mod predicate;
 mod schema;
 
 pub use catalog::{Catalog, v0_catalog};
-pub use error::{ModeAlternative, PlanError, UnsatisfiableGoal};
+pub use error::{GoalLocation, ModeAlternative, PlanError, UnsatisfiableGoal};
 pub use logic::{
     BuiltinDef, BuiltinId, DerivedDef, DerivedId, Goal, GoalRef, InputDef, InputId, Program,
     Root, Rule, Term, Var,
