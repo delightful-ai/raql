@@ -11,10 +11,11 @@ IMPORTANT: we do not care about backwards compatibility here. This is an unpubli
 - If a primitive is not RA-native and honest, disable it rather than keep an approximate custom extractor alive.
 - Prefer query-shaped providers and cached RA identity over broad snapshot materialization, reverse rediscovery, raw filesystem scans, or text-search fallbacks.
 - Use release-mode, daemon-backed runs for latency claims. Debug timings are not decision-grade.
+- This repo does **not** use rustfmt: never run `cargo fmt` (it would reformat everything). Match the surrounding manual style (~100 cols). `cargo clippy` is kept clean on the new-architecture crates (`raql-plan`, `raql-ra`).
 
 ## Route work
 
-- `crates/raql-plan/` owns the predicate catalog (single source of truth for extern predicates) and, later, the binding-aware planner (SPEC §8–§10). No RA types, no execution.
+- `crates/raql-plan/` owns the predicate catalog (single source of truth for extern predicates) and the binding-aware planner (SPEC §8–§10; both implemented). No RA types, no execution.
 - `crates/raql-ra/` owns the new-architecture RA-native layer (SPEC §6): Salsa-tracked queries over `RootDatabase` and catalog operator bodies. Growing alongside the old host path until cutover; read its `AGENTS.md` before adding queries.
 - `crates/raql-host-ra/` owns RA-native providers, workspace integration, lookup/index logic, and the boundary between RAQL and rust-analyzer. (Legacy path: scheduled for deletion at cutover, SPEC §17; mechanical maintenance only.)
 - `crates/raql-daemon/` owns process lifecycle, warmup, socket/protocol, and request scheduling. It must not grow semantic extraction logic.

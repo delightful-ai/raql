@@ -1,5 +1,10 @@
 # Kickoff: finish step 3 (remaining v0 predicates) + step 4 (binding-aware planner)
 
+> **SUPERSEDED 2026-08-11 (same day, second session):** items 1–2 of "Next
+> work" are done (v0 catalog complete, planner built, 46 tests green).
+> Read `2026-08-11-step4-integration-kickoff.md` instead; this file stays
+> as the historical record of the earlier decisions and landmines.
+
 Session handoff written 2026-08-11 by the session that executed the RA bump, the
 step-2 spike (G1–G6 all green), and slices A/B of step 3. Carries what the SPEC
 and code deliberately don't.
