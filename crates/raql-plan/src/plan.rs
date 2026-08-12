@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use crate::logic::{BuiltinId, DerivedId, Goal, InputId, Program, Rule};
+use crate::logic::{BuiltinId, DerivedId, Goal, InputId, Program, Root, Rule};
 use crate::mode::{AccessKind, CostClass, ModeDef, Pattern};
 
 /// The chosen access path of one planned goal.
@@ -73,7 +73,9 @@ pub struct ScanUse {
 /// catalog version ⇒ identical plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalPlan {
-    pub query: PlannedRule,
+    /// The demand roots, in request order. Each root's plan is its
+    /// specialization in [`PhysicalPlan::specializations`].
+    pub roots: Vec<Root>,
     /// Demanded specializations, in deterministic (predicate, pattern)
     /// order.
     pub specializations: Vec<Specialization>,
@@ -84,27 +86,30 @@ pub struct PhysicalPlan {
 }
 
 impl PhysicalPlan {
+    /// The specialization a root is planned as.
+    pub fn root_specialization(&self, root: &Root) -> &Specialization {
+        self.specializations
+            .iter()
+            .find(|spec| spec.predicate == root.predicate && spec.pattern == root.pattern)
+            .expect("every root is planned")
+    }
+
     /// The §10.4 explain rendering: per-goal operator, mode, cost class,
     /// demand specializations, scans, and the RA primitives from the
-    /// catalog.
+    /// catalog. Roots render first in request order, then the remaining
+    /// demanded specializations in deterministic order.
     pub fn explain(&self, program: &Program) -> String {
         let mut out = String::new();
-        writeln!(out, "query:").unwrap();
-        render_rule(&mut out, program, &program.query, &self.query);
+        for root in &self.roots {
+            self.render_spec(&mut out, program, self.root_specialization(root), "root");
+        }
         for spec in &self.specializations {
-            let derived = &program.derived[spec.predicate.0];
-            let scan = if spec.is_scan { "  scan" } else { "" };
-            writeln!(
-                out,
-                "specialization {}{}{scan} [{}]:",
-                derived.name,
-                spec.pattern.render(),
-                spec.max_cost.name(),
-            )
-            .unwrap();
-            for planned in &spec.rules {
-                writeln!(out, "  rule {}:", planned.rule_index + 1).unwrap();
-                render_rule_goals(&mut out, program, &derived.rules[planned.rule_index], planned, "    ");
+            let is_root = self
+                .roots
+                .iter()
+                .any(|root| root.predicate == spec.predicate && root.pattern == spec.pattern);
+            if !is_root {
+                self.render_spec(&mut out, program, spec, "specialization");
             }
         }
         if self.scans.is_empty() {
@@ -121,10 +126,27 @@ impl PhysicalPlan {
         writeln!(out, "max cost: {}", self.max_cost.name()).unwrap();
         out
     }
-}
 
-fn render_rule(out: &mut String, program: &Program, rule: &Rule, planned: &PlannedRule) {
-    render_rule_goals(out, program, rule, planned, "  ");
+    fn render_spec(&self, out: &mut String, program: &Program, spec: &Specialization, label: &str) {
+        let derived = &program.derived[spec.predicate.0];
+        let scan = if spec.is_scan { "  scan" } else { "" };
+        writeln!(
+            out,
+            "{label} {}{}{scan} [{}]:",
+            derived.name,
+            spec.pattern.render(),
+            spec.max_cost.name(),
+        )
+        .unwrap();
+        for planned in &spec.rules {
+            if spec.rules.len() > 1 {
+                writeln!(out, "  rule {}:", planned.rule_index + 1).unwrap();
+                render_rule_goals(out, program, &derived.rules[planned.rule_index], planned, "    ");
+            } else {
+                render_rule_goals(out, program, &derived.rules[planned.rule_index], planned, "  ");
+            }
+        }
+    }
 }
 
 fn render_rule_goals(

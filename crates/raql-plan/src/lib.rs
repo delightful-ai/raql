@@ -28,7 +28,7 @@ pub use catalog::{Catalog, v0_catalog};
 pub use error::{ModeAlternative, PlanError, UnsatisfiableGoal};
 pub use logic::{
     BuiltinDef, BuiltinId, DerivedDef, DerivedId, Goal, GoalRef, InputDef, InputId, Program,
-    Rule, Term, Var,
+    Root, Rule, Term, Var,
 };
 pub use mode::{AccessKind, Binding, CostClass, ModeDef, Pattern};
 pub use operator::{OperatorId, OperatorSet};

@@ -1,11 +1,12 @@
 //! Planner conformance (SPEC §9–§10): the registry-walking mode matrix,
 //! the step-4 gate (seeded filters cause no enumeration), demand
-//! propagation, recursion, negation rules, and the RAQL0301/0310/0311
-//! message contracts.
+//! propagation, recursion, negation rules, root semantics, and the
+//! RAQL0301/0310/0311 message contracts.
 
 use raql_plan::{
     Access, Binding, BuiltinDef, CostClass, DerivedDef, DerivedId, Goal, GoalRef, InputDef,
-    OperatorId, Pattern, PlanError, PlanOptions, Program, Rule, Term, Var, plan, v0_catalog,
+    OperatorId, Pattern, PhysicalPlan, PlanError, PlanOptions, PlannedGoal, Program, Root, Rule,
+    Term, Var, plan, v0_catalog,
 };
 
 fn v(i: u32) -> Term {
@@ -20,13 +21,32 @@ fn rule(vars: &[&str], head: Vec<Term>, body: Vec<Goal>) -> Rule {
     Rule { vars: vars.iter().map(|s| (*s).to_owned()).collect(), head, body }
 }
 
-fn query_program(vars: &[&str], body: Vec<Goal>) -> Program {
+/// Wrap derived defs plus one ad-hoc rule body as a program with a single
+/// arity-0 root — the lowering shape for a lone query (SPEC §9.2).
+fn program_with(
+    mut derived: Vec<DerivedDef>,
+    inputs: Vec<InputDef>,
+    builtins: Vec<BuiltinDef>,
+    vars: &[&str],
+    body: Vec<Goal>,
+) -> Program {
+    let query = DerivedId(derived.len());
+    derived.push(DerivedDef {
+        name: "query".to_owned(),
+        arity: 0,
+        declared_modes: None,
+        rules: vec![rule(vars, Vec::new(), body)],
+    });
     Program {
-        derived: Vec::new(),
-        inputs: Vec::new(),
-        builtins: Vec::new(),
-        query: rule(vars, Vec::new(), body),
+        derived,
+        inputs,
+        builtins,
+        roots: vec![Root { predicate: query, pattern: Pattern::new(Vec::new()) }],
     }
+}
+
+fn query_program(vars: &[&str], body: Vec<Goal>) -> Program {
+    program_with(Vec::new(), Vec::new(), Vec::new(), vars, body)
 }
 
 /// `target_def`-style single-column input relation.
@@ -34,20 +54,24 @@ fn input(name: &str, arity: usize) -> InputDef {
     InputDef { name: name.to_owned(), arity }
 }
 
+/// The planned goals of the single ad-hoc root's rule.
+fn root_goals<'p>(physical: &'p PhysicalPlan, program: &Program) -> &'p [PlannedGoal] {
+    assert_eq!(program.roots.len(), 1);
+    let spec = physical.root_specialization(&program.roots[0]);
+    assert_eq!(spec.rules.len(), 1);
+    &spec.rules[0].goals
+}
+
 fn planned_operators(program: &Program) -> Vec<OperatorId> {
     let physical = plan(program, &v0_catalog(), PlanOptions::default()).expect("plans");
     let mut operators = Vec::new();
-    let mut collect = |goals: &[raql_plan::PlannedGoal]| {
-        for goal in goals {
-            if let Access::Extern { mode, .. } = &goal.access {
-                operators.push(mode.operator);
-            }
-        }
-    };
-    collect(&physical.query.goals);
     for spec in &physical.specializations {
         for planned in &spec.rules {
-            collect(&planned.goals);
+            for goal in &planned.goals {
+                if let Access::Extern { mode, .. } = &goal.access {
+                    operators.push(mode.operator);
+                }
+            }
         }
     }
     operators
@@ -89,17 +113,10 @@ fn registry_mode_matrix() {
                 (0..predicate.arity() as u32).map(v).collect(),
             ));
             let names: Vec<&str> = predicate.args.iter().map(|a| a.name).collect();
-            let program = Program {
-                derived: Vec::new(),
-                inputs,
-                builtins: Vec::new(),
-                query: rule(&names, Vec::new(), body),
-            };
+            let program = program_with(Vec::new(), inputs, Vec::new(), &names, body);
             let physical = plan(&program, &catalog, PlanOptions::default())
                 .unwrap_or_else(|e| panic!("{} mode {:?}: {e}", predicate.name, mode.pattern));
-            let planned = physical
-                .query
-                .goals
+            let planned = root_goals(&physical, &program)
                 .iter()
                 .find(|g| g.source_index == goal_index)
                 .expect("goal planned");
@@ -129,20 +146,17 @@ fn seeded_is_fn_causes_no_enumeration() {
             rule(&["D"], vec![v(0)], vec![extern_goal("def_kind", vec![v(0), Term::Const])]),
         ],
     };
-    let program = Program {
-        derived: vec![is_fn],
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["D", "N"],
-            Vec::new(),
-            vec![
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
-                Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
-                extern_goal("def_name", vec![v(0), v(1)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        vec![is_fn],
+        vec![input("target_def", 1)],
+        Vec::new(),
+        &["D", "N"],
+        vec![
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
+            Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
+            extern_goal("def_name", vec![v(0), v(1)]),
+        ],
+    );
     let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
     assert!(physical.scans.is_empty(), "seeded filter must not scan: {:?}", physical.scans);
     let operators = planned_operators(&program);
@@ -150,10 +164,15 @@ fn seeded_is_fn_causes_no_enumeration() {
         !operators.contains(&OperatorId::DefsScan) && !operators.contains(&OperatorId::FnDefsScan),
         "no enumeration operator may appear: {operators:?}",
     );
-    // One specialization: is_fn demanded under (+) only.
-    assert_eq!(physical.specializations.len(), 1);
-    assert_eq!(physical.specializations[0].pattern, Pattern::from(vec![true]));
-    assert!(!physical.specializations[0].is_scan);
+    // Two specializations: the query root, and is_fn demanded under (+) only.
+    assert_eq!(physical.specializations.len(), 2);
+    let is_fn_spec = physical
+        .specializations
+        .iter()
+        .find(|spec| spec.predicate == DerivedId(0))
+        .expect("is_fn specialized");
+    assert_eq!(is_fn_spec.pattern, Pattern::from(vec![true]));
+    assert!(!is_fn_spec.is_scan);
     assert_eq!(physical.max_cost, CostClass::C0);
     // And the same program plans under --no-scan.
     plan(&program, &v0_catalog(), PlanOptions { deny_scans: true }).expect("scan-free plan");
@@ -177,8 +196,9 @@ fn explicit_scans_are_visible_and_deniable() {
     assert_eq!(physical.max_cost, CostClass::C4);
     // The scan is placed only because nothing else is placeable, and the
     // bound direction runs after it.
-    assert_eq!(physical.query.goals[0].source_index, 0);
-    assert_eq!(physical.query.goals[1].source_index, 1);
+    let goals = root_goals(&physical, &program);
+    assert_eq!(goals[0].source_index, 0);
+    assert_eq!(goals[1].source_index, 1);
 
     let error = plan(&program, &v0_catalog(), PlanOptions { deny_scans: true }).unwrap_err();
     assert_eq!(
@@ -211,19 +231,16 @@ error[RAQL0301]: no satisfiable access path for `call_edge(Caller, Callee, Site,
 /// unlock set.
 #[test]
 fn raql0301_reports_bound_arguments() {
-    let program = Program {
-        derived: Vec::new(),
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["F", "X", "S", "K"],
-            Vec::new(),
-            vec![
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(1)]),
-                extern_goal("caller", vec![v(0), v(1), v(2), v(3)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        Vec::new(),
+        vec![input("target_def", 1)],
+        Vec::new(),
+        &["F", "X", "S", "K"],
+        vec![
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(1)]),
+            extern_goal("caller", vec![v(0), v(1), v(2), v(3)]),
+        ],
+    );
     let error = plan(&program, &v0_catalog(), PlanOptions::default()).unwrap_err();
     let PlanError::UnsatisfiableModes(goal) = &error else {
         panic!("expected RAQL0301, got {error}");
@@ -251,22 +268,24 @@ fn demand_is_memoized_per_pattern() {
             vec![extern_goal("def_kind", vec![v(0), Term::Const])],
         )],
     };
-    let program = Program {
-        derived: vec![is_fn],
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["D"],
-            Vec::new(),
-            vec![
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
-                Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
-                Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        vec![is_fn],
+        vec![input("target_def", 1)],
+        Vec::new(),
+        &["D"],
+        vec![
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
+            Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
+            Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
+        ],
+    );
     let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
-    assert_eq!(physical.specializations.len(), 1);
+    let is_fn_specs = physical
+        .specializations
+        .iter()
+        .filter(|spec| spec.predicate == DerivedId(0))
+        .count();
+    assert_eq!(is_fn_specs, 1);
 }
 
 /// Recursive SCC mode inference (SPEC §9.1 greatest fixpoint): transitive
@@ -294,13 +313,12 @@ fn recursion_supports_both_seeded_directions() {
             ),
         ],
     };
-    let build = |seed_position: usize| Program {
-        derived: vec![reach.clone()],
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["A", "B"],
+    let build = |seed_position: usize| {
+        program_with(
+            vec![reach.clone()],
+            vec![input("target_def", 1)],
             Vec::new(),
+            &["A", "B"],
             vec![
                 Goal::positive(
                     GoalRef::Input(raql_plan::InputId(0)),
@@ -308,14 +326,19 @@ fn recursion_supports_both_seeded_directions() {
                 ),
                 Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0), v(1)]),
             ],
-        ),
+        )
     };
 
     // Seed the caller side: outgoing composition (by-caller), no scans.
     let forward = plan(&build(0), &v0_catalog(), PlanOptions::default()).expect("plans");
     assert!(forward.scans.is_empty());
-    assert_eq!(forward.specializations.len(), 1);
-    assert_eq!(forward.specializations[0].pattern, Pattern::from(vec![true, false]));
+    let reach_specs: Vec<&Pattern> = forward
+        .specializations
+        .iter()
+        .filter(|spec| spec.predicate == DerivedId(0))
+        .map(|spec| &spec.pattern)
+        .collect();
+    assert_eq!(reach_specs, vec![&Pattern::from(vec![true, false])]);
     let forward_ops = planned_operators(&build(0));
     assert!(forward_ops.contains(&OperatorId::CallEdgesByCaller));
     assert!(!forward_ops.contains(&OperatorId::CallEdgesByCallee));
@@ -326,7 +349,7 @@ fn recursion_supports_both_seeded_directions() {
     assert!(!backward_ops.contains(&OperatorId::CallEdgesByCaller));
 }
 
-/// An unseeded derived call is a scan of a derived predicate (§9.2):
+/// An unseeded derived *call* is a scan of a derived predicate (§9.2):
 /// legal, reported with the scans, cost = max of its leaves.
 #[test]
 fn derived_scan_is_visible() {
@@ -344,16 +367,13 @@ fn derived_scan_is_visible() {
             ],
         )],
     };
-    let program = Program {
-        derived: vec![def_allowed],
-        inputs: Vec::new(),
-        builtins: Vec::new(),
-        query: rule(
-            &["D"],
-            Vec::new(),
-            vec![Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)])],
-        ),
-    };
+    let program = program_with(
+        vec![def_allowed],
+        Vec::new(),
+        Vec::new(),
+        &["D"],
+        vec![Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)])],
+    );
     let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
     let scans: Vec<(&str, CostClass)> = physical
         .scans
@@ -361,7 +381,12 @@ fn derived_scan_is_visible() {
         .map(|scan| (scan.predicate.as_str(), scan.cost))
         .collect();
     assert_eq!(scans, vec![("def_allowed", CostClass::C4), ("def", CostClass::C4)]);
-    assert!(physical.specializations[0].is_scan);
+    let def_allowed_spec = physical
+        .specializations
+        .iter()
+        .find(|spec| spec.predicate == DerivedId(0))
+        .expect("def_allowed specialized");
+    assert!(def_allowed_spec.is_scan);
     assert_eq!(physical.max_cost, CostClass::C4);
 
     // Under --no-scan the leaf enumeration is the refusal (RAQL0310).
@@ -370,7 +395,63 @@ fn derived_scan_is_visible() {
     assert!(error.to_string().contains("`def`"), "{error}");
 }
 
-/// Declared `.mode` assertions are the public contract (SPEC §9.1).
+/// A demand root is the request's own demand, not a call: view outputs
+/// demanded unseeded are not reported as scans, while unseeded *calls*
+/// inside their bodies still are (§9.2).
+#[test]
+fn roots_are_not_scans() {
+    // target(T) :- def_name(T, "load_and_plan").   (internally seeded)
+    let target = DerivedDef {
+        name: "target".to_owned(),
+        arity: 1,
+        declared_modes: None,
+        rules: vec![rule(
+            &["T"],
+            vec![v(0)],
+            vec![extern_goal("def_name", vec![v(0), Term::Const])],
+        )],
+    };
+    // report(C, N) :- target(T), callee(T, C, _, _), def_name(C, N).
+    let report = DerivedDef {
+        name: "report".to_owned(),
+        arity: 2,
+        declared_modes: None,
+        rules: vec![rule(
+            &["C", "N", "T", "S", "K"],
+            vec![v(0), v(1)],
+            vec![
+                Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(2)]),
+                extern_goal("callee", vec![v(2), v(0), v(3), v(4)]),
+                extern_goal("def_name", vec![v(0), v(1)]),
+            ],
+        )],
+    };
+    let program = Program {
+        derived: vec![target, report],
+        inputs: Vec::new(),
+        builtins: Vec::new(),
+        roots: vec![Root {
+            predicate: DerivedId(1),
+            pattern: Pattern::from(vec![false, false]),
+        }],
+    };
+    let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
+
+    // The root's own full-extent evaluation is not a scan...
+    let report_spec = physical.root_specialization(&program.roots[0]);
+    assert!(!report_spec.is_scan);
+    assert!(!physical.scans.iter().any(|scan| scan.predicate == "report"));
+    // ...but the unseeded `target(T)` call inside its body is (§9.2),
+    // costed at its leaves (the C2 name seed), and the whole plan stays
+    // legal under --no-scan because nothing bottoms out in an extern scan.
+    assert_eq!(physical.scans.len(), 1);
+    assert_eq!(physical.scans[0].predicate, "target");
+    assert_eq!(physical.scans[0].cost, CostClass::C2);
+    plan(&program, &v0_catalog(), PlanOptions { deny_scans: true }).expect("scan-free leaves");
+}
+
+/// Declared `.mode` assertions are the public contract (SPEC §9.1), for
+/// call sites and demand roots alike.
 #[test]
 fn declared_modes_are_the_contract() {
     let is_fn = DerivedDef {
@@ -385,19 +466,28 @@ fn declared_modes_are_the_contract() {
     };
     // Calling under the empty pattern is refused even though `def_kind`
     // alone would leave it merely unsupported: (+) is the whole contract.
+    let program = program_with(
+        vec![is_fn.clone()],
+        Vec::new(),
+        Vec::new(),
+        &["D"],
+        vec![Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)])],
+    );
+    let error = plan(&program, &v0_catalog(), PlanOptions::default()).unwrap_err();
+    assert_eq!(error.code(), "RAQL0301");
+    assert!(error.to_string().contains("is_fn(+D)"), "{error}");
+
+    // A root demand outside the contract is refused the same way.
     let program = Program {
         derived: vec![is_fn],
         inputs: Vec::new(),
         builtins: Vec::new(),
-        query: rule(
-            &["D"],
-            Vec::new(),
-            vec![Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)])],
-        ),
+        roots: vec![Root { predicate: DerivedId(0), pattern: Pattern::from(vec![false]) }],
     };
     let error = plan(&program, &v0_catalog(), PlanOptions::default()).unwrap_err();
     assert_eq!(error.code(), "RAQL0301");
-    assert!(error.to_string().contains("is_fn(+D)"), "{error}");
+    assert!(error.to_string().contains("is_fn(-)"), "{error}");
+    assert!(error.to_string().contains("is_fn(+)"), "{error}");
 }
 
 /// A declared mode the rules cannot honor is RAQL0303.
@@ -413,12 +503,7 @@ fn undeliverable_declared_mode_is_an_error() {
             vec![extern_goal("caller", vec![v(0), v(1), v(2), v(3)])],
         )],
     };
-    let program = Program {
-        derived: vec![q],
-        inputs: Vec::new(),
-        builtins: Vec::new(),
-        query: rule(&[], Vec::new(), Vec::new()),
-    };
+    let program = program_with(vec![q], Vec::new(), Vec::new(), &[], Vec::new());
     let error = plan(&program, &v0_catalog(), PlanOptions::default()).unwrap_err();
     assert_eq!(error.code(), "RAQL0303");
     assert_eq!(
@@ -432,38 +517,33 @@ fn undeliverable_declared_mode_is_an_error() {
 #[test]
 fn negation_is_ordered_and_scan_free() {
     // `target_def(D), not is_public(D)` — the filter runs second.
-    let program = Program {
-        derived: Vec::new(),
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["D"],
-            Vec::new(),
-            vec![
-                Goal::negated(GoalRef::Extern("is_public".to_owned()), vec![v(0)]),
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        Vec::new(),
+        vec![input("target_def", 1)],
+        Vec::new(),
+        &["D"],
+        vec![
+            Goal::negated(GoalRef::Extern("is_public".to_owned()), vec![v(0)]),
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
+        ],
+    );
     let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
-    assert_eq!(physical.query.goals[0].source_index, 1, "input binds first");
-    assert_eq!(physical.query.goals[1].source_index, 0);
-    assert!(physical.query.goals[1].negated);
+    let goals = root_goals(&physical, &program);
+    assert_eq!(goals[0].source_index, 1, "input binds first");
+    assert_eq!(goals[1].source_index, 0);
+    assert!(goals[1].negated);
 
     // A pure-scan extern under `not` has no non-scan mode: RAQL0301.
-    let program = Program {
-        derived: Vec::new(),
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["D"],
-            Vec::new(),
-            vec![
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
-                Goal::negated(GoalRef::Extern("fn_def".to_owned()), vec![v(0)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        Vec::new(),
+        vec![input("target_def", 1)],
+        Vec::new(),
+        &["D"],
+        vec![
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
+            Goal::negated(GoalRef::Extern("fn_def".to_owned()), vec![v(0)]),
+        ],
+    );
     let error = plan(&program, &v0_catalog(), PlanOptions::default()).unwrap_err();
     assert_eq!(error.code(), "RAQL0301");
 
@@ -474,61 +554,79 @@ fn negation_is_ordered_and_scan_free() {
         declared_modes: None,
         rules: vec![rule(&["D"], vec![v(0)], vec![extern_goal("def", vec![v(0)])])],
     };
-    let program = Program {
-        derived: vec![p],
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["D"],
-            Vec::new(),
-            vec![
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
-                Goal::negated(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        vec![p],
+        vec![input("target_def", 1)],
+        Vec::new(),
+        &["D"],
+        vec![
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
+            Goal::negated(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
+        ],
+    );
     let error = plan(&program, &v0_catalog(), PlanOptions::default()).unwrap_err();
     assert_eq!(error.code(), "RAQL0311");
     assert!(error.to_string().contains("p(+)"), "{error}");
 }
 
-/// Builtins run once their required inputs are bound.
+/// Builtins run once any accepted pattern's inputs are bound; `=`-style
+/// builtins accept several patterns.
 #[test]
 fn builtins_wait_for_their_inputs() {
     let upper = BuiltinDef {
         name: "upper".to_owned(),
-        pattern: vec![Binding::Bound, Binding::Free],
+        patterns: vec![vec![Binding::Bound, Binding::Free]],
     };
-    let program = Program {
-        derived: Vec::new(),
-        inputs: vec![input("seed", 1)],
-        builtins: vec![upper.clone()],
-        query: rule(
-            &["X", "Y"],
-            Vec::new(),
-            vec![
-                Goal::positive(GoalRef::Builtin(raql_plan::BuiltinId(0)), vec![v(0), v(1)]),
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        Vec::new(),
+        vec![input("seed", 1)],
+        vec![upper.clone()],
+        &["X", "Y"],
+        vec![
+            Goal::positive(GoalRef::Builtin(raql_plan::BuiltinId(0)), vec![v(0), v(1)]),
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
+        ],
+    );
     let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
-    assert_eq!(physical.query.goals[0].source_index, 1, "seed binds X first");
-    assert_eq!(physical.query.goals[1].source_index, 0);
+    let goals = root_goals(&physical, &program);
+    assert_eq!(goals[0].source_index, 1, "seed binds X first");
+    assert_eq!(goals[1].source_index, 0);
 
-    let unseeded = Program {
-        derived: Vec::new(),
-        inputs: Vec::new(),
-        builtins: vec![upper],
-        query: rule(
-            &["X", "Y"],
-            Vec::new(),
-            vec![Goal::positive(GoalRef::Builtin(raql_plan::BuiltinId(0)), vec![v(0), v(1)])],
-        ),
-    };
+    let unseeded = program_with(
+        Vec::new(),
+        Vec::new(),
+        vec![upper],
+        &["X", "Y"],
+        vec![Goal::positive(GoalRef::Builtin(raql_plan::BuiltinId(0)), vec![v(0), v(1)])],
+    );
     let error = plan(&unseeded, &v0_catalog(), PlanOptions::default()).unwrap_err();
     assert_eq!(error.code(), "RAQL0301");
     assert!(error.to_string().contains("upper(+X, -)"), "{error}");
+
+    // An either-side builtin (`X = Y`) runs as soon as one side is bound.
+    let eq = BuiltinDef {
+        name: "eq".to_owned(),
+        patterns: vec![
+            vec![Binding::Bound, Binding::Free],
+            vec![Binding::Free, Binding::Bound],
+        ],
+    };
+    let program = program_with(
+        Vec::new(),
+        vec![input("seed", 1)],
+        vec![eq],
+        &["X", "Y", "N"],
+        vec![
+            Goal::positive(GoalRef::Builtin(raql_plan::BuiltinId(0)), vec![v(0), v(1)]),
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(1)]),
+            extern_goal("def_name", vec![v(0), v(2)]),
+        ],
+    );
+    let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
+    let goals = root_goals(&physical, &program);
+    assert_eq!(goals[0].source_index, 1, "seed binds Y first");
+    assert_eq!(goals[1].source_index, 0, "eq runs on its (-, +) pattern");
+    assert_eq!(goals[2].source_index, 2, "def_name projects off the eq-bound X");
 }
 
 /// Same program + same catalog ⇒ identical plan (SPEC §10.1).
@@ -547,7 +645,8 @@ fn planning_is_deterministic() {
     assert_eq!(first, second);
 }
 
-/// The §10.4 explain rendering, end to end.
+/// The §10.4 explain rendering, end to end: roots first, then demanded
+/// specializations; single-rule bodies inline without a rule header.
 #[test]
 fn explain_renders_the_plan() {
     let is_fn = DerivedDef {
@@ -560,29 +659,25 @@ fn explain_renders_the_plan() {
             vec![extern_goal("def_kind", vec![v(0), Term::Const])],
         )],
     };
-    let program = Program {
-        derived: vec![is_fn],
-        inputs: vec![input("target_def", 1)],
-        builtins: Vec::new(),
-        query: rule(
-            &["D", "N"],
-            Vec::new(),
-            vec![
-                Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
-                Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
-                extern_goal("def_name", vec![v(0), v(1)]),
-            ],
-        ),
-    };
+    let program = program_with(
+        vec![is_fn],
+        vec![input("target_def", 1)],
+        Vec::new(),
+        &["D", "N"],
+        vec![
+            Goal::positive(GoalRef::Input(raql_plan::InputId(0)), vec![v(0)]),
+            Goal::positive(GoalRef::Derived(DerivedId(0)), vec![v(0)]),
+            extern_goal("def_name", vec![v(0), v(1)]),
+        ],
+    );
     let physical = plan(&program, &v0_catalog(), PlanOptions::default()).expect("plans");
     let expected = "\
-query:
+root query() [C0]:
   1. target_def(D)  ->  input target_def
   2. def_name(D, N)  ->  def_name/name-of-def (+,-) keyed [C0] via [hir name projection]
   3. is_fn(D)  ->  derived is_fn(+)
 specialization is_fn(+) [C0]:
-  rule 1:
-    1. def_kind(D, <const>)  ->  def_kind/kind-of-def (+,-) keyed [C0] via [value variant projection]
+  1. def_kind(D, <const>)  ->  def_kind/kind-of-def (+,-) keyed [C0] via [value variant projection]
 scans: (none)
 max cost: C0
 ";

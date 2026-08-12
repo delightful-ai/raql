@@ -9,10 +9,13 @@
 //! arrive as pre-bound input relations, e.g. `target_def`"): tiny
 //! pre-materialized relations that bind all their arguments at C0.
 //!
-//! Aggregation/choose/witness goals are engine-level constructs; they are
-//! not represented in the v0 planner slice.
+//! Aggregation/choose/witness goals are engine-level constructs; the lang
+//! layer lowers each to a shape the planner understands boundness-wise (a
+//! synthesized derived predicate for a correlated sub-body, a [`BuiltinDef`]
+//! for a fixed binding requirement) and keeps the execution semantics on its
+//! side of the boundary.
 
-use crate::mode::Binding;
+use crate::mode::{Binding, Pattern};
 
 /// A rule-scoped variable: an index into the owning rule's `vars` table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -102,22 +105,42 @@ pub struct InputDef {
     pub arity: usize,
 }
 
-/// An engine-managed builtin with a fixed binding requirement: `Bound`
-/// positions must be bound at the call; `Free` positions are computed.
+/// An engine-managed builtin with declared binding requirements: within a
+/// pattern, `Bound` positions must be bound at the call and `Free`
+/// positions are computed. A builtin may accept several patterns (`X = Y`
+/// runs with either side ground); the planner places the goal once any one
+/// of them is satisfied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BuiltinDef {
     pub name: String,
-    pub pattern: Vec<Binding>,
+    /// Accepted binding patterns, all of the builtin's arity (≥ 1 entry).
+    pub patterns: Vec<Vec<Binding>>,
+}
+
+impl BuiltinDef {
+    pub fn arity(&self) -> usize {
+        self.patterns.first().map_or(0, Vec::len)
+    }
+}
+
+/// One demand root (SPEC §9.2, §10.1): the request evaluates this derived
+/// predicate under this binding pattern. A view's output predicates are
+/// roots under the all-free pattern; an ad-hoc query lowers to an arity-0
+/// derived predicate demanded once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Root {
+    pub predicate: DerivedId,
+    pub pattern: Pattern,
 }
 
 /// A planner input program: derived predicates, input relations, builtins,
-/// and the query body.
+/// and the demand roots the request evaluates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
     pub derived: Vec<DerivedDef>,
     pub inputs: Vec<InputDef>,
     pub builtins: Vec<BuiltinDef>,
-    pub query: Rule,
+    pub roots: Vec<Root>,
 }
 
 impl Program {

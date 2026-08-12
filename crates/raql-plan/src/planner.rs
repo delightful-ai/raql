@@ -45,7 +45,9 @@ pub struct PlanOptions {
     pub deny_scans: bool,
 }
 
-/// Plan a program against the catalog (SPEC §10.1).
+/// Plan a program against the catalog (SPEC §10.1): demand every root,
+/// specializing derived predicates per binding pattern as demand reaches
+/// them.
 pub fn plan(
     program: &Program,
     catalog: &Catalog,
@@ -60,9 +62,12 @@ pub fn plan(
         supports,
         specs: BTreeMap::new(),
         negated_demands: BTreeSet::new(),
+        call_demands: BTreeSet::new(),
     };
-    let query = planner.plan_rule(&program.query, BTreeSet::new(), 0)?;
-    planner.finalize(query)
+    for root in &program.roots {
+        planner.demand_root(root)?;
+    }
+    planner.finalize()
 }
 
 /// A derived predicate specialization: predicate id + demanded pattern.
@@ -77,13 +82,11 @@ type SpecInfo = (CostClass, bool, Vec<SpecKey>);
 // ---------------------------------------------------------------------
 
 fn validate(program: &Program, catalog: &Catalog) -> Result<(), PlanError> {
-    let check_rule = |rule: &Rule, head_arity: Option<usize>| -> Result<(), PlanError> {
+    let check_rule = |rule: &Rule, head_arity: usize| -> Result<(), PlanError> {
         if rule.body.len() > 128 {
             return Err(malformed("rule body exceeds 128 goals"));
         }
-        if let Some(arity) = head_arity
-            && rule.head.len() != arity
-        {
+        if rule.head.len() != head_arity {
             return Err(malformed("rule head arity differs from its predicate"));
         }
         let var_ok = |term: &Term| match term {
@@ -120,7 +123,7 @@ fn validate(program: &Program, catalog: &Catalog) -> Result<(), PlanError> {
                     let Some(builtin) = program.builtins.get(id.0) else {
                         return Err(malformed("builtin id out of range"));
                     };
-                    builtin.pattern.len()
+                    builtin.arity()
                 }
             };
             if goal.args.len() != expected {
@@ -133,10 +136,34 @@ fn validate(program: &Program, catalog: &Catalog) -> Result<(), PlanError> {
         }
         Ok(())
     };
-    check_rule(&program.query, None)?;
+    for builtin in &program.builtins {
+        let Some(first) = builtin.patterns.first() else {
+            return Err(malformed(&format!(
+                "builtin `{}` declares no binding patterns",
+                builtin.name,
+            )));
+        };
+        if builtin.patterns.iter().any(|pattern| pattern.len() != first.len()) {
+            return Err(malformed(&format!(
+                "builtin `{}` patterns disagree on arity",
+                builtin.name,
+            )));
+        }
+    }
+    for root in &program.roots {
+        let Some(derived) = program.derived.get(root.predicate.0) else {
+            return Err(malformed("root predicate id out of range"));
+        };
+        if root.pattern.arity() != derived.arity {
+            return Err(malformed(&format!(
+                "root pattern arity mismatch on `{}`",
+                derived.name,
+            )));
+        }
+    }
     for derived in &program.derived {
         for rule in &derived.rules {
-            check_rule(rule, Some(derived.arity))?;
+            check_rule(rule, derived.arity)?;
         }
         if let Some(declared) = &derived.declared_modes
             && declared.iter().any(|mode| mode.len() != derived.arity)
@@ -545,11 +572,12 @@ impl Search<'_> {
             }),
             GoalRef::Builtin(id) => {
                 let builtin = &self.program.builtins[id.0];
-                let required_bound = builtin
-                    .pattern
-                    .iter()
-                    .zip(flags.iter())
-                    .all(|(binding, bound)| *binding == Binding::Free || bound);
+                let required_bound = builtin.patterns.iter().any(|pattern| {
+                    pattern
+                        .iter()
+                        .zip(flags.iter())
+                        .all(|(binding, bound)| *binding == Binding::Free || bound)
+                });
                 let negated_ok = !goal.negated || flags.iter().all(|bound| bound);
                 (required_bound && negated_ok).then_some(Candidate {
                     access: Access::Builtin { id: *id },
@@ -586,9 +614,74 @@ struct Planner<'p> {
     /// Specializations demanded from under a negation (§8.5: must end up
     /// scan-free).
     negated_demands: BTreeSet<SpecKey>,
+    /// Specializations demanded by a *call site* (as opposed to a demand
+    /// root): only these count as scans of a derived predicate when
+    /// unseeded (§9.2) — a root's full-extent evaluation is the request's
+    /// demand, not an enumeration the plan chose.
+    call_demands: BTreeSet<SpecKey>,
 }
 
 impl Planner<'_> {
+    /// Demand one root (SPEC §9.2). Declared `.mode` contracts apply to
+    /// roots exactly as to call sites: a root pattern outside the contract
+    /// is refused even when the rules could be ordered under it. (Without
+    /// a declared contract the demand proceeds straight to rule planning,
+    /// whose ordering failure carries the full §10.3 context.)
+    fn demand_root(&mut self, root: &crate::logic::Root) -> Result<(), PlanError> {
+        let derived = &self.program.derived[root.predicate.0];
+        if derived.declared_modes.is_some()
+            && !self.supports[root.predicate.0].iter().any(|s| s.subset_of(&root.pattern))
+        {
+            // Argument names for the message: head variable names of the
+            // first rule where the head term is a variable.
+            let arg_name = |index: usize| -> String {
+                derived
+                    .rules
+                    .first()
+                    .and_then(|rule| match rule.head.get(index) {
+                        Some(Term::Var(var)) => Some(rule.var_name(*var).to_owned()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("arg{index}"))
+            };
+            let mut unlock_sets: Vec<Vec<String>> = self.supports[root.predicate.0]
+                .iter()
+                .map(|pattern| {
+                    (0..pattern.arity())
+                        .filter(|i| pattern.is_bound(*i) && !root.pattern.is_bound(*i))
+                        .map(arg_name)
+                        .collect()
+                })
+                .filter(|set: &Vec<String>| !set.is_empty())
+                .collect();
+            unlock_sets.sort_by_key(Vec::len);
+            unlock_sets.dedup();
+            let alternatives = self.supports[root.predicate.0]
+                .iter()
+                .map(|pattern| ModeAlternative {
+                    signature: format!("{}{}", derived.name, pattern.render()),
+                    via: "derived".to_owned(),
+                    cost: None,
+                    is_scan: pattern.is_unseeded(),
+                    denied: false,
+                })
+                .collect();
+            let bound = (0..root.pattern.arity())
+                .filter(|i| root.pattern.is_bound(*i))
+                .map(arg_name)
+                .collect();
+            return Err(PlanError::UnsatisfiableModes(Box::new(UnsatisfiableGoal {
+                goal: format!("{}{}", derived.name, root.pattern.render()),
+                bound,
+                alternatives,
+                unlock_sets,
+                seed_hint: Vec::new(),
+                scans_denied: false,
+            })));
+        }
+        self.demand(root.predicate, root.pattern.clone(), false, false)
+    }
+
     fn plan_rule(
         &mut self,
         rule: &Rule,
@@ -607,7 +700,7 @@ impl Planner<'_> {
 
         for goal in &placed {
             if let Access::Derived { id, pattern } = &goal.access {
-                self.demand(*id, pattern.clone(), goal.negated)?;
+                self.demand(*id, pattern.clone(), goal.negated, true)?;
             }
         }
         Ok(PlannedRule {
@@ -629,10 +722,14 @@ impl Planner<'_> {
         id: DerivedId,
         pattern: Pattern,
         under_negation: bool,
+        via_call: bool,
     ) -> Result<(), PlanError> {
         let key = (id.0, pattern.clone());
         if under_negation {
             self.negated_demands.insert(key.clone());
+        }
+        if via_call {
+            self.call_demands.insert(key.clone());
         }
         if self.specs.contains_key(&key) {
             return Ok(()); // planned, or in progress (recursion)
@@ -652,13 +749,19 @@ impl Planner<'_> {
     // Metadata: exact costs, scan visibility, negation check (§8.5)
     // -----------------------------------------------------------------
 
-    fn finalize(self, query: PlannedRule) -> Result<PhysicalPlan, PlanError> {
+    fn finalize(self) -> Result<PhysicalPlan, PlanError> {
         let program = self.program;
         let specs: BTreeMap<SpecKey, Vec<PlannedRule>> = self
             .specs
             .into_iter()
             .map(|(key, draft)| (key, draft.expect("every demanded specialization is planned")))
             .collect();
+
+        // An unseeded specialization is a *scan of a derived predicate*
+        // only when a call site demanded it (§9.2); a root's full-extent
+        // evaluation is the request's own demand.
+        let is_derived_scan =
+            |key: &SpecKey| key.1.is_unseeded() && self.call_demands.contains(key);
 
         // Fixpoint over the demand graph: exact max cost and transitive
         // scan usage per specialization (max/or are monotone, so
@@ -686,13 +789,13 @@ impl Planner<'_> {
             specs.iter().map(|(key, rules)| (key, local(rules))).collect();
         for (key, (c, s, _)) in &locals {
             cost.insert(key, *c);
-            scan_flag.insert(key, *s || key.1.is_unseeded());
+            scan_flag.insert(key, *s || is_derived_scan(key));
         }
         loop {
             let mut changed = false;
             for (key, (c, s, refs)) in &locals {
                 let mut new_cost = *c;
-                let mut new_flag = *s || key.1.is_unseeded();
+                let mut new_flag = *s || is_derived_scan(key);
                 for reference in refs {
                     new_cost = new_cost.max(cost[reference]);
                     new_flag |= scan_flag[reference];
@@ -722,29 +825,24 @@ impl Planner<'_> {
             }
         }
 
-        // Scan visibility (§8.5): first-use order, query first, then
-        // depth-first through the demand graph, deduplicated by name.
+        // Scan visibility (§8.5): first-use order — roots in request
+        // order, depth-first through the demand graph, deduplicated by
+        // name. Roots themselves are not scans (§9.2 note above).
         let mut scans: Vec<ScanUse> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut visited: BTreeSet<&SpecKey> = BTreeSet::new();
-        collect_scans(
-            program,
-            &specs,
-            &cost,
-            &query,
-            &mut scans,
-            &mut seen,
-            &mut visited,
-        );
+        for root in &program.roots {
+            let key = (root.predicate.0, root.pattern.clone());
+            let (key, rules) =
+                specs.get_key_value(&key).expect("every root is demanded and planned");
+            if visited.insert(key) {
+                for planned in rules {
+                    collect_scans(program, &specs, &cost, planned, &mut scans, &mut seen, &mut visited);
+                }
+            }
+        }
 
-        let (query_cost, _, query_refs) = local(std::slice::from_ref(&query));
-        let mut max_cost = query_cost;
-        for reference in &query_refs {
-            max_cost = max_cost.max(cost[reference]);
-        }
-        for c in cost.values() {
-            max_cost = max_cost.max(*c);
-        }
+        let max_cost = cost.values().copied().max().unwrap_or(CostClass::C0);
 
         let specializations = specs
             .iter()
@@ -752,12 +850,17 @@ impl Planner<'_> {
                 predicate: DerivedId(key.0),
                 pattern: key.1.clone(),
                 rules: rules.clone(),
-                is_scan: key.1.is_unseeded(),
+                is_scan: is_derived_scan(key),
                 max_cost: cost[key],
             })
             .collect();
 
-        Ok(PhysicalPlan { query, specializations, scans, max_cost })
+        Ok(PhysicalPlan {
+            roots: program.roots.clone(),
+            specializations,
+            scans,
+            max_cost,
+        })
     }
 
     // -----------------------------------------------------------------
@@ -829,9 +932,11 @@ impl Planner<'_> {
                 GoalRef::Derived(id) => {
                     self.supports[id.0].iter().map(missing).collect()
                 }
-                GoalRef::Builtin(id) => {
-                    vec![missing(&Pattern::from_bindings(&program.builtins[id.0].pattern))]
-                }
+                GoalRef::Builtin(id) => program.builtins[id.0]
+                    .patterns
+                    .iter()
+                    .map(|pattern| missing(&Pattern::from_bindings(pattern)))
+                    .collect(),
                 GoalRef::Input(_) => Vec::new(),
             };
             // A negated goal additionally waits on its shared variables.
@@ -922,19 +1027,21 @@ impl Planner<'_> {
                 }
             }
             GoalRef::Builtin(id) => {
-                let pattern = Pattern::from_bindings(&program.builtins[id.0].pattern);
-                let missing: Vec<String> = (0..goal.args.len())
-                    .filter(|i| pattern.is_bound(*i) && !flags.is_bound(*i))
-                    .map(|i| arg_name(goal, i))
-                    .collect();
-                push_unlock(missing);
-                alternatives.push(ModeAlternative {
-                    signature: signature(&pattern),
-                    via: "builtin".to_owned(),
-                    cost: Some(CostClass::C0),
-                    is_scan: false,
-                    denied: false,
-                });
+                for declared in &program.builtins[id.0].patterns {
+                    let pattern = Pattern::from_bindings(declared);
+                    let missing: Vec<String> = (0..goal.args.len())
+                        .filter(|i| pattern.is_bound(*i) && !flags.is_bound(*i))
+                        .map(|i| arg_name(goal, i))
+                        .collect();
+                    push_unlock(missing);
+                    alternatives.push(ModeAlternative {
+                        signature: signature(&pattern),
+                        via: "builtin".to_owned(),
+                        cost: Some(CostClass::C0),
+                        is_scan: false,
+                        denied: false,
+                    });
+                }
             }
             GoalRef::Input(_) => {}
         }
