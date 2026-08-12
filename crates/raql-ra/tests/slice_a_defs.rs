@@ -39,7 +39,7 @@ fn paths_named(fixture: &Fixture, name: &str) -> Vec<String> {
     paths
 }
 
-fn kind_tag(fixture: &Fixture, def: Def) -> &'static str {
+fn kind_tag(fixture: &Fixture, def: Def) -> String {
     let mut ops = fixture.operators();
     let rows = ops
         .invoke(OperatorId::KindOfDef, &[Value::Def(def)])
@@ -51,8 +51,8 @@ fn kind_tag(fixture: &Fixture, def: Def) -> &'static str {
         panic!("def_kind row shape: (Def, Enum)");
     };
     assert_eq!(*echoed, def);
-    assert_eq!(tag.ty, "DefKind");
-    tag.variant
+    assert_eq!(&*tag.ty, "DefKind");
+    tag.variant.to_string()
 }
 
 fn location_of(fixture: &Fixture, def: Def) -> String {

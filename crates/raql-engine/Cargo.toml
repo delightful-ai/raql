@@ -7,12 +7,9 @@ edition = "2024"
 doctest = false
 
 [dependencies]
-raql-ir = { path = "../raql-ir" }
 raql-compiler = { path = "../raql-compiler" }
+raql-plan = { path = "../raql-plan" }
 raql-syntax = { path = "../raql-syntax" }
-raql-host = { path = "../raql-host" }
 
 indexmap.workspace = true
-rustc-hash.workspace = true
-smallvec.workspace = true
 thiserror.workspace = true

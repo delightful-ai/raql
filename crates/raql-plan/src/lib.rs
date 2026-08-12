@@ -23,6 +23,7 @@ mod plan;
 mod planner;
 mod predicate;
 mod schema;
+mod value;
 
 pub use catalog::{Catalog, v0_catalog};
 pub use error::{GoalLocation, ModeAlternative, PlanError, UnsatisfiableGoal};
@@ -36,3 +37,4 @@ pub use plan::{Access, PhysicalPlan, PlannedGoal, PlannedRule, ScanUse, Speciali
 pub use planner::{PlanOptions, plan};
 pub use predicate::{Completeness, PredicateDef};
 pub use schema::{ArgDef, ArgType};
+pub use value::EngineValue;

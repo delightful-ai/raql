@@ -17,7 +17,7 @@ use crate::snapshot::Attached;
 use crate::value::{EnumTag, Value};
 
 pub(super) fn dispatch_value(site: &CallSite) -> Value {
-    Value::Enum(EnumTag { ty: "DispatchKind", variant: site.dispatch.tag() })
+    Value::Enum(EnumTag::new("DispatchKind", site.dispatch.tag()))
 }
 
 /// `callee(+F, -Callee, -Site, -Disp)` rows; also `call_edge(+Caller, ..)`.

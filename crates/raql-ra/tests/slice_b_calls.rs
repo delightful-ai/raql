@@ -22,7 +22,7 @@ fn edge_summary(
     operator: OperatorId,
     seed: Def,
     peer_index: usize,
-) -> Vec<(String, &'static str)> {
+) -> Vec<(String, String)> {
     let mut ops = fixture.operators();
     let rows = ops
         .invoke(operator, &[Value::Def(seed)])
@@ -33,14 +33,14 @@ fn edge_summary(
         let Value::Def(peer) = row[peer_index] else {
             panic!("peer column must be a Def, got {:?}", row[peer_index]);
         };
-        let Value::Enum(tag) = row[3] else {
+        let Value::Enum(tag) = &row[3] else {
             panic!("dispatch column must be an Enum, got {:?}", row[3]);
         };
-        assert_eq!(tag.ty, "DispatchKind");
+        assert_eq!(&*tag.ty, "DispatchKind");
         let path = project_def(&fixture.db, &fixture.workspace_root(), peer)
             .path
             .to_string();
-        summary.push((path, tag.variant));
+        summary.push((path, tag.variant.to_string()));
     }
     summary.sort();
     summary
@@ -54,28 +54,28 @@ fn callee_classifies_dispatch() {
     let static_call = def_by_path(&fixture, "static_call", "calls_ws::static_call");
     assert_eq!(
         edge_summary(&fixture, OperatorId::CalleesOfFn, static_call, 1),
-        vec![("calls_ws::helper".to_owned(), "DIRECT")],
+        vec![("calls_ws::helper".to_owned(), "DIRECT".to_owned())],
     );
 
     // Generic trait-bound receiver: statically resolved trait method.
     let generic_call = def_by_path(&fixture, "generic_call", "calls_ws::generic_call");
     assert_eq!(
         edge_summary(&fixture, OperatorId::CalleesOfFn, generic_call, 1),
-        vec![("calls_ws::Greet::greet".to_owned(), "THROUGH_TRAIT")],
+        vec![("calls_ws::Greet::greet".to_owned(), "THROUGH_TRAIT".to_owned())],
     );
 
     // `dyn Trait` receiver (through the reference autoderef).
     let dyn_call = def_by_path(&fixture, "dyn_call", "calls_ws::dyn_call");
     assert_eq!(
         edge_summary(&fixture, OperatorId::CalleesOfFn, dyn_call, 1),
-        vec![("calls_ws::Greet::greet".to_owned(), "DYN")],
+        vec![("calls_ws::Greet::greet".to_owned(), "DYN".to_owned())],
     );
 
     // Inherent method.
     let inherent = def_by_path(&fixture, "inherent_method_call", "calls_ws::inherent_method_call");
     assert_eq!(
         edge_summary(&fixture, OperatorId::CalleesOfFn, inherent, 1),
-        vec![("calls_ws::Counter::tick".to_owned(), "DIRECT")],
+        vec![("calls_ws::Counter::tick".to_owned(), "DIRECT".to_owned())],
     );
 
     // The closure call `f(..)` has no `Def` callee and is absent; the
@@ -83,14 +83,14 @@ fn callee_classifies_dispatch() {
     let closure_using = def_by_path(&fixture, "closure_using", "calls_ws::closure_using");
     assert_eq!(
         edge_summary(&fixture, OperatorId::CalleesOfFn, closure_using, 1),
-        vec![("calls_ws::helper".to_owned(), "DIRECT")],
+        vec![("calls_ws::helper".to_owned(), "DIRECT".to_owned())],
     );
 
     // Fn-pointer call and fn-as-value reference: no resolvable callee defs.
     let takes_fn_value = def_by_path(&fixture, "takes_fn_value", "calls_ws::takes_fn_value");
     assert_eq!(
         edge_summary(&fixture, OperatorId::CalleesOfFn, takes_fn_value, 1),
-        Vec::<(String, &str)>::new(),
+        Vec::<(String, String)>::new(),
     );
 
     // Known, documented hole (`macro_generated_callsites_absent`): calls
@@ -100,7 +100,7 @@ fn callee_classifies_dispatch() {
         let f = def_by_path(&fixture, name, &format!("calls_ws::{name}"));
         assert_eq!(
             edge_summary(&fixture, OperatorId::CalleesOfFn, f, 1),
-            Vec::<(String, &str)>::new(),
+            Vec::<(String, String)>::new(),
             "{name} outgoing edges are behind macro expansion",
         );
     }
@@ -122,9 +122,9 @@ fn caller_finds_and_classifies_incoming_edges() {
     assert_eq!(
         edge_summary(&fixture, OperatorId::CallersOfFn, helper, 1),
         vec![
-            ("calls_ws::closure_using".to_owned(), "DIRECT"),
-            ("calls_ws::macro_call".to_owned(), "DIRECT"),
-            ("calls_ws::static_call".to_owned(), "DIRECT"),
+            ("calls_ws::closure_using".to_owned(), "DIRECT".to_owned()),
+            ("calls_ws::macro_call".to_owned(), "DIRECT".to_owned()),
+            ("calls_ws::static_call".to_owned(), "DIRECT".to_owned()),
         ],
     );
 
@@ -134,8 +134,8 @@ fn caller_finds_and_classifies_incoming_edges() {
     assert_eq!(
         edge_summary(&fixture, OperatorId::CallersOfFn, greet, 1),
         vec![
-            ("calls_ws::dyn_call".to_owned(), "DYN"),
-            ("calls_ws::generic_call".to_owned(), "THROUGH_TRAIT"),
+            ("calls_ws::dyn_call".to_owned(), "DYN".to_owned()),
+            ("calls_ws::generic_call".to_owned(), "THROUGH_TRAIT".to_owned()),
         ],
     );
 }
@@ -149,7 +149,7 @@ fn call_edge_composes_both_directions() {
     // Outgoing composition shares the `callee` row shape.
     assert_eq!(
         edge_summary(&fixture, OperatorId::CallEdgesByCaller, static_call, 1),
-        vec![("calls_ws::helper".to_owned(), "DIRECT")],
+        vec![("calls_ws::helper".to_owned(), "DIRECT".to_owned())],
     );
 
     // Incoming composition reorders `caller` rows into
@@ -165,9 +165,9 @@ fn call_edge_composes_both_directions() {
     assert_eq!(
         edge_summary(&fixture, OperatorId::CallEdgesByCallee, helper, 0),
         vec![
-            ("calls_ws::closure_using".to_owned(), "DIRECT"),
-            ("calls_ws::macro_call".to_owned(), "DIRECT"),
-            ("calls_ws::static_call".to_owned(), "DIRECT"),
+            ("calls_ws::closure_using".to_owned(), "DIRECT".to_owned()),
+            ("calls_ws::macro_call".to_owned(), "DIRECT".to_owned()),
+            ("calls_ws::static_call".to_owned(), "DIRECT".to_owned()),
         ],
     );
 }
@@ -204,10 +204,10 @@ fn non_function_defs_have_no_call_edges() {
     let counter = def_by_path(&fixture, "Counter", "calls_ws::Counter");
     assert_eq!(
         edge_summary(&fixture, OperatorId::CalleesOfFn, counter, 1),
-        Vec::<(String, &str)>::new(),
+        Vec::<(String, String)>::new(),
     );
     assert_eq!(
         edge_summary(&fixture, OperatorId::CallersOfFn, counter, 1),
-        Vec::<(String, &str)>::new(),
+        Vec::<(String, String)>::new(),
     );
 }

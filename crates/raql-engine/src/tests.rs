@@ -1,2041 +1,595 @@
-use std::collections::{BTreeMap, BTreeSet};
+//! Engine semantics over the full pipeline: programs compile through
+//! resolve → typecheck → plan (catalog externs, demand planning) and
+//! execute against a canned [`OperatorSet`]. The value type is a test
+//! double; `Sym` stands in for opaque semantic handles (defs, spans) —
+//! equality and hashing only, exactly like RA handles.
 
-use indexmap::IndexSet;
-use raql_compiler::{plan, resolve, typecheck};
-use raql_host::{
-    ExternLookupRequest, ExternLookupShape, ExternLookupValue, MockHostRuntime,
-};
-use raql_syntax::{Constraint, Goal, Stmt, parse_program};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::{
-    EngineHostError, EngineHostView, EvalStatus, HostValueKind, RuntimeError, RuntimeValue,
-    build_function_extern_index, collect_function_index_specs, execute,
-    lookup_indexed_function_rows, stable_cmp, term_type_tag,
-};
+use raql_plan::{EngineValue, OperatorId, OperatorSet};
 
-#[derive(Default)]
-struct ExternRowsHost {
-    world_stamp: String,
-    extern_rows: BTreeMap<String, Vec<Vec<RuntimeValue>>>,
-    extern_errors: BTreeMap<String, EngineHostError>,
+use crate::{EvalStatus, execute};
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TestValue {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+    Enum(String, String),
+    Opt(Option<Box<TestValue>>),
+    List(Vec<TestValue>),
+    /// An opaque handle: no ordering, no projection.
+    Sym(&'static str),
 }
 
-impl ExternRowsHost {
-    fn with_rows(mut self, predicate: &str, rows: Vec<Vec<RuntimeValue>>) -> Self {
-        self.extern_rows.insert(predicate.to_string(), rows);
-        self
-    }
+use TestValue::{Int, Sym};
 
-    fn with_error(mut self, predicate: &str, error: EngineHostError) -> Self {
-        self.extern_errors.insert(predicate.to_string(), error);
-        self
-    }
+fn s(text: &str) -> TestValue {
+    TestValue::Str(text.to_string())
 }
 
-impl EngineHostView for ExternRowsHost {
-    fn world_stamp(&mut self) -> String {
-        if self.world_stamp.is_empty() {
-            "test:extern".to_string()
-        } else {
-            self.world_stamp.clone()
+impl EngineValue for TestValue {
+    fn int(value: i64) -> Self {
+        Int(value)
+    }
+
+    fn string(value: &str) -> Self {
+        s(value)
+    }
+
+    fn boolean(value: bool) -> Self {
+        TestValue::Bool(value)
+    }
+
+    fn enum_tag(ty: &str, variant: &str) -> Self {
+        TestValue::Enum(ty.to_string(), variant.to_string())
+    }
+
+    fn none() -> Self {
+        TestValue::Opt(None)
+    }
+
+    fn some(inner: Self) -> Self {
+        TestValue::Opt(Some(Box::new(inner)))
+    }
+
+    fn list(items: Vec<Self>) -> Self {
+        TestValue::List(items)
+    }
+
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            Int(value) => Some(*value),
+            _ => None,
         }
     }
 
-    fn stable_key(&mut self, value: &RuntimeValue) -> String {
-        format!("{value:?}")
-    }
-
-    fn extern_relation_rows(
-        &mut self,
-        predicate: &str,
-    ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
-        if let Some(error) = self.extern_errors.get(predicate) {
-            return Err(error.clone());
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            TestValue::Str(value) => Some(value),
+            _ => None,
         }
-        Ok(self.extern_rows.get(predicate).cloned())
-    }
-}
-
-#[derive(Default)]
-struct StableKeyFallbackHost {
-    extern_rows: BTreeMap<String, Vec<Vec<RuntimeValue>>>,
-    fallback_ids: BTreeSet<u64>,
-    runtime_notes: BTreeSet<String>,
-}
-
-impl StableKeyFallbackHost {
-    fn with_rows(mut self, predicate: &str, rows: Vec<Vec<RuntimeValue>>) -> Self {
-        self.extern_rows.insert(predicate.to_string(), rows);
-        self
     }
 
-    fn with_fallback_id(mut self, id: u64) -> Self {
-        self.fallback_ids.insert(id);
-        self
-    }
-}
-
-impl EngineHostView for StableKeyFallbackHost {
-    fn world_stamp(&mut self) -> String {
-        "test:stable-key".to_string()
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            TestValue::Bool(value) => Some(*value),
+            _ => None,
+        }
     }
 
-    fn stable_key(&mut self, value: &RuntimeValue) -> String {
-        match value {
-            RuntimeValue::Host { kind, id } if self.fallback_ids.contains(id) => {
-                let kind = kind.label();
-                self.runtime_notes.insert(format!(
-                        "host stable-key fallback for `{kind}` value `{id:#018x}`: injected host lookup failure; using deterministic fallback key."
-                    ));
-                format!("stable-fallback:{kind}:{id:#018x}")
+    fn as_enum(&self) -> Option<(&str, &str)> {
+        match self {
+            TestValue::Enum(ty, variant) => Some((ty, variant)),
+            _ => None,
+        }
+    }
+
+    fn as_option(&self) -> Option<Option<&Self>> {
+        match self {
+            TestValue::Opt(inner) => Some(inner.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn as_list(&self) -> Option<&[Self]> {
+        match self {
+            TestValue::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    fn plain_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Int(a), Int(b)) => Some(a.cmp(b)),
+            (TestValue::Str(a), TestValue::Str(b)) => Some(a.cmp(b)),
+            (TestValue::Bool(a), TestValue::Bool(b)) => Some(a.cmp(b)),
+            (TestValue::Enum(a, av), TestValue::Enum(b, bv)) => {
+                Some(a.cmp(b).then_with(|| av.cmp(bv)))
             }
-            RuntimeValue::Host { kind, id } => {
-                let kind = kind.label();
-                format!("stable:{kind}:{id:#018x}")
-            }
-            _ => format!("{value:?}"),
+            _ => None,
         }
     }
 
-    fn take_runtime_notes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.runtime_notes)
-            .into_iter()
-            .collect()
-    }
-
-    fn extern_relation_rows(
-        &mut self,
-        predicate: &str,
-    ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
-        Ok(self.extern_rows.get(predicate).cloned())
+    fn type_tag(&self) -> String {
+        match self {
+            Int(_) => "int".to_string(),
+            TestValue::Str(_) => "string".to_string(),
+            TestValue::Bool(_) => "bool".to_string(),
+            TestValue::Enum(ty, _) => ty.clone(),
+            TestValue::Opt(_) => "option<_>".to_string(),
+            TestValue::List(_) => "list<_>".to_string(),
+            Sym(_) => "Sym".to_string(),
+        }
     }
 }
 
+/// Canned operator extents: each operator filters its full extent by the
+/// mode's bound positions, mirroring the catalog contract (bound inputs in
+/// declaration order, full tuples out).
 #[derive(Default)]
-struct PushdownPendingHost {
-    lookup_rows: BTreeMap<ExternLookupRequest, Vec<Vec<ExternLookupValue>>>,
-    lookup_only_predicates: BTreeSet<String>,
+struct TestOps {
+    extents: HashMap<OperatorId, (Vec<usize>, Vec<Vec<TestValue>>)>,
+    calls: HashMap<OperatorId, usize>,
 }
 
-impl PushdownPendingHost {
-    fn with_lookup_rows(
-        mut self,
-        request: ExternLookupRequest,
-        rows: Vec<Vec<ExternLookupValue>>,
-    ) -> Self {
-        self.lookup_rows.insert(request, rows);
+impl TestOps {
+    fn with(mut self, operator: OperatorId, bound: &[usize], rows: Vec<Vec<TestValue>>) -> Self {
+        self.extents.insert(operator, (bound.to_vec(), rows));
         self
     }
 
-    fn prefer_lookup_only(mut self, predicate: &str) -> Self {
-        self.lookup_only_predicates.insert(predicate.to_string());
-        self
+    fn calls(&self, operator: OperatorId) -> usize {
+        self.calls.get(&operator).copied().unwrap_or(0)
     }
 }
 
-impl EngineHostView for PushdownPendingHost {
-    fn world_stamp(&mut self) -> String {
-        "test:pushdown".to_string()
-    }
+impl OperatorSet for TestOps {
+    type Value = TestValue;
+    type Error = String;
 
-    fn stable_key(&mut self, value: &RuntimeValue) -> String {
-        format!("{value:?}")
-    }
-
-    fn extern_relation_rows(
+    fn invoke(
         &mut self,
-        predicate: &str,
-    ) -> Result<Option<Vec<Vec<RuntimeValue>>>, EngineHostError> {
-        Err(EngineHostError::new(
-            "extern_relation_rows",
-            format!(
-                "predicate `{predicate}` fell back to full relation materialization instead of lookup-first evaluation"
-            ),
-        ))
-    }
-
-    fn extern_lookup(
-        &mut self,
-        request: &ExternLookupRequest,
-    ) -> Result<Option<Vec<Vec<ExternLookupValue>>>, EngineHostError> {
-        Ok(self.lookup_rows.get(request).cloned())
-    }
-
-    fn prefers_lookup_only(&mut self, predicate: &str) -> bool {
-        self.lookup_only_predicates.contains(predicate)
+        operator: OperatorId,
+        inputs: &[TestValue],
+    ) -> Result<Vec<Vec<TestValue>>, String> {
+        *self.calls.entry(operator).or_default() += 1;
+        let (bound, extent) = self
+            .extents
+            .get(&operator)
+            .ok_or_else(|| format!("no canned extent for {}", operator.name()))?;
+        assert_eq!(bound.len(), inputs.len(), "operator input arity");
+        Ok(extent
+            .iter()
+            .filter(|row| bound.iter().zip(inputs).all(|(position, input)| &row[*position] == input))
+            .cloned()
+            .collect())
     }
 }
 
-fn planned_src(src: &str) -> raql_compiler::PlannedProgram {
-    let parsed = parse_program(src).expect("parse");
-    let resolved = resolve(parsed).expect("resolve");
-    let typed = typecheck(resolved).expect("type");
-    plan(typed).expect("plan")
+fn compile(source: &str) -> raql_compiler::PlannedProgram {
+    let parsed = raql_syntax::parse_program(source).expect("parse");
+    let resolved = raql_compiler::resolve(parsed).expect("resolve");
+    let typed = raql_compiler::typecheck(resolved).expect("typecheck");
+    raql_compiler::plan(typed).unwrap_or_else(|diags| panic!("plan: {diags:#?}"))
 }
 
-fn execute_src(src: &str) -> crate::EvalResult {
-    let planned = planned_src(src);
-    let mut host = MockHostRuntime::new();
-    execute(&planned, &mut host)
+fn run(source: &str, ops: &mut TestOps) -> crate::EvalResult<TestValue> {
+    run_with_inputs(source, ops, &BTreeMap::new())
 }
+
+fn run_with_inputs(
+    source: &str,
+    ops: &mut TestOps,
+    inputs: &BTreeMap<String, Vec<Vec<TestValue>>>,
+) -> crate::EvalResult<TestValue> {
+    execute(&compile(source), inputs, ops)
+}
+
+fn rows(result: &crate::EvalResult<TestValue>, relation: &str) -> Vec<Vec<TestValue>> {
+    result
+        .relations
+        .get(relation)
+        .unwrap_or_else(|| panic!("relation `{relation}` in {:?}", result.relations.keys()))
+        .iter()
+        .cloned()
+        .collect()
+}
+
+fn sorted(mut rows: Vec<Vec<TestValue>>) -> Vec<Vec<TestValue>> {
+    rows.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+    rows
+}
+
+// ---------------------------------------------------------------------
+// Core row semantics: facts, joins, recursion, negation
+// ---------------------------------------------------------------------
 
 #[test]
-fn function_extern_index_returns_only_rows_matching_mode_inputs() {
-    let planned = planned_src(
-        r#"
-.decl f(A: int, B: int, Name: string) extern.
-.mode f(+int, +int, -string).
-.decl out(Name: string) output.
-out(Name) :- f(1, 2, Name).
-"#,
-    );
-    let mut relations = BTreeMap::<String, IndexSet<Vec<RuntimeValue>>>::new();
-    relations.insert(
-        "f".to_string(),
-        IndexSet::from([
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(2),
-                RuntimeValue::String("hit".to_string()),
-            ],
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(3),
-                RuntimeValue::String("miss-b".to_string()),
-            ],
-            vec![
-                RuntimeValue::Int(2),
-                RuntimeValue::Int(2),
-                RuntimeValue::String("miss-a".to_string()),
-            ],
-        ]),
-    );
-
-    let specs = collect_function_index_specs(&planned);
-    let index = build_function_extern_index(&planned, &relations, &specs);
-    let matches = lookup_indexed_function_rows(
-        &index,
-        "f",
-        &[0, 1],
-        &[RuntimeValue::Int(1), RuntimeValue::Int(2)],
-        relations.get("f").expect("f rows"),
-    );
-
-    assert_eq!(
-        matches,
-        vec![vec![
-            RuntimeValue::Int(1),
-            RuntimeValue::Int(2),
-            RuntimeValue::String("hit".to_string()),
-        ]]
-    );
-}
-
-#[test]
-fn unmodeled_function_with_ground_output_constant_filters_without_partial_error() {
-    let planned = planned_src(
-        r#"
-.decl src(A: int) input.
-.func f(A: int, Name: string) extern.
-.decl hit() output.
-src(1).
-src(2).
-hit() :- src(A), f(A, "alpha").
-"#,
-    );
-    let mut host = ExternRowsHost::default().with_rows(
-        "f",
-        vec![
-            vec![RuntimeValue::Int(1), RuntimeValue::String("alpha".to_string())],
-            vec![RuntimeValue::Int(2), RuntimeValue::String("beta".to_string())],
-        ],
-    );
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("hit")
-            .is_some_and(|rows| !rows.is_empty()),
-        "unmodeled function fallback should treat only the final argument as output and allow constant filtering"
-    );
-}
-
-#[test]
-fn pushdown_exact_input_function_lookup_avoids_full_relation_materialization() {
-    let planned = planned_src(
-        r#"
-.decl src(A: int) input.
-.func f(A: int, Name: string) extern.
-.decl hit(Name: string) output.
-src(1).
-hit(Name) :- src(A), f(A, Name).
-"#,
-    );
-    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
-        ExternLookupRequest::new(
-            "f",
-            ExternLookupShape::FunctionExactBindings,
-            2,
-            [0],
-            vec![ExternLookupValue::Int(1)],
-        ),
-        vec![vec![
-            ExternLookupValue::Int(1),
-            ExternLookupValue::String("alpha".into()),
-        ]],
-    );
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(
-        result.status,
-        EvalStatus::Ok,
-        "bound-input function externs should be served through lookup-first evaluation; notes={:?}",
-        result.notes
-    );
-}
-
-#[test]
-fn pushdown_constant_output_filter_avoids_full_relation_materialization() {
-    let planned = planned_src(
-        r#"
-.decl src(A: int) input.
-.func f(A: int, Name: string) extern.
-.decl hit() output.
-src(1).
-hit() :- src(A), f(A, "alpha").
-"#,
-    );
-    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
-        ExternLookupRequest::new(
-            "f",
-            ExternLookupShape::FunctionExactBindings,
-            2,
-            [0, 1],
-            vec![
-                ExternLookupValue::Int(1),
-                ExternLookupValue::String("alpha".into()),
-            ],
-        ),
-        vec![vec![
-            ExternLookupValue::Int(1),
-            ExternLookupValue::String("alpha".into()),
-        ]],
-    );
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(
-        result.status,
-        EvalStatus::Ok,
-        "constant-output function filters should still use lookup-first evaluation; notes={:?}",
-        result.notes
-    );
-}
-
-#[test]
-fn pushdown_constant_output_filter_miss_fails_cleanly_without_partial_error() {
-    let planned = planned_src(
-        r#"
-.decl src(A: int) input.
-.func f(A: int, Name: string) extern.
-.decl hit() output.
-src(1).
-hit() :- src(A), f(A, "alpha").
-"#,
-    );
-    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
-        ExternLookupRequest::new(
-            "f",
-            ExternLookupShape::FunctionExactBindings,
-            2,
-            [0, 1],
-            vec![
-                ExternLookupValue::Int(1),
-                ExternLookupValue::String("alpha".into()),
-            ],
-        ),
-        Vec::new(),
-    );
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(
-        result.status,
-        EvalStatus::Ok,
-        "constant-output lookup misses should behave like a failed filter, not a function-cardinality error; notes={:?}",
-        result.notes
-    );
-    assert!(
-        result.relations.get("hit").is_none_or(|rows| rows.is_empty()),
-        "a lookup miss on a constant output should not emit rows"
-    );
-    assert!(
-        result
-            .notes
-            .iter()
-            .all(|note| !note.message.contains("[RAQL0907]")),
-        "a constant-output lookup miss should not surface a function-cardinality error; notes={:?}",
-        result.notes
-    );
-}
-
-#[test]
-fn pushdown_reverse_constant_filter_enumerates_all_matching_inputs() {
-    let planned = planned_src(
-        r#"
-.func f(A: int, Name: string) extern.
-.decl hit(A: int) output.
-hit(A) :- f(A, "alpha").
-"#,
-    );
-    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
-        ExternLookupRequest::new(
-            "f",
-            ExternLookupShape::FunctionExactBindings,
-            2,
-            [1],
-            vec![ExternLookupValue::String("alpha".into())],
-        ),
-        vec![
-            vec![
-                ExternLookupValue::Int(1),
-                ExternLookupValue::String("alpha".into()),
-            ],
-            vec![
-                ExternLookupValue::Int(2),
-                ExternLookupValue::String("alpha".into()),
-            ],
-        ],
-    );
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(
-        result.status,
-        EvalStatus::Ok,
-        "reverse exact-binding filters should enumerate all matching inputs instead of surfacing a function-cardinality error; notes={:?}",
-        result.notes
-    );
-    let hit_rows = result.relations.get("hit").expect("hit relation");
-    assert!(hit_rows.contains(&vec![RuntimeValue::Int(1)]), "rows={hit_rows:?}");
-    assert!(hit_rows.contains(&vec![RuntimeValue::Int(2)]), "rows={hit_rows:?}");
-    assert!(
-        result
-            .notes
-            .iter()
-            .all(|note| !note.message.contains("[RAQL0907]")),
-        "reverse exact-binding filters should not surface a function-cardinality error; notes={:?}",
-        result.notes
-    );
-}
-
-#[test]
-fn pushdown_exact_input_miss_reports_cardinality_without_full_materialization() {
-    let planned = planned_src(
-        r#"
-.decl src(A: int) input.
-.func f(A: int, Name: string) extern.
-.decl hit(Name: string) output.
-src(7).
-hit(Name) :- src(A), f(A, Name).
-"#,
-    );
-    let mut host = PushdownPendingHost::default().prefer_lookup_only("f").with_lookup_rows(
-        ExternLookupRequest::new(
-            "f",
-            ExternLookupShape::FunctionExactBindings,
-            2,
-            [0],
-            vec![ExternLookupValue::Int(7)],
-        ),
-        Vec::new(),
-    );
-    let result = execute(&planned, &mut host);
-
-    assert!(
-        result.notes.iter().any(|note| {
-            note.section == "Errors"
-                && note.message.contains("[RAQL0907]")
-                && note.message.contains("functional predicate `f` cardinality violation")
-        }),
-        "a lookup miss should still report cardinality under current function semantics; notes={:?}",
-        result.notes
-    );
-    assert!(
-        result
-            .notes
-            .iter()
-            .all(|note| !note.message.contains("extern_relation_rows")),
-        "lookup-first miss handling should not surface full materialization fallback notes; notes={:?}",
-        result.notes
-    );
-}
-
-#[test]
-fn pushdown_inline_helper_relation_keeps_seeded_call_edge_lookup_only() {
-    let planned = planned_src(
-        r#"
-.type DispatchKind = { DIRECT }.
-.decl call_edge(Caller: int, Callee: int, Site: int, Dispatch: DispatchKind) extern.
-.mode call_edge(+int, -int, -int, -DispatchKind).
-.mode call_edge(-int, +int, -int, -DispatchKind).
-.mode call_edge(-int, -int, -int, -DispatchKind).
-.decl caller(Callee: int, Caller: int, Site: int, Dispatch: DispatchKind).
-.mode caller(+int, -int, -int, -DispatchKind).
-caller(Callee, Caller, Site, Dispatch) :- call_edge(Caller, Callee, Site, Dispatch).
-.decl target(Callee: int) output.
-.decl out(Caller: int) output.
-target(7).
-out(Caller) :- target(Callee), caller(Callee, Caller, _, _).
-"#,
-    );
-    let mut host = PushdownPendingHost::default()
-        .prefer_lookup_only("call_edge")
-        .with_lookup_rows(
-            ExternLookupRequest::new(
-                "call_edge",
-                ExternLookupShape::RelationExactBindings,
-                4,
-                [1],
-                vec![ExternLookupValue::Int(7)],
-            ),
-            vec![vec![
-                ExternLookupValue::Int(5),
-                ExternLookupValue::Int(7),
-                ExternLookupValue::Int(11),
-                ExternLookupValue::Enum {
-                    name: "DispatchKind".into(),
-                    variant: "DIRECT".into(),
-                },
-            ]],
-        );
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Ok, "notes={:?}", result.notes);
-    assert_eq!(
-        result.relations.get("out"),
-        Some(&IndexSet::from([vec![RuntimeValue::Int(5)]]))
-    );
-    assert!(
-        result
-            .notes
-            .iter()
-            .all(|note| !note.message.contains("extern_relation_rows")),
-        "lookup-only seeded helper evaluation should not fall back to full relation materialization; notes={:?}",
-        result.notes
-    );
-}
-
-#[test]
-fn runtime_error_codes_are_stable() {
-    assert_eq!(RuntimeError::DivisionByZero.code_str(), "RAQL0901");
-    assert_eq!(RuntimeError::Overflow.code_str(), "RAQL0902");
-    assert_eq!(
-        RuntimeError::MissingRelation {
-            relation: "missing".to_string(),
-            context: "referenced by goal `missing()`".to_string(),
-        }
-        .code_str(),
-        "RAQL0903"
-    );
-    assert_eq!(
-        RuntimeError::UnboundVar("X".to_string()).code_str(),
-        "RAQL0904"
-    );
-    assert_eq!(
-        RuntimeError::TypeMismatchContext {
-            context: "builtin `contains` argument 1 expected string, found int".to_string(),
-        }
-        .code_str(),
-        "RAQL0905"
-    );
-    assert_eq!(
-        RuntimeError::ExternRowArity {
-            predicate: "ext".to_string(),
-            row_index: 1,
-            expected: 2,
-            got: 1,
-        }
-        .code_str(),
-        "RAQL0908"
-    );
-    assert_eq!(
-        RuntimeError::WitnessArity {
-            predicate: "path_hop".to_string(),
-            expected: 6,
-            got: 5,
-        }
-        .code_str(),
-        "RAQL0906"
-    );
-    assert_eq!(
-        RuntimeError::WitnessPathHopRowArity {
-            path_id: "path:0".to_string(),
-            expected: 6,
-            got: 5,
-        }
-        .code_str(),
-        "RAQL0906"
-    );
-    assert_eq!(
-        RuntimeError::FunctionCardinality {
-            predicate: "f".to_string(),
-            got: 2,
-            context: "goal `f(X)` with input bindings: <none>".to_string(),
-        }
-        .code_str(),
-        "RAQL0907"
-    );
-}
-
-#[test]
-fn executes_transitive_closure_style_program() {
-    let src = r#"
-.decl edge(A: int, B: int) input.
-.decl reach(A: int, B: int).
-edge(1,2).
-edge(2,3).
-reach(A,B) :- edge(A,B).
+fn facts_join_through_derived_rules() {
+    let source = r#"
+.decl edge(A: int, B: int).
+edge(1, 2).
+edge(2, 3).
+.decl two_hop(A: int, C: int) output.
+two_hop(A, C) :- edge(A, B), edge(B, C).
 "#;
-    let result = execute_src(src);
+    let result = run(source, &mut TestOps::default());
     assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("reach")
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-    );
-    assert_eq!(
-        result
-            .relations
-            .get("out_status")
-            .map(|rows| rows.iter().cloned().collect::<Vec<_>>()),
-        Some(vec![vec![RuntimeValue::String("ok".to_string())]])
-    );
+    assert_eq!(rows(&result, "two_hop"), vec![vec![Int(1), Int(3)]]);
 }
 
 #[test]
-fn reports_division_by_zero_as_partial() {
-    let src = r#"
-.decl p(X: int).
-p(X) :- X := 1 / 0.
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| n.section == "Errors"));
-    assert!(
-        result
-            .notes
-            .iter()
-            .any(|n| n.message.contains("division by zero"))
-    );
-    assert!(
-        result.relations.get("out_status").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::String("partial".to_string())])
-        })
-    );
-    assert!(
-        result
-            .relations
-            .get("out_note")
-            .is_some_and(|rows| rows.iter().any(|row| row
-                == &vec![
-                    RuntimeValue::String("Errors".to_string()),
-                    RuntimeValue::String("runtime error [RAQL0901]: division by zero".to_string(),),
-                ]))
-    );
-}
-
-#[test]
-fn reports_overflow_as_partial_with_runtime_code_and_output_relations() {
-    let src = r#"
+fn input_relations_come_from_the_request() {
+    let source = r#"
 .decl seed(X: int) input.
-.decl out(X: int).
-seed(9223372036854775807).
-out(Y) :- seed(X), Y := X + 1.
+.decl out(X: int) output.
+out(X) :- seed(X).
 "#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0902]")
-            && n.message.contains("integer overflow")
-    }));
-    assert!(
-        result.relations.get("out_status").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::String("partial".to_string())])
-        })
-    );
-    assert!(
-        result
-            .relations
-            .get("out_note")
-            .is_some_and(|rows| rows.iter().any(|row| row
-                == &vec![
-                    RuntimeValue::String("Errors".to_string()),
-                    RuntimeValue::String("runtime error [RAQL0902]: integer overflow".to_string(),),
-                ]))
-    );
+    let mut inputs = BTreeMap::new();
+    inputs.insert("seed".to_string(), vec![vec![Int(7)], vec![Int(9)]]);
+    let result = run_with_inputs(source, &mut TestOps::default(), &inputs);
+    assert_eq!(sorted(rows(&result, "out")), vec![vec![Int(7)], vec![Int(9)]]);
 }
 
 #[test]
-fn reports_iteration_limit_as_partial_with_notes_section() {
-    let src = r#"
-.pragma max_iters = 3.
-.decl p(X: int).
-p(0).
-p(X) :- p(Y), X := Y + 1.
+fn recursion_reaches_the_fixpoint() {
+    let source = r#"
+.decl edge(A: int, B: int).
+edge(1, 2).
+edge(2, 3).
+edge(3, 4).
+.decl reach(A: int, B: int) output.
+reach(A, B) :- edge(A, B).
+reach(A, C) :- edge(A, B), reach(B, C).
 "#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Notes"
-            && n.message
-                .contains("fixpoint iteration limit exceeded in SCC `p`")
-            && n.message.contains("configured max_iters=3")
-            && n.message.contains("triggered at iteration 4")
-    }));
-    assert!(
-        result.relations.get("out_status").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::String("partial".to_string())])
-        })
-    );
-    assert!(result.relations.get("out_note").is_some_and(|rows| {
-        rows.iter().any(|row| {
-            row.first() == Some(&RuntimeValue::String("Notes".to_string()))
-                && row.get(1).is_some_and(|msg| {
-                    matches!(
-                        msg,
-                        RuntimeValue::String(m)
-                            if m.contains("fixpoint iteration limit exceeded in SCC `p`")
-                                && m.contains("configured max_iters=3")
-                                && m.contains("triggered at iteration 4")
-                    )
-                })
-        })
-    }));
-}
-
-#[test]
-fn non_recursive_scc_does_not_trip_iteration_limit() {
-    let src = r#"
-.pragma max_iters = 1.
-.decl edge(A: int, B: int) input.
-.decl reach(A: int, B: int).
-edge(1,2).
-reach(A,B) :- edge(A,B).
-"#;
-    let result = execute_src(src);
+    let result = run(source, &mut TestOps::default());
     assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result.relations.get("reach").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::Int(1), RuntimeValue::Int(2)])
-        })
-    );
+    assert_eq!(rows(&result, "reach").len(), 6);
 }
 
 #[test]
-fn choose_topk_is_deterministic_for_score_ties() {
-    let src = r#"
-.decl candidate(G: int, Item: string, Score: int) input.
-.decl grp(G: int) input.
-.decl top_item(G: int, Score: int, Item: string).
-grp(1).
-candidate(1, "b", 5).
-candidate(1, "a", 5).
-candidate(1, "c", 7).
-candidate(1, "d", 1).
-top_item(G, Score, Item) :-
-  grp(G),
-  choose_topk("rank", 3, G, Score, Item : candidate(G, Item, Score)).
+fn recursion_hits_the_iteration_cap_honestly() {
+    // Successor-style growth with no natural bound below the cap: the cap
+    // fires, the result degrades to Partial, and the note says so.
+    let source = r#"
+.pragma max_iters = 4.
+.decl n(X: int) output.
+n(0).
+n(Y) :- n(X), X < 100, Y := X + 1.
 "#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    let rows = result
-        .relations
-        .get("top_item")
-        .expect("relation exists")
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(result.status, EvalStatus::Partial);
+    assert!(result.notes.iter().any(|note| note.message.contains("RAQL0910")), "{:?}", result.notes);
+}
+
+#[test]
+fn negation_is_stratified_and_seeded() {
+    let source = r#"
+.decl candidate(X: int).
+candidate(1).
+candidate(2).
+.decl blocked(X: int).
+blocked(2).
+.decl allowed(X: int) output.
+allowed(X) :- candidate(X), not blocked(X).
+"#;
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(rows(&result, "allowed"), vec![vec![Int(1)]]);
+}
+
+#[test]
+fn disjunction_flattens_into_a_union() {
+    let source = r#"
+.decl a(X: int).
+a(1).
+.decl b(X: int).
+b(2).
+.decl either(X: int) output.
+either(X) :- (a(X) ; b(X)).
+"#;
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(sorted(rows(&result, "either")), vec![vec![Int(1)], vec![Int(2)]]);
+}
+
+// ---------------------------------------------------------------------
+// Constraints and engine builtins
+// ---------------------------------------------------------------------
+
+#[test]
+fn constraints_bind_compare_and_compute() {
+    let source = r#"
+.decl item(X: int).
+item(2).
+item(5).
+.decl out(X: int, Doubled: int) output.
+out(X, D) :- item(X), X >= 3, D := X * 2 + 1.
+.decl aliased(Y: int) output.
+aliased(Y) :- item(X), Y = X.
+"#;
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(rows(&result, "out"), vec![vec![Int(5), Int(11)]]);
+    assert_eq!(sorted(rows(&result, "aliased")), vec![vec![Int(2)], vec![Int(5)]]);
+}
+
+#[test]
+fn division_by_zero_degrades_to_partial() {
+    let source = r#"
+.decl item(X: int).
+item(0).
+.decl out(Y: int) output.
+out(Y) :- item(X), Y := 1 / X.
+"#;
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(result.status, EvalStatus::Partial);
+    assert!(result.notes.iter().any(|note| note.message.contains("RAQL0901")));
+    assert_eq!(rows(&result, "out"), Vec::<Vec<TestValue>>::new());
+}
+
+#[test]
+fn string_builtins_filter_and_format() {
+    let source = r#"
+.decl name(N: string).
+name("alpha").
+name("beta").
+.decl hit(N: string) output.
+hit(N) :- name(N), starts_with(N, "al").
+.decl misses(N: string) output.
+misses(N) :- name(N), not contains(N, "et").
+.decl fmt(F: string, Args: list<string>, Out: string) extern.
+.decl msg(M: string) output.
+msg(M) :- name(N), starts_with(N, "al"), fmt("hello {}", [N], M).
+"#;
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(rows(&result, "hit"), vec![vec![s("alpha")]]);
+    assert_eq!(rows(&result, "misses"), vec![vec![s("alpha")]]);
+    assert_eq!(rows(&result, "msg"), vec![vec![s("hello alpha")]]);
+}
+
+#[test]
+fn coalesce_and_options_round_trip() {
+    let source = r#"
+.decl raw(V: option<int>).
+raw(none).
+raw(some(3)).
+.func coalesce(Opt: option<int>, Default: int, Out: int) extern.
+.decl out(V: int) output.
+out(V) :- raw(O), coalesce(O, 0, V).
+"#;
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(result.status, EvalStatus::Ok, "{:?}", result.notes);
+    assert_eq!(sorted(rows(&result, "out")), vec![vec![Int(0)], vec![Int(3)]]);
+}
+
+// ---------------------------------------------------------------------
+// Aggregates and choose_topk
+// ---------------------------------------------------------------------
+
+#[test]
+fn aggregates_group_per_correlated_binding() {
+    let source = r#"
+.decl sale(Shop: string, Item: string, Price: int).
+sale("north", "apple", 3).
+sale("north", "pear", 5).
+sale("south", "apple", 2).
+.decl report(Shop: string, Items: int, Total: int, Cheapest: int) output.
+report(Shop, Items, Total, Cheapest) :-
+  sale(Shop, _, _),
+  Items = count(I : sale(Shop, I, _)),
+  Total = sum(P : sale(Shop, _, P)),
+  Cheapest = min(P : sale(Shop, _, P)).
+"#;
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(result.status, EvalStatus::Ok, "{:?}", result.notes);
     assert_eq!(
-        rows,
+        sorted(rows(&result, "report")),
         vec![
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(7),
-                RuntimeValue::String("c".to_string())
-            ],
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(5),
-                RuntimeValue::String("a".to_string())
-            ],
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(5),
-                RuntimeValue::String("b".to_string())
-            ],
-        ]
+            vec![s("north"), Int(2), Int(8), Int(3)],
+            vec![s("south"), Int(1), Int(2), Int(2)],
+        ],
     );
 }
 
 #[test]
-fn relational_order_for_enums_uses_declaration_order() {
-    let src = r#"
-.type Rank = { Beta, Alpha }.
-.decl src(V: Rank) input.
-.decl lt(V: Rank).
-src(Rank::Alpha).
-src(Rank::Beta).
-lt(V) :- src(V), V < Rank::Alpha.
+fn min_over_an_empty_extent_fails_the_goal() {
+    let source = r#"
+.decl seed(X: int).
+seed(1).
+.decl empty(X: int).
+.decl out(M: int) output.
+out(M) :- seed(_), M = min(V : empty(V)).
 "#;
-    let result = execute_src(src);
+    let result = run(source, &mut TestOps::default());
     assert_eq!(result.status, EvalStatus::Ok);
-    assert!(result.relations.get("lt").is_some_and(|rows| {
-        rows.len() == 1
-            && rows.contains(&vec![RuntimeValue::Enum {
-                name: "Rank".to_string(),
-                variant: "Beta".to_string(),
-            }])
-    }));
+    assert_eq!(rows(&result, "out"), Vec::<Vec<TestValue>>::new());
 }
 
 #[test]
-fn aggregate_min_max_for_enums_uses_declaration_order() {
-    let src = r#"
-.type Rank = { Beta, Alpha }.
-.decl src(V: Rank) input.
-.decl mn(V: Rank).
-.decl mx(V: Rank).
-src(Rank::Alpha).
-src(Rank::Beta).
-mn(V) :- V = min(X : src(X)).
-mx(V) :- V = max(X : src(X)).
+fn count_over_an_empty_extent_binds_zero() {
+    let source = r#"
+.decl seed(X: int).
+seed(1).
+.decl empty(X: int).
+.decl out(N: int) output.
+out(N) :- seed(_), N = count(V : empty(V)).
 "#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(result.relations.get("mn").is_some_and(|rows| {
-        rows.contains(&vec![RuntimeValue::Enum {
-            name: "Rank".to_string(),
-            variant: "Beta".to_string(),
-        }])
-    }));
-    assert!(result.relations.get("mx").is_some_and(|rows| {
-        rows.contains(&vec![RuntimeValue::Enum {
-            name: "Rank".to_string(),
-            variant: "Alpha".to_string(),
-        }])
-    }));
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(rows(&result, "out"), vec![vec![Int(0)]]);
 }
 
 #[test]
-fn choose_topk_ties_use_enum_declaration_order_for_items() {
-    let src = r#"
-.type Item = { Beta, Alpha, Gamma }.
-.decl candidate(G: int, I: Item, Score: int) input.
-.decl grp(G: int) input.
-.decl top_item(G: int, Score: int, I: Item).
-grp(1).
-candidate(1, Item::Alpha, 5).
-candidate(1, Item::Beta, 5).
-candidate(1, Item::Gamma, 7).
-top_item(G, Score, I) :-
-  grp(G),
-  choose_topk("rank", 3, G, Score, I : candidate(G, I, Score)).
+fn choose_topk_selects_by_score_descending() {
+    let source = r#"
+.decl scored(Item: string, Score: int).
+scored("low", 1).
+scored("mid", 5).
+scored("high", 9).
+.decl top(Item: string, Score: int) output.
+top(I, S) :- choose_topk("t", 2, 1, Score, Item : scored(Item, Score)), I = Item, S = Score.
 "#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    let rows = result
-        .relations
-        .get("top_item")
-        .expect("relation exists")
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let result = run(source, &mut TestOps::default());
     assert_eq!(
-        rows,
+        sorted(rows(&result, "top")),
+        vec![vec![s("high"), Int(9)], vec![s("mid"), Int(5)]],
+    );
+}
+
+// ---------------------------------------------------------------------
+// Witness paths
+// ---------------------------------------------------------------------
+
+#[test]
+fn witness_path_walks_derived_graph_edges() {
+    let source = r#"
+.decl graph_edge(Graph: string, From: Def, To: Def, EdgeKind: string, Evidence: Span).
+.decl link(F: Def, T: Def, S: Span).
+.decl hops(Seq: int, From: Def, To: Def) output.
+graph_edge("g", F, T, "link", S) :- link(F, T, S).
+path_limit(1).
+.decl path_limit(N: int).
+.decl start(D: Def) input.
+.decl goal(D: Def) input.
+hops(Seq, From, To) :-
+  start(A), goal(B),
+  witness_path("g", A, B, P),
+  path_hop(P, Seq, From, To, _, _).
+"#;
+    let mut inputs = BTreeMap::new();
+    inputs.insert("start".to_string(), vec![vec![Sym("a")]]);
+    inputs.insert("goal".to_string(), vec![vec![Sym("c")]]);
+    let mut ops = TestOps::default();
+    // link is a plain derived relation populated by facts — but facts
+    // cannot carry Sym handles, so feed it as an input relation instead.
+    let source = source.replace(".decl link(F: Def, T: Def, S: Span).", ".decl link(F: Def, T: Def, S: Span) input.");
+    inputs.insert(
+        "link".to_string(),
         vec![
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(7),
-                RuntimeValue::Enum {
-                    name: "Item".to_string(),
-                    variant: "Gamma".to_string(),
-                },
-            ],
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(5),
-                RuntimeValue::Enum {
-                    name: "Item".to_string(),
-                    variant: "Beta".to_string(),
-                },
-            ],
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Int(5),
-                RuntimeValue::Enum {
-                    name: "Item".to_string(),
-                    variant: "Alpha".to_string(),
-                },
-            ],
-        ]
+            vec![Sym("a"), Sym("b"), Sym("s1")],
+            vec![Sym("b"), Sym("c"), Sym("s2")],
+        ],
     );
-}
-
-#[test]
-fn stable_cmp_orders_none_by_explicit_option_type_tag() {
-    let src = r#"
-.decl p().
-p().
-"#;
-    let parsed = parse_program(src).expect("parse");
-    let resolved = resolve(parsed).expect("resolve");
-    let typed = typecheck(resolved).expect("type");
-    let planned = plan(typed).expect("plan");
-    let mut host = MockHostRuntime::new();
-
-    let less = stable_cmp(
-        &planned,
-        &mut host,
-        &RuntimeValue::None,
-        &RuntimeValue::None,
-        Some("option<int>"),
-        Some("option<string>"),
-    );
-    let greater = stable_cmp(
-        &planned,
-        &mut host,
-        &RuntimeValue::None,
-        &RuntimeValue::None,
-        Some("option<string>"),
-        Some("option<int>"),
-    );
-    assert!(less.is_lt());
-    assert!(greater.is_gt());
-}
-
-#[test]
-fn term_type_tag_uses_turbofish_for_none_and_empty_list() {
-    let src = r#"
-.decl p().
-p() :- none::<int> = none::<int>.
-p() :- []::<string> = []::<string>.
-"#;
-    let parsed = parse_program(src).expect("parse");
-    let statements = &parsed.phase().statements;
-    let empty = std::collections::BTreeMap::new();
-
-    let rule_none = match &statements[1].value {
-        Stmt::Rule(rule) => rule,
-        _ => panic!("expected rule"),
-    };
-    let rel_none = match &rule_none.body[0].value {
-        Goal::Constraint(Constraint::Relational(rel)) => rel,
-        _ => panic!("expected relational constraint"),
-    };
+    let result = run_with_inputs(&source, &mut ops, &inputs);
+    assert_eq!(result.status, EvalStatus::Ok, "{:?}", result.notes);
     assert_eq!(
-        term_type_tag(&rel_none.lhs, &empty).as_deref(),
-        Some("option<int>")
-    );
-
-    let rule_list = match &statements[2].value {
-        Stmt::Rule(rule) => rule,
-        _ => panic!("expected rule"),
-    };
-    let rel_list = match &rule_list.body[0].value {
-        Goal::Constraint(Constraint::Relational(rel)) => rel,
-        _ => panic!("expected relational constraint"),
-    };
-    assert_eq!(
-        term_type_tag(&rel_list.lhs, &empty).as_deref(),
-        Some("list<string>")
-    );
-}
-
-#[test]
-fn witness_path_hop_order_uses_stable_order() {
-    let src = r#"
-.type Def = { Start, Beta, Alpha, End }.
-.type Span = { S1, S2, S3, S4 }.
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl path_hop(P: Path, Seq: int, From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.
-.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
-.decl first_hop(To: Def).
-graph_edge("g", Def::Start, Def::Alpha, "edge", Span::S1).
-graph_edge("g", Def::Start, Def::Beta, "edge", Span::S2).
-graph_edge("g", Def::Alpha, Def::End, "edge", Span::S3).
-graph_edge("g", Def::Beta, Def::End, "edge", Span::S4).
-first_hop(To) :-
-  witness_path("g", Def::Start, Def::End, P),
-  path_hop(P, 0, _, To, _, _).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(result.relations.get("first_hop").is_some_and(|rows| {
-        rows.len() == 1
-            && rows.contains(&vec![RuntimeValue::Enum {
-                name: "Def".to_string(),
-                variant: "Beta".to_string(),
-            }])
-    }));
-}
-
-#[test]
-fn witness_path_and_path_hop_produce_expected_hops() {
-    let src = r#"
-.type Def = { D1, D2, D3 }.
-.type Span = { E12, E23 }.
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl path_hop(P: Path, Seq: int, From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.
-.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
-.decl hop(Seq: int, From: Def, To: Def, Kind: string, Evidence: Span).
-graph_edge("g", Def::D1, Def::D2, "edge", Span::E12).
-graph_edge("g", Def::D2, Def::D3, "edge", Span::E23).
-hop(Seq, From, To, Kind, Evidence) :-
-  witness_path("g", Def::D1, Def::D3, P),
-  path_hop(P, Seq, From, To, Kind, Evidence).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    let rows = result
-        .relations
-        .get("hop")
-        .expect("relation exists")
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        rows,
+        sorted(rows(&result, "hops")),
         vec![
-            vec![
-                RuntimeValue::Int(0),
-                RuntimeValue::Enum {
-                    name: "Def".to_string(),
-                    variant: "D1".to_string()
-                },
-                RuntimeValue::Enum {
-                    name: "Def".to_string(),
-                    variant: "D2".to_string()
-                },
-                RuntimeValue::String("edge".to_string()),
-                RuntimeValue::Enum {
-                    name: "Span".to_string(),
-                    variant: "E12".to_string()
-                }
-            ],
-            vec![
-                RuntimeValue::Int(1),
-                RuntimeValue::Enum {
-                    name: "Def".to_string(),
-                    variant: "D2".to_string()
-                },
-                RuntimeValue::Enum {
-                    name: "Def".to_string(),
-                    variant: "D3".to_string()
-                },
-                RuntimeValue::String("edge".to_string()),
-                RuntimeValue::Enum {
-                    name: "Span".to_string(),
-                    variant: "E23".to_string()
-                }
-            ],
-        ]
+            vec![Int(0), Sym("a"), Sym("b")],
+            vec![Int(1), Sym("b"), Sym("c")],
+        ],
     );
 }
 
-#[test]
-fn witness_path_hop_sequences_are_zero_based_and_gapless_per_path() {
-    let src = r#"
-.type Def = { Start, A, B, End }.
-.type Span = { SA, AE, SB, BE }.
-.func path_max_depth(N: int) input.
-.mode path_max_depth(-int).
-.func path_limit(N: int) input.
-.mode path_limit(-int).
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl path_hop(P: Path, Seq: int, From: Def, To: Def, EdgeKind: string, Evidence: Span) extern.
-.mode path_hop(+Path, -int, -Def, -Def, -string, -Span).
-.decl hop_seq(P: Path, Seq: int).
-path_max_depth(8).
-path_limit(2).
-graph_edge("g", Def::Start, Def::A, "edge", Span::SA).
-graph_edge("g", Def::A, Def::End, "edge", Span::AE).
-graph_edge("g", Def::Start, Def::B, "edge", Span::SB).
-graph_edge("g", Def::B, Def::End, "edge", Span::BE).
-hop_seq(P, Seq) :-
-  witness_path("g", Def::Start, Def::End, P),
-  path_hop(P, Seq, _, _, _, _).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    let rows = result
-        .relations
-        .get("hop_seq")
-        .expect("relation exists")
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut by_path = BTreeMap::<String, Vec<i64>>::new();
-    for row in rows {
-        assert_eq!(row.len(), 2, "expected hop_seq row arity 2");
-        let path_id = match row[0].clone() {
-            RuntimeValue::String(path_id) => path_id,
-            other => panic!("expected string path id, found {other:?}"),
-        };
-        let seq = match row[1] {
-            RuntimeValue::Int(seq) => seq,
-            ref other => panic!("expected int sequence, found {other:?}"),
-        };
-        by_path.entry(path_id).or_default().push(seq);
-    }
-    assert_eq!(by_path.len(), 2, "expected two witness paths");
-    for seqs in by_path.values_mut() {
-        seqs.sort_unstable();
-        assert_eq!(seqs.as_slice(), [0, 1]);
-    }
+// ---------------------------------------------------------------------
+// Catalog operators: invocation, modes, demand memoization
+// ---------------------------------------------------------------------
+
+fn def_world() -> TestOps {
+    let defs = [(Sym("f1"), "alpha", "FN"),
+        (Sym("f2"), "beta", "FN"),
+        (Sym("s1"), "alpha", "STRUCT")];
+    TestOps::default()
+        .with(
+            OperatorId::NameOfDef,
+            &[0],
+            defs.iter().map(|(d, n, _)| vec![d.clone(), s(n)]).collect(),
+        )
+        .with(
+            OperatorId::DefsByExactName,
+            &[1],
+            defs.iter().map(|(d, n, _)| vec![d.clone(), s(n)]).collect(),
+        )
+        .with(
+            OperatorId::KindOfDef,
+            &[0],
+            defs.iter()
+                .map(|(d, _, k)| vec![d.clone(), TestValue::enum_tag("DefKind", k)])
+                .collect(),
+        )
+        .with(OperatorId::DefsScan, &[], defs.iter().map(|(d, _, _)| vec![d.clone()]).collect())
 }
 
 #[test]
-fn opt_max_iters_some_overrides_pragma() {
-    let src = r#"
-.pragma max_iters = 50.
-.func opt_max_iters(N: option<int>) input.
-opt_max_iters(some(2)).
-.decl p(X: int).
-p(0).
-p(X) :- p(Y), X := Y + 1.
+fn extern_goals_invoke_the_catalog_operator_for_their_mode() {
+    let source = r#"
+.type DefKind = { FN, METHOD, STRUCT }.
+.decl hit(D: Def) output.
+hit(D) :- def_name(D, "alpha"), def_kind(D, DefKind::FN).
 "#;
-    let result = execute_src(src);
+    let mut ops = def_world();
+    let result = run(source, &mut ops);
+    assert_eq!(result.status, EvalStatus::Ok, "{:?}", result.notes);
+    assert_eq!(rows(&result, "hit"), vec![vec![Sym("f1")]]);
+    // The name seed ran (not the scan), and the kind filter ran per
+    // candidate def.
+    assert_eq!(ops.calls(OperatorId::DefsByExactName), 1);
+    assert_eq!(ops.calls(OperatorId::DefsScan), 0);
+    assert_eq!(ops.calls(OperatorId::KindOfDef), 2);
+}
+
+#[test]
+fn declared_scans_enumerate() {
+    let source = r#"
+.decl all_names(N: string) output.
+all_names(N) :- def(D), def_name(D, N).
+"#;
+    let mut ops = def_world();
+    let result = run(source, &mut ops);
+    // Set semantics: two defs named "alpha" project to one row.
+    assert_eq!(sorted(rows(&result, "all_names")), vec![vec![s("alpha")], vec![s("beta")]]);
+    assert_eq!(ops.calls(OperatorId::DefsScan), 1);
+}
+
+#[test]
+fn demanded_specializations_memoize_per_seed() {
+    // is_fn is demanded once per distinct def; the second rule referencing
+    // it must reuse the memoized specialization rows.
+    let source = r#"
+.decl seed(D: Def) input.
+.type DefKind = { FN, METHOD, STRUCT }.
+.decl is_fn(D: Def).
+.mode is_fn(+Def).
+is_fn(D) :- def_kind(D, DefKind::FN).
+.decl once(D: Def) output.
+once(D) :- seed(D), is_fn(D).
+.decl twice(D: Def) output.
+twice(D) :- seed(D), is_fn(D), is_fn(D).
+"#;
+    let mut inputs = BTreeMap::new();
+    inputs.insert("seed".to_string(), vec![vec![Sym("f1")]]);
+    let mut ops = def_world();
+    let result = run_with_inputs(source, &mut ops, &inputs);
+    assert_eq!(result.status, EvalStatus::Ok, "{:?}", result.notes);
+    assert_eq!(rows(&result, "once"), vec![vec![Sym("f1")]]);
+    assert_eq!(rows(&result, "twice"), vec![vec![Sym("f1")]]);
+    // One def, one demanded (is_fn, (+), [f1]) specialization: one
+    // def_kind invocation despite three call sites.
+    assert_eq!(ops.calls(OperatorId::KindOfDef), 1);
+}
+
+#[test]
+fn operator_errors_are_errors_not_empty_relations() {
+    let source = r#"
+.decl hit(D: Def) output.
+hit(D) :- def(D).
+"#;
+    // No canned extent for DefsScan.
+    let mut ops = TestOps::default();
+    let result = run(source, &mut ops);
     assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Notes"
-            && n.message.contains("fixpoint iteration limit exceeded")
-            && n.message.contains("configured max_iters=2")
-            && n.message.contains("triggered at iteration 3")
-    }));
-}
-
-#[test]
-fn injects_default_control_max_depth_input() {
-    let src = r#"
-.decl control_max_depth(N: int) input.
-.decl observed(N: int).
-observed(N) :- control_max_depth(N).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
     assert!(
-        result
-            .relations
-            .get("observed")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(32)]))
+        result.notes.iter().any(|note| note.message.contains("RAQL0909")),
+        "{:?}",
+        result.notes,
     );
 }
 
 #[test]
-fn world_stamp_is_injected_from_host_runtime() {
-    let src = r#"
-.func world_stamp(S: string) extern.
-.mode world_stamp(-string).
-.decl stamp(S: string).
-stamp(S) :- world_stamp(S).
+fn out_status_reflects_the_evaluation() {
+    let source = r#"
+.decl ok(X: int) output.
+ok(1).
 "#;
-    let parsed = parse_program(src).expect("parse");
-    let resolved = resolve(parsed).expect("resolve");
-    let typed = typecheck(resolved).expect("type");
-    let planned = plan(typed).expect("plan");
-    let mut host = MockHostRuntime::new().with_world_stamp("cfg:test");
-    let result = execute(&planned, &mut host);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(result.relations.get("stamp").is_some_and(|rows| {
-        rows.contains(&vec![RuntimeValue::String("cfg:test".to_string())])
-    }));
-    assert!(result.relations.get("world_stamp").is_some_and(|rows| {
-        rows.len() == 1 && rows.contains(&vec![RuntimeValue::String("cfg:test".to_string())])
-    }));
-}
-
-#[test]
-fn function_cardinality_violation_for_input_function_halts_run() {
-    let src = r#"
-.func single_value(S: string) input.
-.mode single_value(-string).
-single_value("a").
-single_value("b").
-.decl p() .
-p() :- single_value(_).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0907]")
-            && n.message
-                .contains("functional predicate `single_value` cardinality violation")
-            && n.message
-                .contains("goal `single_value(_)` with input bindings: <none>")
-    }));
-}
-
-#[test]
-fn function_cardinality_for_opt_max_iters_includes_input_context() {
-    let src = r#"
-.func opt_max_iters(N: option<int>) input.
-opt_max_iters(some(1)).
-opt_max_iters(some(2)).
-.decl p().
-p().
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0907]")
-            && n.message
-                .contains("input `opt_max_iters` expected exactly one optional scalar row")
-            && n.message.contains("row 1 = (some(1))")
-            && n.message.contains("row 2 = (some(2))")
-    }));
-}
-
-#[test]
-fn scalar_input_type_mismatch_includes_input_row_context() {
-    let mut rows = IndexSet::new();
-    rows.insert(vec![RuntimeValue::String("deep".to_string())]);
-    let mut relations = BTreeMap::new();
-    relations.insert("control_max_depth".to_string(), rows);
-
-    let err = super::scalar_input(&relations, "control_max_depth", 32).expect_err("type mismatch");
-    assert_eq!(err.code_str(), "RAQL0905");
-    assert!(
-        err.to_string()
-            .contains("input `control_max_depth` row 1 expected `int`, found string (\"deep\")")
-    );
-    assert!(err.to_string().contains("row 1 = (\"deep\")"));
-}
-
-#[test]
-fn optional_scalar_input_type_mismatch_includes_input_row_context() {
-    let mut rows = IndexSet::new();
-    rows.insert(vec![RuntimeValue::Int(1)]);
-    let mut relations = BTreeMap::new();
-    relations.insert("opt_max_iters".to_string(), rows);
-
-    let err =
-        super::scalar_option_i64_input(&relations, "opt_max_iters").expect_err("type mismatch");
-    assert_eq!(err.code_str(), "RAQL0905");
-    assert!(
-        err.to_string()
-            .contains("input `opt_max_iters` row 1 expected `option<int>`, found int (1)")
-    );
-    assert!(err.to_string().contains("row 1 = (1)"));
-}
-
-#[test]
-fn scalar_input_arity_mismatch_includes_input_row_context() {
-    let mut rows = IndexSet::new();
-    rows.insert(vec![RuntimeValue::Int(16), RuntimeValue::Int(32)]);
-    let mut relations = BTreeMap::new();
-    relations.insert("control_max_depth".to_string(), rows);
-
-    let err = super::scalar_input(&relations, "control_max_depth", 32).expect_err("arity");
-    assert_eq!(err.code_str(), "RAQL0905");
-    assert!(
-        err.to_string()
-            .contains("input `control_max_depth` row 1 expected arity 1 with `int`, found arity 2")
-    );
-    assert!(err.to_string().contains("row 1 = (16, 32)"));
-}
-
-#[test]
-fn optional_scalar_input_arity_mismatch_includes_input_row_context() {
-    let mut rows = IndexSet::new();
-    rows.insert(vec![RuntimeValue::None, RuntimeValue::None]);
-    let mut relations = BTreeMap::new();
-    relations.insert("opt_max_iters".to_string(), rows);
-
-    let err = super::scalar_option_i64_input(&relations, "opt_max_iters").expect_err("arity");
-    assert_eq!(err.code_str(), "RAQL0905");
-    assert!(err.to_string().contains(
-        "input `opt_max_iters` row 1 expected arity 1 with `option<int>`, found arity 2"
-    ));
-    assert!(err.to_string().contains("row 1 = (none, none)"));
-}
-
-#[test]
-fn arithmetic_bind_type_mismatch_includes_target_and_row_context() {
-    let parsed = parse_program(
-        r#"
-.decl p().
-p() :- X := 1.
-"#,
-    )
-    .expect("parse");
-    let rule = match &parsed.phase().statements[1].value {
-        Stmt::Rule(rule) => rule,
-        _ => panic!("expected rule"),
-    };
-    let bind = match &rule.body[0].value {
-        Goal::Constraint(Constraint::ArithmeticBind(bind)) => bind,
-        _ => panic!("expected arithmetic bind"),
-    };
-
-    let mut env = BTreeMap::new();
-    env.insert("X".to_string(), RuntimeValue::String("bad".to_string()));
-
-    let err = super::eval_arithmetic_bind_constraint(bind, &env).expect_err("type mismatch");
-    assert_eq!(err.code_str(), "RAQL0905");
-    assert!(
-        err.to_string()
-            .contains("arithmetic bind `X := 1` expected target `X` to be `int`")
-    );
-    assert!(err.to_string().contains("row bindings: X=\"bad\""));
-}
-
-#[test]
-fn eval_int_expr_type_mismatch_includes_expression_context() {
-    let parsed = parse_program(
-        r#"
-.decl p().
-p() :- X := Y.
-"#,
-    )
-    .expect("parse");
-    let rule = match &parsed.phase().statements[1].value {
-        Stmt::Rule(rule) => rule,
-        _ => panic!("expected rule"),
-    };
-    let bind = match &rule.body[0].value {
-        Goal::Constraint(Constraint::ArithmeticBind(bind)) => bind,
-        _ => panic!("expected arithmetic bind"),
-    };
-
-    let mut env = BTreeMap::new();
-    env.insert("Y".to_string(), RuntimeValue::String("oops".to_string()));
-
-    let err = super::eval_int_expr(&bind.expr, &env).expect_err("type mismatch");
-    assert_eq!(err.code_str(), "RAQL0905");
-    assert!(
-        err.to_string()
-            .contains("arithmetic expression `Y` expected term `Y` to be `int`")
-    );
-    assert!(err.to_string().contains("found string (\"oops\")"));
-    assert!(err.to_string().contains("row bindings: Y=\"oops\""));
-}
-
-#[test]
-fn eval_ground_term_wildcard_reports_contextual_type_mismatch() {
-    let parsed = parse_program(
-        r#"
-.decl p().
-p() :- q(_).
-"#,
-    )
-    .expect("parse");
-    let rule = match &parsed.phase().statements[1].value {
-        Stmt::Rule(rule) => rule,
-        _ => panic!("expected rule"),
-    };
-    let atom = match &rule.body[0].value {
-        Goal::Atom(atom) => atom,
-        _ => panic!("expected atom"),
-    };
-    let env = BTreeMap::new();
-
-    let err = super::eval_ground_term(&atom.terms[0], &env).expect_err("wildcard mismatch");
-    assert_eq!(err.code_str(), "RAQL0905");
-    assert!(
-        err.to_string()
-            .contains("wildcard `_` cannot be evaluated as a ground term")
-    );
-    assert!(err.to_string().contains("row bindings: <none>"));
-}
-
-#[test]
-fn missing_relation_for_witness_path_includes_reference_context() {
-    let src = r#"
-.type Def = { A, B }.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl out().
-out() :- witness_path("g", Def::A, Def::B, _).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0903]")
-            && n.message.contains("missing relation `graph_edge`")
-            && n.message
-                .contains("referenced by builtin `witness_path` call")
-            && n.message.contains("witness_path(\"g\", Def::A, Def::B, _)")
-            && n.message.contains("<memory>:")
-    }));
-}
-
-#[test]
-fn builtin_type_mismatch_contains_reports_predicate_and_argument() {
-    let src = r#"
-.decl contains(Haystack: string, Needle: string) extern.
-.decl out().
-out() :- contains(1, "x").
-"#;
-    let parsed = parse_program(src).expect("parse");
-    let resolved = resolve(parsed).expect("resolve");
-    let err = typecheck(resolved).expect_err("type mismatch");
-    assert!(err.iter().any(|d| d.code_str() == "RAQL0200"));
-    assert!(err.iter().any(|d| {
-        d.to_string().contains("cannot unify `string` with `int`")
-    }));
-}
-
-#[test]
-fn builtin_type_mismatch_fmt_reports_nested_argument_path() {
-    let src = r#"
-.decl fmt(Format: string, Args: list<string>, Out: string) extern.
-.decl out().
-out() :- fmt("{}", [1], _).
-"#;
-    let parsed = parse_program(src).expect("parse");
-    let resolved = resolve(parsed).expect("resolve");
-    let err = typecheck(resolved).expect_err("type mismatch");
-    assert!(err.iter().any(|d| d.code_str() == "RAQL0200"));
-    assert!(err.iter().any(|d| {
-        d.to_string().contains("cannot unify `string` with `int`")
-    }));
-}
-
-#[test]
-fn path_hop_arity_errors_are_specific() {
-    let parsed = parse_program(
-        r#"
-.decl p().
-p() :- path_hop(P).
-"#,
-    )
-    .expect("parse");
-    let rule = match &parsed.phase().statements[1].value {
-        Stmt::Rule(rule) => rule,
-        _ => panic!("expected rule"),
-    };
-    let atom = match &rule.body[0].value {
-        Goal::Atom(atom) => atom,
-        _ => panic!("expected atom"),
-    };
-    let env = BTreeMap::new();
-    let context = super::ExecutionContext::default();
-    let relations = BTreeMap::new();
-    let err =
-        super::eval_path_hop_atom(atom, &env, &context, &relations).expect_err("arity mismatch");
-    assert_eq!(err.code_str(), "RAQL0906");
-    assert_eq!(
-        err.to_string(),
-        "witness predicate `path_hop` arity mismatch: expected 6, got 1"
-    );
-}
-
-#[test]
-fn witness_path_hop_error_messages_distinguish_failure_causes() {
-    let arity = RuntimeError::WitnessArity {
-        predicate: "path_hop".to_string(),
-        expected: 6,
-        got: 5,
-    };
-    let row = RuntimeError::WitnessPathHopRowArity {
-        path_id: "path:bad".to_string(),
-        expected: 6,
-        got: 4,
-    };
-    assert_eq!(
-        arity.to_string(),
-        "witness predicate `path_hop` arity mismatch: expected 6, got 5"
-    );
-    assert_eq!(
-        row.to_string(),
-        "witness predicate `path_hop` cached row for path `path:bad` has arity 4, expected 6"
-    );
-}
-
-#[test]
-fn malformed_extern_row_arity_is_reported() {
-    let src = r#"
-.decl ext(A: int, B: int) extern.
-.mode ext(-int, -int).
-.decl out(A: int).
-out(A) :- ext(A, _).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default().with_rows("ext", vec![vec![RuntimeValue::Int(1)]]);
-    let result = execute(&planned, &mut host);
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0908]")
-            && n.message
-                .contains("extern relation `ext` row 1 has arity 1, expected 2")
-            && n.message.contains("host `extern_relation_rows`")
-    }));
-}
-
-#[test]
-fn host_scalar_overrides_for_witness_path_do_not_collide_with_defaults() {
-    let src = r#"
-.type Def = { A, B, C }.
-.type Span = { S1, S2 }.
-.func path_max_depth(N: int) extern.
-.mode path_max_depth(-int).
-.func path_limit(N: int) extern.
-.mode path_limit(-int).
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl out(P: Path).
-graph_edge("g", Def::A, Def::B, "edge", Span::S1).
-graph_edge("g", Def::B, Def::C, "edge", Span::S2).
-out(P) :- witness_path("g", Def::A, Def::C, P).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default()
-        .with_rows("path_max_depth", vec![vec![RuntimeValue::Int(1)]])
-        .with_rows("path_limit", vec![vec![RuntimeValue::Int(5)]]);
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("out")
-            .is_some_and(|rows| rows.is_empty())
-    );
-    assert!(
-        result
-            .relations
-            .get("path_max_depth")
-            .is_some_and(|rows| { rows.len() == 1 && rows.contains(&vec![RuntimeValue::Int(1)]) })
-    );
-    assert!(
-        result
-            .relations
-            .get("path_limit")
-            .is_some_and(|rows| { rows.len() == 1 && rows.contains(&vec![RuntimeValue::Int(5)]) })
-    );
-}
-
-#[test]
-fn missing_host_extern_rows_are_reported_as_actionable_partial_note() {
-    let src = r#"
-.decl ext(A: int) extern.
-.mode ext(-int).
-.decl out().
-out() :- ext(_).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default();
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Notes"
-            && n.message
-                .contains("extern relation `ext` returned `Ok(None)`")
-            && n.message.contains("EngineHostView::extern_relation_rows")
-            && n.message.contains("treating `ext` as an empty relation")
-            && n.message.contains("`ext` is referenced by 1 goal(s)")
-            && n.message.contains("goal `ext(_)` in rule `out()`")
-            && n.message.contains("<memory>:")
-            && n.message.contains("Ok(Some(vec![]))")
-    }));
-    assert!(
-        result.relations.get("out_status").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::String("partial".to_string())])
-        })
-    );
-}
-
-#[test]
-fn missing_host_extern_rows_for_unused_predicate_note_mentions_no_usage() {
-    let src = r#"
-.decl ext(A: int) extern.
-.mode ext(-int).
-.decl out().
-out().
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default();
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Notes"
-            && n.message
-                .contains("extern relation `ext` returned `Ok(None)`")
-            && n.message.contains("is not referenced by any rule goals")
-            && n.message.contains("Declaration anchor:")
-            && n.message.contains("<memory>:")
-            && n.message.contains("Ok(Some(vec![]))")
-    }));
-}
-
-#[test]
-fn host_extern_rows_errors_are_distinct_from_ok_none_no_data() {
-    let src = r#"
-.decl ext(A: int) extern.
-.mode ext(-int).
-.decl out().
-out() :- ext(_).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default().with_error(
-        "ext",
-        EngineHostError::new("extern_rows(ext)", "backend timeout"),
-    );
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Notes"
-            && n.message
-                .contains("extern relation `ext` returned host error")
-            && n.message
-                .contains("host `extern_rows(ext)` failed: backend timeout")
-            && n.message.contains("goal `ext(_)` in rule `out()`")
-            && n.message.contains("<memory>:")
-            && n.message.contains("Ok(None)")
-    }));
-    assert!(
-        result.relations.get("out_status").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::String("partial".to_string())])
-        })
-    );
-}
-
-#[test]
-fn stable_key_fallback_notes_mark_execution_partial() {
-    let src = r#"
-.decl src(V: Def) extern.
-.mode src(-Def).
-.decl mn(V: Def).
-mn(V) :- V = min(X : src(X)).
-"#;
-    let planned = planned_src(src);
-    let value_a = RuntimeValue::Host {
-        kind: HostValueKind::Def,
-        id: 0x71,
-    };
-    let value_b = RuntimeValue::Host {
-        kind: HostValueKind::Def,
-        id: 0x72,
-    };
-    let mut host = StableKeyFallbackHost::default()
-        .with_rows("src", vec![vec![value_a], vec![value_b]])
-        .with_fallback_id(0x71);
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Notes"
-            && n.message
-                .contains("host stable-key fallback for `Def` value `0x0000000000000071`")
-            && n.message.contains("using deterministic fallback key")
-    }));
-    assert!(
-        result.relations.get("out_status").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::String("partial".to_string())])
-        })
-    );
-}
-
-#[test]
-fn choose_topk_k_type_mismatch_reports_tag_term_and_row_context() {
-    let src = r#"
-.decl kcfg(K: int) extern.
-.mode kcfg(-int).
-.decl candidate(G: int, Item: string, Score: int) input.
-.decl grp(G: int) input.
-.decl top_item(G: int, Score: int, Item: string).
-grp(1).
-candidate(1, "a", 7).
-top_item(G, Score, Item) :-
-  grp(G),
-  kcfg(K),
-  choose_topk("rank", K, G, Score, Item : candidate(G, Item, Score)).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default()
-        .with_rows("kcfg", vec![vec![RuntimeValue::String("x".to_string())]]);
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-            n.section == "Errors"
-                && n.message.contains("[RAQL0905]")
-                && n.message.contains(
-                    "choose_topk `rank` expected `k` term `K` to evaluate to `int`, found string (\"x\")"
-                )
-                && n.message.contains("row bindings:")
-                && n.message.contains("K=\"x\"")
-        }));
-}
-
-#[test]
-fn choose_topk_k_negative_reports_actionable_runtime_context() {
-    let src = r#"
-.decl kcfg(K: int) extern.
-.mode kcfg(-int).
-.decl candidate(G: int, Item: string, Score: int) input.
-.decl grp(G: int) input.
-.decl top_item(G: int, Score: int, Item: string).
-grp(1).
-candidate(1, "a", 7).
-top_item(G, Score, Item) :-
-  grp(G),
-  kcfg(K),
-  choose_topk("rank", K, G, Score, Item : candidate(G, Item, Score)).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default().with_rows("kcfg", vec![vec![RuntimeValue::Int(-1)]]);
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-            n.section == "Errors"
-                && n.message.contains("[RAQL0905]")
-                && n.message.contains(
-                    "choose_topk `rank` expected `k` term `K` to evaluate to a positive `int` (> 0), found int (-1)"
-                )
-                && n.message.contains("row bindings:")
-                && n.message.contains("K=-1")
-        }));
-}
-
-#[test]
-fn choose_topk_k_zero_reports_actionable_runtime_context() {
-    let src = r#"
-.decl kcfg(K: int) extern.
-.mode kcfg(-int).
-.decl candidate(G: int, Item: string, Score: int) input.
-.decl grp(G: int) input.
-.decl top_item(G: int, Score: int, Item: string).
-grp(1).
-candidate(1, "a", 7).
-top_item(G, Score, Item) :-
-  grp(G),
-  kcfg(K),
-  choose_topk("rank", K, G, Score, Item : candidate(G, Item, Score)).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default().with_rows("kcfg", vec![vec![RuntimeValue::Int(0)]]);
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-            n.section == "Errors"
-                && n.message.contains("[RAQL0905]")
-                && n.message.contains(
-                    "choose_topk `rank` expected `k` term `K` to evaluate to a positive `int` (> 0), found int (0)"
-                )
-                && n.message.contains("row bindings:")
-                && n.message.contains("K=0")
-        }));
-}
-
-#[test]
-fn witness_path_negative_max_depth_reports_actionable_runtime_context() {
-    let src = r#"
-.type Def = { A, B }.
-.type Span = { S }.
-.func path_max_depth(N: int) input.
-.mode path_max_depth(-int).
-.func path_limit(N: int) input.
-.mode path_limit(-int).
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl out().
-path_max_depth(-1).
-path_limit(1).
-graph_edge("g", Def::A, Def::B, "edge", Span::S).
-out() :- witness_path("g", Def::A, Def::B, _).
-"#;
-    let result = execute_src(src);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0905]")
-            && n.message.contains(
-                "input `path_max_depth` expected `int >= 0` for `witness_path`, found int (-1)",
-            )
-            && n.message.contains("set `path_max_depth` to 0 or greater")
-    }));
-}
-
-#[test]
-fn witness_path_non_positive_limit_reports_actionable_runtime_context() {
-    let src = r#"
-.type Def = { A, B }.
-.type Span = { S }.
-.func path_max_depth(N: int) input.
-.mode path_max_depth(-int).
-.func path_limit(N: int) input.
-.mode path_limit(-int).
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl out().
-path_max_depth(8).
-path_limit(0).
-graph_edge("g", Def::A, Def::B, "edge", Span::S).
-out() :- witness_path("g", Def::A, Def::B, _).
-"#;
-    let result = execute_src(src);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0905]")
-            && n.message
-                .contains("input `path_limit` expected `int > 0` for `witness_path`, found int (0)")
-            && n.message.contains("set `path_limit` to 1 or greater")
-    }));
-}
-
-#[test]
-fn witness_path_scalar_input_cardinality_violation_reports_actionable_runtime_context() {
-    let src = r#"
-.type Def = { A, B }.
-.type Span = { S }.
-.func path_max_depth(N: int) input.
-.mode path_max_depth(-int).
-.func path_limit(N: int) input.
-.mode path_limit(-int).
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl out().
-path_max_depth(4).
-path_max_depth(8).
-path_limit(1).
-graph_edge("g", Def::A, Def::B, "edge", Span::S).
-out() :- witness_path("g", Def::A, Def::B, _).
-"#;
-    let result = execute_src(src);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0907]")
-            && n.message
-                .contains("input `path_max_depth` expected exactly one scalar row, found 2 rows")
-            && n.message.contains("row 1 =")
-            && n.message.contains("row 2 =")
-    }));
-}
-
-#[test]
-fn witness_path_limit_cardinality_violation_reports_actionable_runtime_context() {
-    let src = r#"
-.type Def = { A, B }.
-.type Span = { S }.
-.func path_max_depth(N: int) input.
-.mode path_max_depth(-int).
-.func path_limit(N: int) input.
-.mode path_limit(-int).
-.decl graph_edge(Graph: string, From: Def, To: Def, Kind: string, Evidence: Span) input.
-.decl witness_path(Graph: string, From: Def, To: Def, P: Path) extern.
-.mode witness_path(+string, +Def, +Def, -Path).
-.decl out().
-path_max_depth(8).
-path_limit(1).
-path_limit(2).
-graph_edge("g", Def::A, Def::B, "edge", Span::S).
-out() :- witness_path("g", Def::A, Def::B, _).
-"#;
-    let result = execute_src(src);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-        n.section == "Errors"
-            && n.message.contains("[RAQL0907]")
-            && n.message
-                .contains("input `path_limit` expected exactly one scalar row, found 2 rows")
-            && n.message.contains("row 1 =")
-            && n.message.contains("row 2 =")
-    }));
-}
-
-#[test]
-fn aggregate_sum_type_mismatch_reports_projection_context() {
-    let src = r#"
-.decl src(V: int) extern.
-.mode src(-int).
-.decl total(N: int).
-total(N) :- N = sum(V : src(V)).
-"#;
-    let planned = planned_src(src);
-    let mut host = ExternRowsHost::default()
-        .with_rows("src", vec![vec![RuntimeValue::String("oops".to_string())]]);
-    let result = execute(&planned, &mut host);
-
-    assert_eq!(result.status, EvalStatus::Partial);
-    assert!(result.notes.iter().any(|n| {
-            n.section == "Errors"
-                && n.message.contains("[RAQL0905]")
-                && n.message.contains(
-                    "aggregate `sum` for output `N` expected projected values from `V` to be `int`, found string (\"oops\")"
-                )
-                && n.message.contains("row bindings: V=\"oops\"")
-        }));
-}
-
-#[test]
-fn builtin_helpers_execute_without_host_relations() {
-    let src = r#"
-.decl doc(Opt: option<string>) input.
-.decl contains(Haystack: string, Needle: string) extern.
-.decl starts_with(S: string, Prefix: string) extern.
-.decl fmt(Format: string, Args: list<string>, Out: string) extern.
-.func coalesce(Opt: option<string>, Default: string, Out: string) extern.
-.decl out(S: string).
-doc(none).
-out(S) :-
-  doc(Opt),
-  coalesce(Opt, "fallback", C),
-  fmt("pre-{}-suf", [C], S),
-  starts_with(S, "pre"),
-  contains(S, "fallback").
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(result.relations.get("out").is_some_and(|rows| {
-        rows.contains(&vec![RuntimeValue::String("pre-fallback-suf".to_string())])
-    }));
-}
-
-#[test]
-fn aggregate_empty_input_semantics_match_spec() {
-    let src = r#"
-.decl src(V: int) input.
-.decl c(N: int).
-.decl s(N: int).
-.decl mn(N: int).
-.decl mx(N: int).
-c(N) :- N = count(V : src(V)).
-s(N) :- N = sum(V : src(V)).
-mn(N) :- N = min(V : src(V)).
-mx(N) :- N = max(V : src(V)).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("c")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(0)]))
-    );
-    assert!(
-        result
-            .relations
-            .get("s")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(0)]))
-    );
-    assert_eq!(result.relations.get("mn").map(|r| r.len()), Some(0));
-    assert_eq!(result.relations.get("mx").map(|r| r.len()), Some(0));
-}
-
-#[test]
-fn aggregate_count_uses_set_semantics_for_rows_and_projection() {
-    let src = r#"
-.decl pair(X: int, Y: int) input.
-.decl c_proj(N: int).
-.decl c_rows(N: int).
-pair(1, 10).
-c_proj(N) :- N = count(V : (pair(_, V); pair(_, V))).
-c_rows(N) :- N = count((pair(X, Y); pair(X, Y))).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("c_proj")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(1)]))
-    );
-    assert!(
-        result
-            .relations
-            .get("c_rows")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(1)]))
-    );
-}
-
-#[test]
-fn atom_matching_binds_nested_some_and_list_variables() {
-    let src = r#"
-.decl src_opt(V: option<int>) input.
-.decl src_list(V: list<int>) input.
-.decl out_opt(X: int).
-.decl out_list(A: int, B: int).
-src_opt(some(7)).
-src_list([1,2]).
-out_opt(X) :- src_opt(some(X)).
-out_list(A, B) :- src_list([A, B]).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("out_opt")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(7)]))
-    );
-    assert!(
-        result.relations.get("out_list").is_some_and(|rows| {
-            rows.contains(&vec![RuntimeValue::Int(1), RuntimeValue::Int(2)])
-        })
-    );
-}
-
-#[test]
-fn equality_constraint_unifies_structural_terms_and_binds_nested_vars() {
-    let src = r#"
-.decl src(V: option<int>) input.
-.decl out(X: int).
-src(some(9)).
-out(X) :- src(V), V = some(X).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("out")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(9)]))
-    );
-}
-
-#[test]
-fn equality_constraint_can_bind_after_planner_defers_until_ground() {
-    let src = r#"
-.decl p(X: int) input.
-.decl q(X: int).
-p(1).
-q(X) :- X = Y, p(Y).
-"#;
-    let result = execute_src(src);
-    assert_eq!(result.status, EvalStatus::Ok);
-    assert!(
-        result
-            .relations
-            .get("q")
-            .is_some_and(|rows| rows.contains(&vec![RuntimeValue::Int(1)]))
-    );
+    let result = run(source, &mut TestOps::default());
+    assert_eq!(rows(&result, "out_status"), vec![vec![s("ok")]]);
+    assert_eq!(rows(&result, "ok"), vec![vec![Int(1)]]);
 }

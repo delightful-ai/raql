@@ -203,7 +203,7 @@ fn def_names_scan_is_enumeration_times_name() {
 #[test]
 fn call_edge_scan_composes_over_the_outgoing_direction() {
     let fixture = Fixture::load("calls_ws");
-    let mut edges: Vec<(String, String, &str)> = scan(&fixture, OperatorId::CallEdgesScan)
+    let mut edges: Vec<(String, String, String)> = scan(&fixture, OperatorId::CallEdgesScan)
         .into_iter()
         .map(|row| {
             let [Value::Def(caller), Value::Def(callee), Value::FileRange(_), Value::Enum(tag)] =
@@ -211,11 +211,11 @@ fn call_edge_scan_composes_over_the_outgoing_direction() {
             else {
                 panic!("call_edge row shape: (Def, Def, Site, Disp), got {row:?}");
             };
-            assert_eq!(tag.ty, "DispatchKind");
+            assert_eq!(&*tag.ty, "DispatchKind");
             let path = |def: &Def| {
                 project_def(&fixture.db, &fixture.workspace_root(), *def).path.to_string()
             };
-            (path(caller), path(callee), tag.variant)
+            (path(caller), path(callee), tag.variant.to_string())
         })
         .collect();
     edges.sort();
@@ -226,19 +226,19 @@ fn call_edge_scan_composes_over_the_outgoing_direction() {
     assert_eq!(
         edges,
         vec![
-            ("calls_ws::closure_using".to_owned(), "calls_ws::helper".to_owned(), "DIRECT"),
-            ("calls_ws::dyn_call".to_owned(), "calls_ws::Greet::greet".to_owned(), "DYN"),
+            ("calls_ws::closure_using".to_owned(), "calls_ws::helper".to_owned(), "DIRECT".to_owned()),
+            ("calls_ws::dyn_call".to_owned(), "calls_ws::Greet::greet".to_owned(), "DYN".to_owned()),
             (
                 "calls_ws::generic_call".to_owned(),
                 "calls_ws::Greet::greet".to_owned(),
-                "THROUGH_TRAIT",
+                "THROUGH_TRAIT".to_owned(),
             ),
             (
                 "calls_ws::inherent_method_call".to_owned(),
                 "calls_ws::Counter::tick".to_owned(),
-                "DIRECT",
+                "DIRECT".to_owned(),
             ),
-            ("calls_ws::static_call".to_owned(), "calls_ws::helper".to_owned(), "DIRECT"),
+            ("calls_ws::static_call".to_owned(), "calls_ws::helper".to_owned(), "DIRECT".to_owned()),
         ],
     );
 }

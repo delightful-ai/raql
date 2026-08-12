@@ -231,7 +231,6 @@ pub(crate) fn lower(
         derived: Vec::new(),
         derived_prov: Vec::new(),
         builtins: Vec::new(),
-        shared_builtin_ids: BTreeMap::new(),
     };
 
     // User predicates first (their ids are pre-assigned); synthesized
@@ -272,7 +271,7 @@ pub(crate) fn lower(
         }
     }
 
-    let roots = roots
+    let mut roots: Vec<Root> = roots
         .iter()
         .filter_map(|name| {
             let id = *derived_ids.get(name)?;
@@ -280,6 +279,15 @@ pub(crate) fn lower(
             Some(Root { predicate: id, pattern: Pattern::new(vec![false; arity]) })
         })
         .collect();
+    // `witness_path` walks the whole `graph_edge` extent at runtime; when
+    // it is reachable, demand that extent so the planner plans it.
+    if reachable.contains("witness_path")
+        && let Some(id) = derived_ids.get("graph_edge")
+        && !roots.iter().any(|root| root.predicate == *id)
+    {
+        let arity = lowerer.derived[id.0].arity;
+        roots.push(Root { predicate: *id, pattern: Pattern::new(vec![false; arity]) });
+    }
 
     let lowered = LoweredProgram {
         logic: raql_plan::Program {
@@ -296,7 +304,14 @@ pub(crate) fn lower(
 
 fn collect_goal_atom_names(goal: &Spanned<Goal>, agenda: &mut VecDeque<String>) {
     match &goal.value {
-        Goal::Atom(atom) => agenda.push_back(atom.name.value.to_string()),
+        Goal::Atom(atom) => {
+            agenda.push_back(atom.name.value.to_string());
+            // The graph builtins walk the `graph_edge` extent at runtime
+            // (mirrors the stratification dependency in `strata`).
+            if matches!(atom.name.value.as_str(), "witness_path" | "path_hop") {
+                agenda.push_back("graph_edge".to_string());
+            }
+        }
         Goal::Not(not_goal) => agenda.push_back(not_goal.atom.value.name.value.to_string()),
         Goal::Aggregate(aggregate) => {
             for sub in &aggregate.goals {
@@ -326,9 +341,6 @@ struct Lowerer<'t, 'd> {
     derived: Vec<DerivedDef>,
     derived_prov: Vec<DerivedProvenance>,
     builtins: Vec<BuiltinDef>,
-    /// Fixed-pattern engine builtins share one `BuiltinDef` per name;
-    /// constraint goals get their own defs (their patterns are per-goal).
-    shared_builtin_ids: BTreeMap<String, BuiltinId>,
 }
 
 /// The head shape of a synthesized binder def: bound slots first, then
@@ -691,7 +703,11 @@ impl Lowerer<'_, '_> {
             }
             GoalRef::Extern(name.to_string())
         } else if let Some(patterns) = engine_builtin_patterns(name) {
-            GoalRef::Builtin(self.shared_builtin(name, patterns))
+            // Engine builtins evaluate from source terms, not positions,
+            // so compound arguments are fine (`fmt("{}", [N], Out)`): the
+            // planner sees the flattened variable list, each variable
+            // bound when it sits in any `+` position.
+            return self.lower_engine_builtin(name, atom, &patterns, negated, scope);
         } else if let Some(id) = self.input_ids.get(name) {
             GoalRef::Input(*id)
         } else if let Some(id) = self.derived_ids.get(name) {
@@ -727,13 +743,46 @@ impl Lowerer<'_, '_> {
         raql_plan::Goal { target, args, negated }
     }
 
-    fn shared_builtin(&mut self, name: &str, patterns: Vec<Vec<Binding>>) -> BuiltinId {
-        if let Some(id) = self.shared_builtin_ids.get(name) {
-            return *id;
+    /// Lower an engine-builtin atom to a per-goal builtin over its
+    /// flattened variable list: a variable is required bound when any of
+    /// its positions is `+` in the builtin's declared pattern; wildcards
+    /// in `-` positions become fresh computed slots.
+    fn lower_engine_builtin(
+        &mut self,
+        name: &str,
+        atom: &Atom,
+        patterns: &[Vec<Binding>],
+        negated: bool,
+        scope: &mut VarScope,
+    ) -> raql_plan::Goal {
+        let declared = &patterns[0];
+        let mut vars: Vec<(String, Binding)> = Vec::new();
+        let mut goal_args: Vec<raql_plan::Term> = Vec::new();
+        for (position, term) in atom.terms.iter().enumerate() {
+            let binding = declared.get(position).copied().unwrap_or(Binding::Bound);
+            if let Term::Wildcard = term.value {
+                let var = scope.fresh("_");
+                goal_args.push(raql_plan::Term::Var(var));
+                vars.push((scope.names[var.0 as usize].clone(), binding));
+                continue;
+            }
+            for var_name in ordered_term_vars(&term.value) {
+                match vars.iter_mut().find(|(existing, _)| *existing == var_name) {
+                    Some((_, existing)) => {
+                        if binding == Binding::Bound {
+                            *existing = Binding::Bound;
+                        }
+                    }
+                    None => {
+                        goal_args.push(raql_plan::Term::Var(scope.intern(&var_name)));
+                        vars.push((var_name, binding));
+                    }
+                }
+            }
         }
-        let id = self.push_builtin(name.to_string(), patterns);
-        self.shared_builtin_ids.insert(name.to_string(), id);
-        id
+        let pattern = vars.iter().map(|(_, binding)| *binding).collect();
+        let id = self.push_builtin(name.to_string(), vec![pattern]);
+        raql_plan::Goal { target: GoalRef::Builtin(id), args: goal_args, negated }
     }
 
     fn push_builtin(&mut self, name: String, patterns: Vec<Vec<Binding>>) -> BuiltinId {

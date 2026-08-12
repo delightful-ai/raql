@@ -30,7 +30,7 @@ pub(super) fn kind_of_def(
     let kind = def.kind(att.db());
     Ok(vec![vec![
         Value::Def(def),
-        Value::Enum(EnumTag { ty: "DefKind", variant: kind.tag() }),
+        Value::Enum(EnumTag::new("DefKind", kind.tag())),
     ]])
 }
 

@@ -100,7 +100,14 @@ pub fn resolve(program: Program<AstPhase>) -> Result<ResolvedProgram, DiagBundle
                     ));
                 }
                 let attrs = d.attrs.iter().map(|a| a.value).collect::<Vec<_>>();
-                if attrs.contains(&DeclAttr::Extern) {
+                // Extern declarations are gone from the language — the
+                // catalog owns extern signatures. The exception is the
+                // engine builtins whose schemas are use-site-specific
+                // (`fmt`, `coalesce`): those stay program-declared, and
+                // the reserved-shape validation keeps them honest.
+                if attrs.contains(&DeclAttr::Extern)
+                    && crate::externs::engine_builtin_patterns(&name).is_none()
+                {
                     diagnostics.push(
                         CompilerDiagnostic::error(
                             "RAQL0105",
