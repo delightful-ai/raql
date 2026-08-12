@@ -20,6 +20,22 @@ Contract: `docs/SPEC.md` §8–§10.
 
 - Planner input is `logic::Program` — the lang layer lowers to it; the
   planner never sees compiler IR. Selector bindings are input relations.
+- Programs are planned from *demand roots* (`logic::Root`): a view's
+  output predicates under the all-free pattern, an ad-hoc query as an
+  arity-0 derived def. A root's full-extent evaluation is the request's
+  own demand — not reported in `scans`, not denied by `--no-scan` —
+  while an unseeded derived *call* inside a body remains a scan of a
+  derived predicate (SPEC §9.2). Declared `.mode` contracts bind roots
+  exactly like call sites.
+- Builtins declare one or more accepted patterns (`=` runs with either
+  side ground); the planner places a builtin once any pattern holds.
+- `UnsatisfiableGoal.location` carries (predicate, rule, source goal)
+  so the lang layer maps RAQL0301 back to a span; it is not part of the
+  rendered message.
+- `EngineValue` (value.rs) is the engine-facing plain-data contract
+  beside `OperatorSet`: construct/inspect ints, strings, bools, enums,
+  options, lists; `plain_cmp` refuses semantic handles. It defines no
+  execution and stays RA-free.
 - Binding patterns are the `Pattern` newtype (`mode.rs`): demand keys,
   support sets, satisfiability checks all speak it. Never reintroduce bare
   `Vec<bool>` at a boundary.

@@ -1,32 +1,40 @@
-## Boundary
+# raql-host-ra
 
-This crate owns the rust-analyzer-backed host runtime: RA-native identity, workspace integration, semantic provider logic, and the lookup/index boundary between RAQL and rust-analyzer.
+Workspace lifecycle for the daemon, plus the output-projection boundary of
+the new runtime. The legacy semantic machinery (`DeterministicRaHost`,
+providers, lookup caches) was deleted per SPEC §17.1 — semantic truth
+lives in `crates/raql-ra/` now. This crate is scheduled to dissolve into
+`raql-server` at step 5 (SPEC §12); until then it is the working shell.
 
-`src/workspace_service.rs` is orchestration, cache ownership, and daemon-facing lifecycle glue. It must not keep absorbing new semantic families.
+## Ownership boundary
 
-## Route work
-
-- Put RA identity types, canonical wrappers, and shared lookup record logic in focused modules, not inline in `src/workspace_service.rs`.
-- Put exact-name/bound-def logic in a defs-oriented provider module.
-- Put caller/callee and dispatch logic in a call-oriented provider module.
-- Put structure, type, syntax, and search logic in their own provider modules once they have distinct proof loops.
-- Use `vendor/rust-analyzer` to copy RA integration patterns before inventing local substitutes.
+- Owns: loading a Cargo workspace into an `AnalysisHost` + VFS
+  (`workspace_loader.rs`), watching and syncing it (`workspace_service/`,
+  incl. `sync_workspace` — the known-bad warm-path sweep §12.2 deletes),
+  warmup, workspace epoch/content revision, the supported-capability set
+  (`capability.rs`), and running a planned program: `run_planned` =
+  sync → `raql_engine::execute` over `raql_ra::SnapshotOperators` →
+  §13.1 projection (`projection.rs` → `ProjectedRunResult`).
+- Must not own: semantic extraction (raql-ra's), execution semantics
+  (raql-engine's), plan knowledge (raql-plan's), CLI/daemon lifecycle
+  (raql-daemon's).
 
 ## Keep out
 
-- Do not use tracked-file text scans, raw filesystem sweeps, path-prefix guessing, or AST rediscovery as supported semantic truth when RA already has the answer.
-- Do not answer bound lookups by turning them back into reverse search.
-- Do not grow new public CLI or daemon lifecycle logic here. That belongs in `crates/raql-daemon/` and `crates/raql-cli/`.
-- If a surface is not RA-native and honest yet, disable it instead of preserving a custom approximation.
+- Do not re-grow providers, lookup caches, or any extraction here; a new
+  semantic family means a catalog entry + operator in `raql-ra`.
+- `supported_capabilities` must track what `SnapshotOperators` actually
+  implements (the catalog's non-disabled predicates) — update both sides
+  together.
+- Projection never fabricates: unprojectable values render as
+  `<unprojectable:reason>` (SPEC §4.4), through `raql_ra::project_def` /
+  `project_file_range` only.
 
-## Verification
+## Verify
 
-- `cargo test -p raql-host-ra workspace_service_reports_supported_def_paths_for_exact_name_seeded_structs -- --nocapture`
-  proves exact-name seeded non-function defs still resolve on the supported path.
-- `cargo test -p raql-host-ra workspace_service_supports_structure_and_trait_rows -- --nocapture`
-  proves bound `Def` joins still line up with the RA-built core host.
-- `cargo test -p raql-host-ra workspace_service_looks_up_call_edges_for_bound_callee -- --nocapture`
-  proves the bound-callee call path still works through RA-backed identity.
-- `cargo test -p raql-host-ra -- --nocapture`
-  is the crate-wide proof loop after touching shared provider or workspace logic.
-
+- `cargo test -p raql-host-ra` — lifecycle + the end-to-end fixture run
+  through `run_planned` (projected-row assertions, bound call family,
+  incremental-edit visibility, capability coverage).
+- The public latency probe: release binary,
+  `raql lang run views/stdlib_callers_load_and_plan.raql --rust-file .`
+  (daemon-backed; cold ≈3.2s / warm ≈120ms as of 2026-08-11).

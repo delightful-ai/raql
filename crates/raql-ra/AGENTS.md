@@ -57,6 +57,12 @@ mixes the wrong operators.
 - Impl handles are the self-type's canonical path with a `#ordinal` only
   when several impls share it, ordered by (workspace-relative path, range
   start) — stable across sessions, unlike `FileId`s (`projection.rs`).
+- `Value` implements `raql_plan::EngineValue` (the engine's plain-data
+  contract); `EnumTag` holds `Arc<str>` names because the engine
+  constructs tags for render-layer enums this crate never sees. The
+  operator-side tag strings (`DefKind`/`DispatchKind` variants) must
+  keep matching the `std.raql` `.type` variant names — that equality is
+  how rule constants meet operator rows.
 
 ## Bait / keep out
 

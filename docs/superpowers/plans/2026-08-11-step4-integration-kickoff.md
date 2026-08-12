@@ -1,3 +1,7 @@
+ > **SUPERSEDED** by `2026-08-11-step5-workspace-actor-kickoff.md` (its
+> "Next work" items 1–2 landed that same day; item 3 is the new
+> document's subject). Kept for the decision log only.
+
 # Kickoff: wire the planner in — compiler lowering + engine bridging
 
 Session handoff written 2026-08-11 (second session that day) by the session

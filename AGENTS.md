@@ -11,24 +11,25 @@ IMPORTANT: we do not care about backwards compatibility here. This is an unpubli
 - If a primitive is not RA-native and honest, disable it rather than keep an approximate custom extractor alive.
 - Prefer query-shaped providers and cached RA identity over broad snapshot materialization, reverse rediscovery, raw filesystem scans, or text-search fallbacks.
 - Use release-mode, daemon-backed runs for latency claims. Debug timings are not decision-grade.
-- This repo does **not** use rustfmt: never run `cargo fmt` (it would reformat everything). Match the surrounding manual style (~100 cols). `cargo clippy` is kept clean on the new-architecture crates (`raql-plan`, `raql-ra`).
+- This repo does **not** use rustfmt: never run `cargo fmt` (it would reformat everything). Match the surrounding manual style (~100 cols). `cargo clippy` is kept clean on the new-architecture crates (`raql-plan`, `raql-ra`, `raql-engine`, and the new `raql-compiler` modules).
 
 ## Route work
 
-- `crates/raql-plan/` owns the predicate catalog (single source of truth for extern predicates) and the binding-aware planner (SPEC §8–§10; both implemented). No RA types, no execution.
-- `crates/raql-ra/` owns the new-architecture RA-native layer (SPEC §6): Salsa-tracked queries over `RootDatabase` and catalog operator bodies. Growing alongside the old host path until cutover; read its `AGENTS.md` before adding queries.
-- `crates/raql-host-ra/` owns RA-native providers, workspace integration, lookup/index logic, and the boundary between RAQL and rust-analyzer. (Legacy path: scheduled for deletion at cutover, SPEC §17; mechanical maintenance only.)
+- `crates/raql-plan/` owns the predicate catalog (single source of truth for extern predicates), the binding-aware planner (SPEC §8–§10), and the engine-facing contracts (`OperatorSet`, `EngineValue`). No RA types, no execution.
+- `crates/raql-compiler/` (with `raql-syntax`, `raql-ir`) is the lang layer: resolution with catalog-injected extern signatures, typechecking, stratification, and the lowering to `raql_plan::logic` (SPEC §17.1 lang row). No ordering, no access paths, no RA types.
+- `crates/raql-ra/` owns Rust semantic truth (SPEC §6): Salsa-tracked queries over `RootDatabase`, the catalog operator bodies (`SnapshotOperators`), and §13.1 projection primitives. Read its `AGENTS.md` before adding queries.
+- `crates/raql-engine/` owns demand-driven row execution over the operator boundary (SPEC §9.2, §11): joins, recursion, negation, binders, memoization. Never invokes RA directly.
+- `crates/raql-host-ra/` is the workspace-lifecycle shell (loading, watch/sync, warmup, capabilities) plus the projection boundary of `run_planned`. Dissolves into `raql-server` at step 5 (SPEC §12); no semantic machinery may return here.
 - `crates/raql-daemon/` owns process lifecycle, warmup, socket/protocol, and request scheduling. It must not grow semantic extraction logic.
 - `crates/raql-cli/` stays a thin client over the daemon-backed path.
-- `crates/raql-engine/` owns RAQL execution semantics and host lookup contracts, not Rust semantic discovery.
 - `vendor/rust-analyzer/` is the reference tree for API choice, invariants, and integration patterns. Prefer matching RA's own patterns over inventing local approximations.
 
 ## Invariants / keep out
 
 - Any supported RAQL query execution path must go through the daemon-backed, incremental rust-analyzer runtime. Any direct runtime path is dev-only, quarantined, and must not be wired into public CLI behavior.
-- Bound lookups must answer from RA-backed identity or cached RA-built indexes, not from reverse rediscovery or ad hoc text scans.
+- Extern predicates exist only in the catalog (SPEC §8.1): a new semantic family is a catalog entry + a `raql-ra` operator + its §16 proof matrix, never a program-text declaration or an engine special case.
 - Do not introduce raw filesystem scans, manual AST walks, or path-prefix heuristics as the source of truth when rust-analyzer already exposes the answer.
-- Do not keep adding responsibilities to `crates/raql-host-ra/src/workspace_service.rs`. If a change adds a new semantic family or proof model, split it into a focused provider/module instead of extending the blob.
+- Do not grow semantic machinery in `crates/raql-host-ra/` — it is a lifecycle shell awaiting the §12 server. New semantic families go through the catalog into `raql-ra`.
 - Daemon/client code must not import or recreate host semantic extraction logic. Keep lifecycle and semantics separate.
 - The current public latency probe is `views/stdlib_callers_load_and_plan.raql`. Use the real daemon-backed release binary when making cold/warm latency claims.
 
