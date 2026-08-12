@@ -105,7 +105,6 @@ fn lang_run_supports_exact_name_only_queries_on_the_daemon_path() {
     fs::write(
         &query,
         r#"
-.func def_name(D: Def, Name: string) extern.
 .decl hit(Name: string).
 hit(Name) :- def_name(_, "alpha"), Name = "alpha".
 "#,
@@ -295,10 +294,6 @@ fn lang_run_supports_lookup_seeded_span_queries_on_the_daemon_path() {
     fs::write(
         &query,
         r#"
-.func def_name(D: Def, Name: string) extern.
-.func def_span(D: Def, S: Span) extern.
-.decl span_allowed(S: Span) extern.
-.func span_key(S: Span, RelPath: string, L0: int, C0: int, L1: int, C1: int) extern.
 .decl hit(RelPath: string).
 hit(RelPath) :-
   def_name(D, "alpha"),
@@ -357,8 +352,6 @@ fn lang_run_supports_lookup_seeded_handle_queries_on_the_daemon_path() {
     fs::write(
         &query,
         r#"
-.func def_name(D: Def, Name: string) extern.
-.func handle(D: Def, H: string) extern.
 .decl hit(H: string).
 hit(H) :- def_name(D, "alpha"), handle(D, H).
 "#,
@@ -559,9 +552,6 @@ pub fn beta() {}
     fs::write(
         dir_a.join("helper.raql"),
         r#"
-.decl def(D: Def) extern.
-.func def_name(D: Def, Name: string) extern.
-.decl contains(Haystack: string, Needle: string) extern.
 .decl hit(Name: string).
 hit(Name) :- def(D), def_name(D, Name), contains(Name, "alpha").
 "#,
@@ -572,9 +562,6 @@ hit(Name) :- def(D), def_name(D, Name), contains(Name, "alpha").
     fs::write(
         dir_b.join("helper.raql"),
         r#"
-.decl def(D: Def) extern.
-.func def_name(D: Def, Name: string) extern.
-.decl contains(Haystack: string, Needle: string) extern.
 .decl hit(Name: string).
 hit(Name) :- def(D), def_name(D, Name), contains(Name, "beta").
 "#,
@@ -876,42 +863,14 @@ hit(Name) :- search("alpha", D, _Score), def_name(D, Name).
 }
 
 #[test]
-fn lang_run_supports_structure_and_trait_queries_on_the_daemon_path() {
+fn lang_run_rejects_structure_and_trait_queries_until_their_families_land() {
+    // The v1 structure/trait family (`field`, `variant`, `method`,
+    // `trait_method`, `implements`, `from_impl`) enters the catalog only
+    // with its operators and proof matrix (SPEC §8.6). Until then the
+    // predicates do not exist, and the refusal happens at compile time.
     let work = temp_dir("daemon_structure_trait");
     let workspace = work.join("ws");
     write_workspace(&workspace);
-    fs::write(
-        workspace.join("src/lib.rs"),
-        r#"
-pub trait Greeter {
-    fn greet(&self);
-}
-
-pub struct Person {
-    pub name: String,
-    age: u32,
-}
-
-pub enum Choice {
-    First,
-    Second,
-}
-
-pub struct NameError;
-pub struct AgeError;
-
-impl Greeter for Person {
-    fn greet(&self) {}
-}
-
-impl From<NameError> for AgeError {
-    fn from(_: NameError) -> Self {
-        AgeError
-    }
-}
-"#,
-    )
-    .expect("write lib.rs");
 
     let query = work.join("query.raql");
     fs::write(
@@ -919,29 +878,7 @@ impl From<NameError> for AgeError {
         r#"
 .include "std.raql".
 .decl field_hit(Name: string).
-.decl field_type_hit(Name: string, TyName: string).
-.decl variant_hit(Name: string).
-.decl method_hit(Name: string).
-.decl trait_method_hit(Name: string).
-.decl impl_hit(Name: string).
-.decl from_hit(SrcName: string, DstName: string).
-field_hit(Name) :- def(Person), def_name(Person, "Person"), field(Person, Name, _).
-field_type_hit(Name, TyName) :-
-  def(Person),
-  def_name(Person, "Person"),
-  field(Person, Name, Ty),
-  ty_app(Ty, Head),
-  def_name(Head, TyName).
-field_type_hit(Name, TyName) :-
-  def(Person),
-  def_name(Person, "Person"),
-  field(Person, Name, Ty),
-  ty_prim(Ty, TyName).
-variant_hit(Name) :- def(Choice), def_name(Choice, "Choice"), variant(Choice, Name, _).
-method_hit(Name) :- def(Person), def_name(Person, "Person"), method(Person, Method), def_name(Method, Name).
-trait_method_hit(Name) :- def(Greeter), def_name(Greeter, "Greeter"), trait_method(Greeter, Method), def_name(Method, Name).
-impl_hit(Name) :- def(Person), def_name(Person, "Person"), implements(Person, Trait, _), def_name(Trait, Name).
-from_hit(SrcName, DstName) :- def(Src), def_name(Src, "NameError"), from_impl(Src, Dst, _), def_name(Src, SrcName), def_name(Dst, DstName).
+field_hit(Name) :- def_name(Person, "Person"), field(Person, Name, _).
 "#,
     )
     .expect("write query");
@@ -960,72 +897,30 @@ from_hit(SrcName, DstName) :- def(Src), def_name(Src, "NameError"), from_impl(Sr
         .expect("run raql");
 
     assert!(
-        output.status.success(),
-        "daemon-backed structure query should succeed; stdout={} stderr={}",
+        !output.status.success(),
+        "structure/trait queries must refuse until the family lands; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("field_hit(\"name\")"), "stdout={stdout}");
-    assert!(stdout.contains("field_type_hit(\"name\", \"String\")"), "stdout={stdout}");
-    assert!(stdout.contains("field_type_hit(\"age\", \"u32\")"), "stdout={stdout}");
-    assert!(stdout.contains("variant_hit(\"First\")"), "stdout={stdout}");
-    assert!(stdout.contains("method_hit(\"greet\")"), "stdout={stdout}");
-    assert!(stdout.contains("trait_method_hit(\"greet\")"), "stdout={stdout}");
-    assert!(stdout.contains("impl_hit(\"Greeter\")"), "stdout={stdout}");
-    assert!(
-        stdout.contains("from_hit(\"NameError\", \"AgeError\")"),
-        "stdout={stdout}"
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("field"), "stderr={stderr}");
 }
 
 #[test]
-fn lang_run_supports_type_surface_queries_on_the_daemon_path() {
+fn lang_run_rejects_type_surface_queries_until_their_families_land() {
+    // The type-navigation family (`fn_return_type`, `ty_*`) is not in the
+    // v0 catalog (SPEC §8.6); it returns with operators + proof matrix.
     let work = temp_dir("daemon_type_surface");
     let workspace = work.join("ws");
     write_workspace(&workspace);
-    fs::write(
-        workspace.join("src/lib.rs"),
-        r#"
-pub struct Wrapper<T>(pub T);
-pub struct Item;
-pub struct Oops;
-
-pub fn make_wrapper(item: Item) -> Wrapper<Item> { Wrapper(item) }
-pub fn borrow_item(item: &mut Item) -> &mut Item { item }
-pub fn raw_item(item: *const Item) -> *const Item { item }
-pub fn tuple_item() -> (Item, i32) { (Item, 1) }
-pub fn slice_item(items: &[Item]) -> &[Item] { items }
-pub fn generic_item<T>(value: T) -> T { value }
-pub fn parse_item() -> Result<Item, Oops> { Err(Oops) }
-pub fn opaque_array() -> [i32; 4] { [0; 4] }
-"#,
-    )
-    .expect("write lib.rs");
 
     let query = work.join("query.raql");
     fs::write(
         &query,
         r#"
 .include "std.raql".
-.decl app_hit(Path: string).
-.decl arg_hit(Path: string).
-.decl ref_hit(Name: string).
-.decl ptr_hit(Name: string).
-.decl tuple_prim_hit(Name: string).
-.decl slice_hit(Name: string).
-.decl param_hit(Name: string).
-.decl error_hit(Name: string).
-.decl unknown_hit(Key: string).
-app_hit(Path) :- def(F), def_name(F, "make_wrapper"), fn_return_type(F, TR), type_head_path(TR, Path).
-arg_hit(Path) :- def(F), def_name(F, "make_wrapper"), fn_return_type(F, TR), ty_arg(TR, 0, Arg), type_head_path(Arg, Path).
-ref_hit(Name) :- def(F), def_name(F, "borrow_item"), fn_return_type(F, TR), ty_ref(TR, Mutability::MUT, Inner), type_head_def(Inner, Head), def_name(Head, Name).
-ptr_hit(Name) :- def(F), def_name(F, "raw_item"), fn_return_type(F, TR), ty_ptr(TR, Mutability::IMM, Inner), type_head_def(Inner, Head), def_name(Head, Name).
-tuple_prim_hit(Name) :- def(F), def_name(F, "tuple_item"), fn_return_type(F, TR), ty_tuple(TR, 1, Elem), ty_prim(Elem, Name).
-slice_hit(Name) :- def(F), def_name(F, "slice_item"), fn_return_type(F, TR), ty_ref(TR, Mutability::IMM, RefInner), ty_slice(RefInner, Elem), type_head_def(Elem, Head), def_name(Head, Name).
-param_hit(Name) :- def(F), def_name(F, "generic_item"), fn_return_type(F, TR), ty_param(TR, Param), def_name(Param, Name).
-error_hit(Name) :- def(F), def_name(F, "parse_item"), fn_error_type(F, some(Err)), def_name(Err, Name).
-unknown_hit(Key) :- def(F), def_name(F, "opaque_array"), fn_return_type(F, TR), ty_unknown(TR), typeref_id(TR, Key).
+.decl app_hit(F: Def).
+app_hit(F) :- def_name(F, "make_wrapper"), fn_return_type(F, _).
 "#,
     )
     .expect("write query");
@@ -1044,21 +939,13 @@ unknown_hit(Key) :- def(F), def_name(F, "opaque_array"), fn_return_type(F, TR), 
         .expect("run raql");
 
     assert!(
-        output.status.success(),
-        "daemon-backed type query should succeed; stdout={} stderr={}",
+        !output.status.success(),
+        "type-surface queries must refuse until the family lands; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("app_hit(\"Wrapper\")"), "stdout={stdout}");
-    assert!(stdout.contains("arg_hit(\"Item\")"), "stdout={stdout}");
-    assert!(stdout.contains("ref_hit(\"Item\")"), "stdout={stdout}");
-    assert!(stdout.contains("ptr_hit(\"Item\")"), "stdout={stdout}");
-    assert!(stdout.contains("tuple_prim_hit(\"i32\")"), "stdout={stdout}");
-    assert!(stdout.contains("slice_hit(\"Item\")"), "stdout={stdout}");
-    assert!(stdout.contains("param_hit(\"T\")"), "stdout={stdout}");
-    assert!(stdout.contains("error_hit(\"Oops\")"), "stdout={stdout}");
-    assert!(stdout.contains("unknown_hit("), "stdout={stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fn_return_type"), "stderr={stderr}");
 }
 
 #[test]
@@ -1135,11 +1022,13 @@ fn_pointer_hit(Label) :- def(Caller), def_name(Caller, "fn_pointer_caller"), cal
     );
     assert!(stdout.contains("trait_hit(\"through_trait\")"), "stdout={stdout}");
     assert!(stdout.contains("dyn_hit(\"dyn\")"), "stdout={stdout}");
-    assert!(stdout.contains("closure_hit(\"closure\")"), "stdout={stdout}");
-    assert!(
-        stdout.contains("fn_pointer_hit(\"fn_pointer\")"),
-        "stdout={stdout}"
-    );
+    // Honest absences (SPEC §6.3, §8.6 caveats): the `closure()` and
+    // `fp()` callsites have no resolvable `Def` callee and are absent —
+    // the closure body's `direct_target()` call is attributed to the
+    // enclosing named function instead.
+    assert!(stdout.contains("closure_hit(\"direct\")"), "stdout={stdout}");
+    assert!(!stdout.contains("closure_hit(\"closure\")"), "stdout={stdout}");
+    assert!(!stdout.contains("fn_pointer_hit("), "stdout={stdout}");
 }
 
 #[test]
@@ -1203,45 +1092,24 @@ caller_path_hit() :-
 }
 
 #[test]
-fn lang_run_supports_syntax_control_queries_on_the_daemon_path() {
+fn lang_run_rejects_syntax_control_queries_until_their_families_land() {
+    // The node/control family (`node_*`, `enclosing_control`) is not in
+    // the v0 catalog (SPEC §8.6); it returns with operators + proof
+    // matrix.
     let work = temp_dir("daemon_syntax_control");
     let workspace = work.join("ws");
     write_workspace(&workspace);
-    fs::write(
-        workspace.join("src/lib.rs"),
-        r#"
-pub fn direct_target() {}
-
-pub fn syntax_demo(flag: bool) {
-    if flag {
-        direct_target();
-    }
-}
-"#,
-    )
-    .expect("write lib.rs");
 
     let query = work.join("query.raql");
     fs::write(
         &query,
         r#"
 .include "std.raql".
-.decl node_hit().
 .decl if_control_hit().
-node_hit() :-
-  def(F),
-  def_name(F, "syntax_demo"),
-  call_edge(F, _, Site, _),
-  node_at(Site, some(Node)),
-  node_kind(Node, NodeKind::OTHER),
-  node_span(Node, _),
-  node_parent(Node, some(_)),
-  node_id(Node, _).
 if_control_hit() :-
-  def(F),
   def_name(F, "syntax_demo"),
   call_edge(F, _, Site, _),
-  enclosing_control(Site, NodeKind::IF, _, _).
+  enclosing_control(Site, "IF", _, _).
 "#,
     )
     .expect("write query");
@@ -1260,14 +1128,13 @@ if_control_hit() :-
         .expect("run raql");
 
     assert!(
-        output.status.success(),
-        "daemon-backed syntax/control query should succeed; stdout={} stderr={}",
+        !output.status.success(),
+        "syntax/control queries must refuse until the family lands; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("node_hit()."), "stdout={stdout}");
-    assert!(stdout.contains("if_control_hit()."), "stdout={stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("enclosing_control"), "stderr={stderr}");
 }
 
 #[test]
@@ -1417,7 +1284,7 @@ convert_hit() :-
 handle_hit(Variant) :-
   def(E),
   def_name(E, "ParseErr"),
-  handles(E, some(Variant), _, F),
+  handles(E, Variant, _, F),
   def_name(F, "handle_parse").
 "#,
     )
@@ -1453,7 +1320,10 @@ handle_hit(Variant) :-
 }
 
 #[test]
-fn lang_run_supports_stable_handle_queries_on_the_daemon_path() {
+fn lang_run_supports_handle_queries_on_the_daemon_path() {
+    // The old `call_id`/`ref_id`/`impl_id` zero-bound key enumerations are
+    // deleted from the language (SPEC §8.6); `handle(D, H)` projects the
+    // §13.2 selector grammar instead.
     let work = temp_dir("daemon_stable_handles");
     let workspace = work.join("ws");
     write_workspace(&workspace);
@@ -1472,11 +1342,7 @@ impl Greeter for Person {
 }
 
 pub fn invoke(left: Person, right: Person) {
-    let mut slot = left;
-    slot.greet();
-    if slot == right {
-        slot = right;
-    }
+    let _ = (left, right);
 }
 "#,
     )
@@ -1487,10 +1353,10 @@ pub fn invoke(left: Person, right: Person) {
         &query,
         r#"
 .include "std.raql".
-.decl call_key(H: string).
+.decl fn_key(H: string).
 .decl impl_key(H: string).
-call_key(H) :- call_id(_, H).
-impl_key(H) :- impl_id(_, H).
+fn_key(H) :- def_name(D, "invoke"), is_fn(D), handle(D, H).
+impl_key(H) :- def(D), def_kind(D, DefKind::IMPL), handle(D, H).
 "#,
     )
     .expect("write query");
@@ -1510,11 +1376,19 @@ impl_key(H) :- impl_id(_, H).
 
     assert!(
         output.status.success(),
-        "daemon-backed stable-handle query should succeed; stdout={} stderr={}",
+        "daemon-backed handle query should succeed; stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("call_key(\"call:src/lib.rs:"), "stdout={stdout}");
-    assert!(stdout.contains("impl_key(\"impl:src/lib.rs:"), "stdout={stdout}");
+    assert!(
+        stdout.contains("fn_key(\"@H:fn:cli_daemon_cutover::invoke\")"),
+        "stdout={stdout}"
+    );
+    // Four derive impls + the explicit `Greeter` impl share Person's
+    // path, so every impl handle is ordinal-qualified (SPEC §13.2).
+    assert!(
+        stdout.contains("impl_key(\"@H:impl:cli_daemon_cutover::Person#"),
+        "stdout={stdout}"
+    );
 }
