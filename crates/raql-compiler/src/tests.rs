@@ -7,6 +7,8 @@ use camino::Utf8PathBuf;
 use raql_host::ExternLookupShape;
 use raql_syntax::{Directive, Goal, Stmt, parse_program, parse_program_from_file};
 
+use crate::diagnostics::format_span_brief;
+use crate::program::PredicateUsageKind;
 use crate::{CompilerType, plan, resolve, typecheck};
 
 fn has_code(diags: &[crate::CompilerDiagnostic], code: &str) -> bool {
@@ -245,7 +247,7 @@ fn mode_arity_mismatch_points_to_mode_span_with_contextual_message() {
     assert!(diag.message.contains("mode `(+int)`"));
     assert!(diag.message.contains("expects 2"));
     assert!(diag.help.as_deref().is_some_and(|h| {
-        h.contains(&super::format_span_brief(
+        h.contains(&format_span_brief(
             parsed_for_spans.sources(),
             decl_span,
         ))
@@ -457,8 +459,8 @@ p(1, 2).
         .iter()
         .find(|d| d.code_str() == "RAQL0203" && d.span() == Some(usage_span))
         .expect("must contain usage-anchored RAQL0203");
-    let usage_location = super::format_span_brief(parsed_for_spans.sources(), usage_span);
-    let decl_location = super::format_span_brief(parsed_for_spans.sources(), decl_span);
+    let usage_location = format_span_brief(parsed_for_spans.sources(), usage_span);
+    let decl_location = format_span_brief(parsed_for_spans.sources(), decl_span);
 
     assert_eq!(diag.span(), Some(usage_span));
     assert!(diag.message.contains("used with 2 argument(s)"));
@@ -489,7 +491,7 @@ p(1, 2).
         .get_mut("p")
         .expect("declared predicate should exist");
     decl.inferred = true;
-    decl.inferred_from = Some(super::PredicateUsageKind::Fact);
+    decl.inferred_from = Some(PredicateUsageKind::Fact);
 
     let err = typecheck(resolved).expect_err("must fail");
     let diag = err
