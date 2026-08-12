@@ -45,7 +45,7 @@ deliberately don't.
   `out_status("ok")`, 4 correct `caller_report` rows; a second probe
   proved Def/Span/handle/enum projection across the socket. Old-path
   reference was cold ~4.1s / warm ~59–69ms — warm regressed ~2x (no
-  join batching, per-env operator invokes); see next-work item 3.
+  join batching, per-env operator invokes); see next-work item 5.
 
 ## How much to trust this (a reviewer's attack list)
 
